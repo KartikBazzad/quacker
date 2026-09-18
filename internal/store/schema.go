@@ -105,8 +105,23 @@ type migration struct {
 	sql     string
 }
 
+// migration 2 adds per-key concurrency and rate-limit columns. The key
+// gate counts RUNNING rows sharing a step's concurrency_key; claimed_at is
+// stamped on every claim so a queue's sliding-window start rate can be
+// counted directly (started_at stays first-start only). All ALTERs use
+// defaults so existing rows need no backfill.
+const migration2 = `
+ALTER TABLE runs ADD COLUMN concurrency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN concurrency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN key_limit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE steps ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_steps_key ON steps (concurrency_key, status);
+CREATE INDEX IF NOT EXISTS idx_steps_claimed ON steps (queue, claimed_at);
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
+	{version: 2, sql: migration2},
 }
 
 // init validates the migration list's invariant before any Open can rely

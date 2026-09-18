@@ -34,12 +34,16 @@ Use quacker when your app *is* the worker: background jobs, pipelines, agent
 orchestration, fan-out/fan-in — anything where "spin up a queueing platform"
 is the wrong amount of infrastructure.
 
-## Features (v0.1)
+## Features
 
 - **Typed tasks** — `NewTask[I, O]` with JSON-serialized payloads
 - **Retries** — attempt counts, exponential/constant backoff with jitter
 - **Timeouts** — per-attempt, via `context`
 - **Queues** — named queues with independent concurrency limits and priorities
+- **Per-key concurrency** — `WithKey` serializes (or caps at N) runs sharing
+  a key, enforced by counting RUNNING rows at claim time
+- **Rate limiting** — `WithRate(queue, n, per)` caps starts per sliding
+  window; the window is persisted, so it survives File-mode restarts
 - **DAG workflows** — steps with dependencies, upstream outputs via `DepOutput`
 - **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`, `"@every 1s"`)
   and `quacker.WithDelay`
@@ -104,6 +108,27 @@ Steps start the moment their dependencies succeed. If a step exhausts its
 retries, the run fails and remaining steps are cancelled. Task logs written
 inside steps are persisted and readable via `q.Logs(ctx, runID, limit)`.
 
+## Concurrency & rate control
+
+```go
+// At most one run per customer at a time, across every queue:
+charge := quacker.NewTask("orders.charge", fn,
+    quacker.WithKey(func(o Order) string { return o.CustomerID }),
+    // quacker.WithKeyConcurrency(3), // default 1 = strict per-key serialization
+)
+
+// At most 50 starts per minute on the "emails" queue — a sliding window
+// counted over persisted claim times, so it survives File-mode restarts:
+q, _ := quacker.Open(
+    quacker.WithRate("emails", 50, time.Minute),
+)
+q.SetRateLimit("emails", 100, time.Minute) // adjustable at runtime
+```
+
+A due step whose key is saturated — or whose queue's window is full — stays
+`QUEUED` until a slot opens; nothing is rejected or dropped. Keys are visible
+in `Execution` snapshots (`Key` on the run and each step).
+
 ## Cancellation & shutdown
 
 ```go
@@ -157,11 +182,11 @@ at shutdown.
   enforced by the `.quacker.lock` kernel-lock guard: a second engine on
   the same path fails fast at `Open` instead of corrupting assumptions.
 
-## Not in v0.1
+## Not yet
 
-Distributed workers across processes, rate limiting, per-key concurrency
-strategies, durable pause/resume (durable sleep), worker labels/affinity, a
-web UI, OpenTelemetry.
+Distributed workers across processes, per-key rate limits and strict
+per-key ordering, durable pause/resume (durable sleep), worker
+labels/affinity, a web UI, OpenTelemetry.
 
 ## Documentation
 

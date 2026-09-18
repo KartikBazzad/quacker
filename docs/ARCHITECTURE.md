@@ -78,10 +78,12 @@ growth whenever readers are momentarily idle — plus a best-effort
 
 ```
 runs(id, workflow, kind, status, queue, priority, input, output, error,
-     attempts, max_attempts, run_at, created_at, started_at, completed_at)
+     attempts, max_attempts, run_at, created_at, started_at, completed_at,
+     concurrency_key)
 steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
-      run_at, created_at, started_at, completed_at)
+      run_at, created_at, started_at, completed_at,
+      concurrency_key, key_limit, claimed_at)
 crons(id, name UNIQUE, spec, task, input, next_at, created_at)
 logs(seq AUTOINCREMENT, run_id, step, at, level, message)
 schema_migrations(version PRIMARY KEY, applied_at)
@@ -96,6 +98,14 @@ Every task execution is a **step** row; a single-task run has exactly one.
 `steps.name` is the DAG identity, `steps.task` is the registered function to
 run (they differ for named workflow steps). `depends_on` is a comma-separated
 list of step names. Timestamps are unix nanoseconds (`0` = unset).
+
+Concurrency control columns (migration 2): `concurrency_key` is computed
+from the task's `WithKey` extractor at enqueue — steps sharing a key are
+capped at `key_limit` simultaneous `RUNNING` rows across all queues, checked
+as a correlated count inside the claim gate (see "Claim" below).
+`claimed_at` is stamped on *every* claim so a queue's `WithRate` sliding
+window can be counted from durable state; `started_at` keeps first-start
+semantics.
 
 ## Lifecycle of a run
 
@@ -118,9 +128,15 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
    (`status='QUEUED' AND run_at <= now`, ordered `priority DESC, run_at ASC`)
    in one immediate transaction: `UPDATE steps ... WHERE id=? AND
    status='QUEUED'` with a rows-affected check, plus `QUEUED→RUNNING` on the
-   parent run. Claims are issued only by the single scheduler goroutine, so
-   there is no cross-goroutine double-claim to defend against; the guarded
-   UPDATE is belt-and-braces.
+   parent run. Two extra gates apply inside the same transaction — a
+   **per-key gate** (`RUNNING` count sharing the step's `concurrency_key`
+   must be below `key_limit`, re-checked per UPDATE so a batch of same-key
+   candidates can't over-claim) and a **rate gate** (when the queue has a
+   rate limit, the batch is capped at the sliding window's remaining budget,
+   counted over `claimed_at`). Saturated steps simply stay QUEUED. Claims
+   are issued only by the single scheduler goroutine, so there is no
+   cross-goroutine double-claim to defend against; the guarded UPDATE is
+   belt-and-braces.
 3. **Execute**: one goroutine per claimed step, `context` with the step's
    timeout, panics recovered with a stack trace. Dependency outputs are
    loaded before the task runs and exposed via `DepOutput`. Task logs go

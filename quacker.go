@@ -55,6 +55,9 @@ func Open(opts ...Option) (*Quacker, error) {
 	for name, conc := range cfg.queues {
 		eng.SetQueue(name, conc)
 	}
+	for name, rc := range cfg.rates {
+		eng.SetRateLimit(name, rc.limit, rc.window)
+	}
 	eng.Start()
 	return &Quacker{st: st, eng: eng, log: cfg.logger}, nil
 }
@@ -83,6 +86,12 @@ func (q *Quacker) Cancel(runID string) error { return q.eng.Cancel(runID) }
 
 // SetQueue adjusts a queue's concurrency at runtime.
 func (q *Quacker) SetQueue(name string, concurrency int) { q.eng.SetQueue(name, concurrency) }
+
+// SetRateLimit adjusts a queue's start-rate cap at runtime — at most n runs
+// started per sliding window. n<=0 disables the cap; window<=0 is one second.
+func (q *Quacker) SetRateLimit(name string, n int, window time.Duration) {
+	q.eng.SetRateLimit(name, int64(n), window)
+}
 
 // Crons lists registered cron triggers.
 func (q *Quacker) Crons() []CronInfo {

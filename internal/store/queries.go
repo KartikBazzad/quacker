@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // CreateRun inserts a run and its initial steps in one transaction.
@@ -17,10 +18,10 @@ func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0)`,
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?)`,
 		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt)
+		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey)
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}
@@ -29,10 +30,11 @@ func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
 	}
 	for _, st := range steps {
 		_, err := tx.ExecContext(ctx, `INSERT INTO steps
-			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0)`,
+			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit)
+			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?)`,
 			st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, joinDeps(st.DependsOn), st.Queue, st.Priority,
-			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt)
+			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
+			st.ConcurrencyKey, st.KeyLimit)
 		if err != nil {
 			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
 		}
@@ -46,11 +48,29 @@ type Claim struct {
 	Run  *Run
 }
 
+// keyGate lets a claim proceed only while fewer than key_limit RUNNING
+// steps share the step's concurrency_key. It appears in both the candidate
+// SELECT (so saturated keys don't crowd the LIMIT with unclaimable rows)
+// and the per-step UPDATE (re-checked there against this transaction's own
+// earlier claims, which is what makes a batch of same-key steps safe).
+// The count is database state, not an in-memory semaphore: parked,
+// cancelled, and interrupted steps free their key automatically.
+const keyGate = `(concurrency_key = '' OR key_limit <= 0 OR
+	(SELECT COUNT(*) FROM steps r
+		WHERE r.concurrency_key = steps.concurrency_key
+		AND r.status = '` + StatusRunning + `') < steps.key_limit)`
+
 // ClaimDue claims up to limit due steps for the given queue, moving them and
 // their parent runs to RUNNING. Safe under concurrency: executed on the single
 // writer connection inside one immediate transaction, and each UPDATE is
-// guarded on the step still being QUEUED.
-func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64) ([]*Claim, error) {
+// guarded on the step still being QUEUED and its key gate.
+//
+// When rateLimit > 0 the queue is rate-limited: at most rateLimit steps may
+// be claimed in the trailing rateWindow nanoseconds (a sliding window over
+// claimed_at), so limit is capped at the window's remaining budget. The
+// count is persisted, so the window survives a File-mode restart instead of
+// allowing a fresh-process burst.
+func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64) ([]*Claim, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -60,8 +80,25 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 	}
 	defer tx.Rollback()
 
+	if rateLimit > 0 {
+		if rateWindow <= 0 {
+			rateWindow = int64(time.Second)
+		}
+		var started int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE queue=? AND claimed_at >= ?`,
+			queue, now-rateWindow).Scan(&started); err != nil {
+			return nil, err
+		}
+		if remaining := rateLimit - started; remaining < int64(limit) {
+			limit = int(remaining)
+		}
+		if limit <= 0 {
+			return nil, tx.Commit()
+		}
+	}
+
 	rows, err := tx.QueryContext(ctx, `SELECT `+stepCols+` FROM steps
-		WHERE status = ? AND run_at <= ? AND queue = ?
+		WHERE status = ? AND run_at <= ? AND queue = ? AND `+keyGate+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		StatusQueued, now, queue, limit)
 	if err != nil {
@@ -85,13 +122,15 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 	var claims []*Claim
 	for _, st := range cands {
 		res, err := tx.ExecContext(ctx, `UPDATE steps SET
-			status = ?, attempts = attempts + 1, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
-			WHERE id = ? AND status = ?`, StatusRunning, now, st.ID, StatusQueued)
+			status = ?, attempts = attempts + 1, claimed_at = ?,
+			started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
+			WHERE id = ? AND status = ? AND `+keyGate,
+			StatusRunning, now, now, st.ID, StatusQueued)
 		if err != nil {
 			return nil, err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
-			continue // someone else moved it; skip
+			continue // moved by someone else, or its key saturated mid-batch
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE runs SET
 			status = ?, attempts = attempts + 1, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
@@ -100,6 +139,7 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 		}
 		st.Status = StatusRunning
 		st.Attempts++
+		st.ClaimedAt = now
 		if st.StartedAt == 0 {
 			st.StartedAt = now
 		}
@@ -262,11 +302,13 @@ func (s *Store) RetryStep(ctx context.Context, stepID string, errMsg string, nex
 
 // ParkStep requeues a step that was claimed but never really executed (task
 // not registered in this process). Unlike RetryStep it hands back the
-// attempt ClaimDue took: parking is not a real execution attempt and must
-// not consume the task's retry budget.
+// attempt ClaimDue took — and clears claimed_at, so a parked claim doesn't
+// consume the queue's rate window either: parking is not a real execution
+// attempt and must not consume the task's retry budget.
 func (s *Store) ParkStep(ctx context.Context, stepID string, errMsg string, nextRunAt, now int64) error {
 	_, err := s.write.ExecContext(ctx, `UPDATE steps SET
-		status=?, error=?, run_at=?, attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE attempts END
+		status=?, error=?, run_at=?, claimed_at=0,
+		attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE attempts END
 		WHERE id=? AND status=?`,
 		StatusQueued, errMsg, nextRunAt, stepID, StatusRunning)
 	return err

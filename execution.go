@@ -38,9 +38,12 @@ func unixToTime(n int64) time.Time {
 
 // StepState is a point-in-time snapshot of one step.
 type StepState struct {
-	Name        string          `json:"name"`
-	Status      Status          `json:"status"`
-	Deps        []string        `json:"deps,omitempty"`
+	Name   string   `json:"name"`
+	Status Status   `json:"status"`
+	Deps   []string `json:"deps,omitempty"`
+	// Key is the step's concurrency key (empty when unkeyed). Steps
+	// sharing a key run at most KeyConcurrency at a time.
+	Key         string          `json:"key,omitempty"`
 	Attempts    int             `json:"attempts"`
 	MaxAttempts int             `json:"max_attempts"`
 	Timeout     time.Duration   `json:"timeout,omitempty"`
@@ -67,11 +70,14 @@ type Execution struct {
 	Input       json.RawMessage `json:"input,omitempty"`
 	Output      json.RawMessage `json:"output,omitempty"`
 	Error       string          `json:"error,omitempty"`
-	RunAt       time.Time       `json:"run_at"`
-	CreatedAt   time.Time       `json:"created_at"`
-	StartedAt   time.Time       `json:"started_at,omitempty"`
-	CompletedAt time.Time       `json:"completed_at,omitempty"`
-	Steps       []StepState     `json:"steps"`
+	// Key mirrors the first step's concurrency key (per-step keys in
+	// workflows may differ).
+	Key         string      `json:"key,omitempty"`
+	RunAt       time.Time   `json:"run_at"`
+	CreatedAt   time.Time   `json:"created_at"`
+	StartedAt   time.Time   `json:"started_at,omitempty"`
+	CompletedAt time.Time   `json:"completed_at,omitempty"`
+	Steps       []StepState `json:"steps"`
 }
 
 // RunSummary is a run without payloads, for list views.
@@ -153,14 +159,14 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 	ex := &Execution{
 		RunID: run.ID, Workflow: run.Workflow, Kind: Kind(run.Kind), Status: Status(run.Status),
 		Queue: run.Queue, Priority: run.Priority, Attempts: int(run.Attempts), MaxAttempts: int(run.MaxAttempts),
-		Input: run.Input, Output: run.Output, Error: run.Error,
+		Input: run.Input, Output: run.Output, Error: run.Error, Key: run.ConcurrencyKey,
 		RunAt: unixToTime(run.RunAt), CreatedAt: unixToTime(run.CreatedAt),
 		StartedAt: unixToTime(run.StartedAt), CompletedAt: unixToTime(run.CompletedAt),
 		Steps: make([]StepState, 0, len(steps)),
 	}
 	for _, s := range steps {
 		ex.Steps = append(ex.Steps, StepState{
-			Name: s.Name, Status: Status(s.Status), Deps: s.DependsOn,
+			Name: s.Name, Status: Status(s.Status), Deps: s.DependsOn, Key: s.ConcurrencyKey,
 			Attempts: int(s.Attempts), MaxAttempts: int(s.MaxAttempts), Timeout: s.Timeout,
 			Input: s.Input, Output: s.Output, Error: s.Error,
 			RunAt: unixToTime(s.RunAt), CreatedAt: unixToTime(s.CreatedAt),

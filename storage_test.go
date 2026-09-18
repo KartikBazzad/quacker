@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// TestSchemaMigrationsBaseline: a fresh File database baselines to schema
-// version 1, and reopening it stays at version 1 with no error.
+// TestSchemaMigrationsBaseline: a fresh File database baselines to the
+// latest schema version, and reopening it stays there with no error.
 func TestSchemaMigrationsBaseline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	q1, err := Open(WithStorage(File(path)), WithPollInterval(5*time.Millisecond))
@@ -28,8 +28,8 @@ func TestSchemaMigrationsBaseline(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("schema version = %d, want 1", v)
+	if v != 2 {
+		t.Fatalf("schema version = %d, want 2", v)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -50,8 +50,8 @@ func TestSchemaMigrationsBaseline(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("after reopen schema version = %d, want 1", v)
+	if v != 2 {
+		t.Fatalf("after reopen schema version = %d, want 2", v)
 	}
 }
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
@@ -34,8 +35,59 @@ func TestMigrateBaselinesLegacyShape(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("baseline schema version = %d, want 1", v)
+	if want := migrations[len(migrations)-1].version; v != want {
+		t.Fatalf("baseline schema version = %d, want %d", v, want)
+	}
+}
+
+// TestMigrationV2Columns: migration 2 adds the concurrency_key, key_limit,
+// and claimed_at columns — and a v1-shaped row survives the upgrade with
+// defaults intact, so it claims like any unkeyed step.
+func TestMigrationV2Columns(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "v1.db")
+	db, err := sql.Open("sqlite", "file:"+p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runs
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at)
+		VALUES ('r1', 'w', 'task', 'QUEUED', 'q', 0, NULL, NULL, '', 0, 1, 0, 0, 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO steps
+		(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at)
+		VALUES ('r1/s', 'r1', 's', 't', 0, 'QUEUED', '', 'q', 0, NULL, NULL, '', 0, 1, 0, 0, 0, 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(Config{Mode: ModeFile, Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// The upgraded step carries the new columns (all defaults: unkeyed,
+	// unlimited, never claimed) and claims normally.
+	var key string
+	var keyLimit, claimedAt int64
+	if err := s.Read().QueryRow(
+		`SELECT concurrency_key, key_limit, claimed_at FROM steps WHERE id='r1/s'`).
+		Scan(&key, &keyLimit, &claimedAt); err != nil {
+		t.Fatalf("select v2 columns: %v", err)
+	}
+	if key != "" || keyLimit != 0 || claimedAt != 0 {
+		t.Fatalf("v2 defaults = (%q,%d,%d), want ('',0,0)", key, keyLimit, claimedAt)
+	}
+	claims, err := s.ClaimDue(context.Background(), "q", 10, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Step.ID != "r1/s" {
+		t.Fatalf("claims = %+v, want the legacy step", claims)
 	}
 }
 

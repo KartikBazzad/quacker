@@ -43,8 +43,14 @@ type config struct {
 	storage            store.Config
 	checkpointInterval time.Duration
 	queues             map[string]int
+	rates              map[string]rateConfig
 	poll               time.Duration
 	logger             *slog.Logger
+}
+
+type rateConfig struct {
+	limit  int64
+	window time.Duration
 }
 
 // Option configures Open.
@@ -65,6 +71,20 @@ func WithQueue(name string, concurrency int) Option {
 			c.queues = map[string]int{}
 		}
 		c.queues[name] = concurrency
+	}
+}
+
+// WithRate caps how many runs a queue may start per window — a sliding
+// window counted over claim timestamps, so the cap survives a File-mode
+// restart instead of allowing a fresh-process burst. The scheduler simply
+// holds due work QUEUED while the window is full; nothing is rejected.
+// n<=0 disables the cap; per<=0 is treated as one second.
+func WithRate(queue string, n int, per time.Duration) Option {
+	return func(c *config) {
+		if c.rates == nil {
+			c.rates = map[string]rateConfig{}
+		}
+		c.rates[queue] = rateConfig{limit: int64(n), window: per}
 	}
 }
 

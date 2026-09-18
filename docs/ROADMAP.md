@@ -49,8 +49,20 @@ to the caller.
 
 | Item | Design sketch |
 |---|---|
-| Per-key concurrency | `quacker.WithKey(func(in I) string)` on a task; key persisted on `runs`/`steps` (new column + index, needs migrations). Engine keeps per-key semaphores in memory; scheduler claims a step only when its key has a free slot. Strategies: `N concurrent per key` (v0.2) and `strict order per key` (serialize; v0.3). |
-| Rate limiting | Token bucket per queue (and optionally per key): scheduler delays claims when the bucket is empty instead of claiming. Config: `quacker.WithRate("emails", 50, time.Minute)`. |
+| ✅ Per-key concurrency | `quacker.WithKey(func(in I) string)` on a task; key persisted on `runs`/`steps` (new column + index, needs migrations). Engine keeps per-key semaphores in memory; scheduler claims a step only when its key has a free slot. Strategies: `N concurrent per key` (v0.2) and `strict order per key` (serialize; v0.3). |
+| ✅ Rate limiting | Token bucket per queue (and optionally per key): scheduler delays claims when the bucket is empty instead of claiming. Config: `quacker.WithRate("emails", 50, time.Minute)`. |
+
+As built (deviating from the sketch where the sketch was weaker):
+per-key gating counts persisted `RUNNING` rows sharing the step's
+`concurrency_key` at claim time — no in-memory semaphores to leak on
+park/cancel/interrupt, and File-mode restarts inherit the right count.
+`WithKeyConcurrency(n)` gives N-per-key (default 1); strict-order-per-key
+stays v0.3. Rate limiting is a sliding window over persisted `claimed_at`
+timestamps inside the claim transaction — `WithRate(queue, n, per)` /
+`SetRateLimit` — which beats a token bucket on the acceptance test (no 2N
+boundary bursts) and survives restarts. Keys are visible in `Execution`
+(run + step level); schema migration v2 adds `concurrency_key`,
+`key_limit`, `claimed_at` + indexes.
 
 Acceptance: tests asserting max-concurrent-per-key under load; rate-limited
 queue never exceeds N starts per window; both observable in `Execution`

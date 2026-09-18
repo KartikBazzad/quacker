@@ -127,6 +127,56 @@ checkpointable and returns immediately, so the timer caps WAL growth
 whenever readers are momentarily idle. At `Close` no readers remain, so
 one best-effort TRUNCATE leaves an empty (usually deleted) `-wal` file.
 
+### 10. Per-key concurrency is a claim-time row count, not a semaphore
+
+The roadmap sketch said "per-key semaphores in memory". The shipped design
+keeps the semaphore in the database instead: each step persists its
+`concurrency_key` (computed once at enqueue) and `key_limit`, and the
+claim gate counts `RUNNING` rows sharing the key:
+
+```sql
+(concurrency_key = '' OR key_limit <= 0 OR
+  (SELECT COUNT(*) FROM steps r
+    WHERE r.concurrency_key = steps.concurrency_key
+      AND r.status = 'RUNNING') < steps.key_limit)
+```
+
+The gate appears twice in `ClaimDue`: in the candidate `SELECT` so
+saturated keys can't crowd the `LIMIT` with unclaimable rows, and in the
+per-step `UPDATE` where it is re-evaluated against the transaction's own
+earlier claims — the latter is what makes a batch of same-key candidates
+safe (the first claims, the rest see the fresh RUNNING row and skip).
+
+Why not the in-memory sketch: every terminal path — success, retry, fail,
+cancel, halt-tombstone, interrupt sweep, park — would owe a decrement, and
+any miss leaks a slot forever. Counting RUNNING rows is self-maintaining:
+parked, cancelled, and interrupted steps free their key automatically, and
+a File-mode restart inherits the right count from recovered state instead
+of rebuilding a semaphore from nothing. The cost is one correlated count
+per claim batch on an indexed column — trivial at single-writer scale.
+
+### 11. Rate limiting is a sliding window over persisted claim times
+
+Two designs were on the table: an in-memory token bucket, and counting
+claim timestamps in the database. The token bucket loses on both
+correctness axes that matter here:
+
+- **Boundary bursts**: a full bucket fires N at t=0, refills, and fires N
+  again at t=window — up to 2N starts in barely more than one window. The
+  stated acceptance ("never exceeds N starts per window") is the
+  sliding-window semantics, not token-bucket semantics.
+- **Restart amnesia**: a bucket resets at Open, so a File-mode process
+  restarted mid-window gets a fresh burst. `claimed_at` is persisted, so
+  the window is real: `ClaimDue` counts
+  `WHERE queue=? AND claimed_at >= now - window` inside the claim
+  transaction and caps the batch at the remaining budget.
+
+`claimed_at` is stamped on every QUEUED→RUNNING — deliberately *not*
+`started_at`, which keeps first-start semantics for introspection and
+would let retried steps sneak past the window (a retry is a start).
+`ParkStep` clears `claimed_at` for the same reason it returns the attempt:
+a parked claim never ran, so it shouldn't spend rate budget either.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

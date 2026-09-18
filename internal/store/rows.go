@@ -27,6 +27,9 @@ type Run struct {
 	CreatedAt   int64
 	StartedAt   int64
 	CompletedAt int64
+	// ConcurrencyKey mirrors the first step's key (informational; per-step
+	// keys in workflows may differ).
+	ConcurrencyKey string
 }
 
 // Step is a row in the steps table. A single-task run has exactly one step.
@@ -52,6 +55,16 @@ type Step struct {
 	CreatedAt   int64
 	StartedAt   int64
 	CompletedAt int64
+	// ConcurrencyKey groups steps whose concurrent execution is capped at
+	// KeyLimit across all queues ("" = unkeyed, never gated).
+	ConcurrencyKey string
+	// KeyLimit is the max simultaneously-RUNNING steps sharing
+	// ConcurrencyKey; <=0 is treated as unlimited by the claim gate.
+	KeyLimit int64
+	// ClaimedAt is stamped on every QUEUED→RUNNING transition so a queue's
+	// sliding-window start rate can be counted; ParkStep clears it since a
+	// parked claim never executed.
+	ClaimedAt int64
 }
 
 // Cron is a row in the crons table.
@@ -92,16 +105,17 @@ func splitDeps(s string) []string {
 }
 
 const runCols = `id, workflow, kind, status, queue, priority, input, output, error,
-	attempts, max_attempts, run_at, created_at, started_at, completed_at`
+	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key`
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
-	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at`
+	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
+	concurrency_key, key_limit, claimed_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.Workflow, &r.Kind, &r.Status, &r.Queue, &r.Priority,
 		&r.Input, &r.Output, &r.Error, &r.Attempts, &r.MaxAttempts,
-		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt)
+		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +127,8 @@ func scanStep(row interface{ Scan(...any) error }) (*Step, error) {
 	var deps string
 	err := row.Scan(&s.ID, &s.RunID, &s.Name, &s.Task, &s.Ord, &s.Status, &deps, &s.Queue, &s.Priority,
 		&s.Input, &s.Output, &s.Error, &s.Attempts, &s.MaxAttempts, &s.Timeout,
-		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt)
+		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt,
+		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt)
 	if err != nil {
 		return nil, err
 	}

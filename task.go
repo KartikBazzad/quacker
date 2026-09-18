@@ -31,6 +31,8 @@ type taskConfig struct {
 	maxAttempts int
 	timeout     time.Duration
 	backoff     Backoff
+	keyFn       func(json.RawMessage) string
+	keyLimit    int
 }
 
 // Retries sets how many times a failed attempt is retried (maxAttempts =
@@ -55,6 +57,34 @@ func Timeout(d time.Duration) TaskOption {
 // Default: "default".
 func Queue(name string) TaskOption {
 	return func(c *taskConfig) { c.queue = name }
+}
+
+// WithKey extracts a concurrency key from the task input. Steps sharing a
+// key are capped at WithKeyConcurrency (default 1) simultaneous executions
+// across all queues — the scheduler holds a due step QUEUED until its key
+// has a free slot. The cap is enforced by counting RUNNING rows at claim
+// time, so it survives restarts and needs no per-key bookkeeping. A task
+// without WithKey is never key-gated; a key function returning "" leaves
+// that run unkeyed.
+func WithKey[I any](fn func(I) string) TaskOption {
+	return func(c *taskConfig) {
+		c.keyFn = func(raw json.RawMessage) string {
+			var in I
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := json.Unmarshal(raw, &in); err != nil {
+					return "" // undecodable input leaves the run unkeyed; the task's own decode surfaces the error at execution
+				}
+			}
+			return fn(in)
+		}
+	}
+}
+
+// WithKeyConcurrency sets how many runs sharing one WithKey may execute
+// concurrently (default 1 = strict serialization per key). Meaningless
+// without WithKey; values <1 are treated as 1.
+func WithKeyConcurrency(n int) TaskOption {
+	return func(c *taskConfig) { c.keyLimit = n }
 }
 
 // Task is a named, typed unit of work. Create with NewTask; the same value
@@ -85,7 +115,7 @@ func (t *Task[I, O]) Name() string { return t.name }
 
 // toDef adapts the typed task to the engine's JSON-based definition.
 func (t *Task[I, O]) toDef() *engine.TaskDef {
-	return &engine.TaskDef{
+	def := &engine.TaskDef{
 		Name:        t.name,
 		Queue:       t.cfg.queue,
 		MaxAttempts: t.cfg.maxAttempts,
@@ -105,4 +135,7 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 			return json.Marshal(out)
 		},
 	}
+	def.KeyFn = t.cfg.keyFn
+	def.KeyLimit = t.cfg.keyLimit
+	return def
 }

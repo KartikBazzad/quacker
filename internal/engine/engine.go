@@ -43,6 +43,13 @@ type TaskDef struct {
 	Timeout     time.Duration
 	Backoff     Backoff
 	Fn          func(ctx context.Context, input json.RawMessage) (json.RawMessage, error)
+	// KeyFn extracts a concurrency key from the step input; steps sharing
+	// a key are capped at KeyLimit concurrent executions across all queues.
+	// nil means unkeyed.
+	KeyFn func(input json.RawMessage) string
+	// KeyLimit is the max simultaneously-running steps sharing one key;
+	// <1 is normalized to 1 at enqueue when a key is present.
+	KeyLimit int
 }
 
 // StepReq is one step of an enqueue request.
@@ -76,6 +83,11 @@ type queueState struct {
 	// e.mu while SetQueue may write concurrently.
 	concurrency atomic.Int64
 	inFlight    atomic.Int64
+	// rateLimit/rateWindow are the queue's sliding-window start cap:
+	// rateLimit>0 means at most that many claims in the trailing
+	// rateWindow nanoseconds. Atomic for the same snapshot-read reason.
+	rateLimit  atomic.Int64
+	rateWindow atomic.Int64
 }
 
 type cronEntry struct {
@@ -246,6 +258,24 @@ func (e *Engine) SetQueue(name string, concurrency int) {
 	e.queues[name] = newQueueState(concurrency)
 }
 
+// SetRateLimit caps how many steps a queue may start per window (a sliding
+// window counted over claim timestamps, so the cap survives a File-mode
+// restart). n<=0 disables the cap; window<=0 is treated as one second.
+func (e *Engine) SetRateLimit(name string, n int64, window time.Duration) {
+	if window <= 0 {
+		window = time.Second
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	q := e.queues[name]
+	if q == nil {
+		q = newQueueState(DefaultQueueConcurrency)
+		e.queues[name] = q
+	}
+	q.rateLimit.Store(n)
+	q.rateWindow.Store(int64(window))
+}
+
 // ensureQueue creates a queue with default concurrency if it doesn't exist;
 // it never overrides an existing configuration.
 func (e *Engine) ensureQueue(name string) {
@@ -374,15 +404,31 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 		if len(sr.Deps) > 0 {
 			status = store.StatusBlocked
 		}
+		// The concurrency key is computed once at enqueue from the run's
+		// input and persisted, so the claim gate is a pure DB check — no
+		// in-memory semaphore to rebuild after a File-mode restart.
+		var key string
+		var keyLimit int64
+		if def.KeyFn != nil {
+			key = def.KeyFn(req.Input)
+			if key != "" {
+				keyLimit = int64(def.KeyLimit)
+				if keyLimit < 1 {
+					keyLimit = 1
+				}
+			}
+		}
 		steps = append(steps, &store.Step{
 			ID: runID + "/" + sr.Name, RunID: runID, Name: sr.Name, Task: def.Name, Ord: int64(i),
 			Status: status, DependsOn: sr.Deps, Queue: stepQueue, Priority: req.Priority,
 			Input: req.Input, MaxAttempts: int64(maxAtt), Timeout: def.Timeout,
 			RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
+			ConcurrencyKey: key, KeyLimit: keyLimit,
 		})
 	}
 	// run-level max attempts mirrors the first step for introspection.
 	run.MaxAttempts = steps[0].MaxAttempts
+	run.ConcurrencyKey = steps[0].ConcurrencyKey
 
 	// Registration and the closing check happen under one lock so an enqueue
 	// racing Close either lands in the sweep or is rejected — never stranded
@@ -482,7 +528,8 @@ func (e *Engine) tick() {
 			if slots <= 0 {
 				break
 			}
-			claims, err := e.st.ClaimDue(e.ctx, q, slots, now)
+			claims, err := e.st.ClaimDue(e.ctx, q, slots, now,
+				qs.rateLimit.Load(), qs.rateWindow.Load())
 			if err != nil {
 				if e.ctx.Err() == nil {
 					e.log.Error("quacker: claim failed", "queue", q, "err", err)
