@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" driver
 )
@@ -45,7 +47,15 @@ type Config struct {
 	// INTERRUPTED by a previous process are re-queued on Open; when false
 	// they are marked FAILED with an "interrupted" error. Default true.
 	RecoverRunningOnBoot bool
+	// CheckpointInterval is how often WAL modes (Ephemeral, File) run a
+	// passive wal_checkpoint to bound WAL growth. <=0 uses the 60s default.
+	// ModeMemory never checkpoints: :memory: databases have no WAL.
+	CheckpointInterval time.Duration
 }
+
+// defaultCheckpointInterval bounds WAL growth when CheckpointInterval is
+// unset.
+const defaultCheckpointInterval = 60 * time.Second
 
 // dsn returns the writer DSN, reader DSN, and (for ModeEphemeral) the temp
 // file path to remove on Close.
@@ -100,7 +110,14 @@ type Store struct {
 	read    *sql.DB // read-only connections (query_only)
 	keep    *sql.DB // keeper pool pinning the shared-cache in-memory DB
 	tmpPath string
-	closed  atomic.Bool
+	// lockPath is set only when this store created the File-mode lockfile;
+	// Close removes it so a dead process never leaves a stale lock.
+	lockPath   string
+	wal        bool // WAL journal modes run checkpoints
+	ckptDone   chan struct{}
+	ckptCancel context.CancelFunc
+	ckptWG     sync.WaitGroup
+	closed     atomic.Bool
 }
 
 var memSerial atomic.Int64
@@ -111,7 +128,18 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{tmpPath: tmpPath}
+	s := &Store{tmpPath: tmpPath, wal: cfg.Mode != ModeMemory}
+
+	if cfg.Mode == ModeFile {
+		// Take the single-writer lock before any connection touches the
+		// file: the lockfile is created atomically (tmp + link(2)), so two
+		// opens can never both win.
+		lockPath, err := acquireFileLock(cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		s.lockPath = lockPath
+	}
 
 	w, err := sql.Open("sqlite", wdsn)
 	if err != nil {
@@ -170,6 +198,17 @@ func Open(cfg Config) (*Store, error) {
 			return nil, err
 		}
 	}
+	if s.wal {
+		interval := cfg.CheckpointInterval
+		if interval <= 0 {
+			interval = defaultCheckpointInterval
+		}
+		s.ckptDone = make(chan struct{})
+		ckptCtx, ckptCancel := context.WithCancel(context.Background())
+		s.ckptCancel = ckptCancel
+		s.ckptWG.Add(1)
+		go s.checkpointLoop(ckptCtx, interval)
+	}
 	return s, nil
 }
 
@@ -180,10 +219,41 @@ func (s *Store) Write() *sql.DB { return s.write }
 // mode its queries never block (or get blocked by) the write path.
 func (s *Store) Read() *sql.DB { return s.read }
 
-// Close closes both pools and removes any ephemeral database file.
+// checkpointLoop runs a PASSIVE wal_checkpoint on the writer every d.
+// PASSIVE never waits on the writer or readers — it checkpoints whatever
+// is safely checkpointable and returns — so the timer can sit on the hot
+// path and still cap WAL growth whenever readers are momentarily idle.
+func (s *Store) checkpointLoop(ctx context.Context, d time.Duration) {
+	defer s.ckptWG.Done()
+	t := time.NewTicker(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ckptDone:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// ExecContext lets Close interrupt an Exec queued behind a
+			// long write tx on the single-conn pool.
+			_, _ = s.write.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+		}
+	}
+}
+
+// Close closes both pools and removes any ephemeral database file. On WAL
+// modes it first stops the checkpoint goroutine, then — once the read pool
+// is closed and no reader snapshot can linger — runs a best-effort
+// truncating checkpoint so a clean close leaves an empty (usually deleted)
+// -wal file.
 func (s *Store) Close() error {
 	if s == nil || s.closed.Swap(true) {
 		return nil
+	}
+	if s.ckptDone != nil {
+		close(s.ckptDone)
+		s.ckptCancel()
+		s.ckptWG.Wait()
 	}
 	var errs []error
 	if s.keep != nil {
@@ -196,10 +266,18 @@ func (s *Store) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if s.wal && s.write != nil {
+		// Best-effort: with the read pool closed no snapshot remains, so
+		// TRUNCATE merges and empties the WAL in one shot.
+		_, _ = s.write.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	}
 	if s.write != nil {
 		if err := s.write.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if s.lockPath != "" {
+		releaseFileLock(s.lockPath)
 	}
 	if s.tmpPath != "" {
 		for _, p := range []string{s.tmpPath, s.tmpPath + "-wal", s.tmpPath + "-shm"} {

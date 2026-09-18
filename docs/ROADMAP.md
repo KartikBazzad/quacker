@@ -28,13 +28,18 @@ See DESIGN_NOTES.md for the full list.
 Acceptance: a test that runs two engines concurrently and asserts each run's
 logs appear only in its own instance's store.
 
-### P0 — storage foundation
+### P0 — storage foundation (✅ DONE)
 
 | Item | Design sketch |
 |---|---|
-| Schema migrations | `schema_migrations(version INT PRIMARY KEY, applied_at)` + ordered migration list; `CREATE TABLE IF NOT EXISTS` stops being the whole story. **Prerequisite for every later schema change** (keyed concurrency, parent runs, retention columns). |
-| Single-writer guard for `File` mode | Advisory lock (SQLite's own locking via a probe txn, or an `O_EXCL` lockfile with pid) so a second engine on the same path fails fast with a clear error instead of corrupting assumptions. |
-| WAL hygiene | Periodic `PRAGMA wal_checkpoint(TRUNCATE)` on a timer; cap WAL growth for long-running File deployments. |
+| ✅ Schema migrations | `schema_migrations(version INT PRIMARY KEY, applied_at)` + ordered migration list; `CREATE TABLE IF NOT EXISTS` stops being the whole story. **Prerequisite for every later schema change** (keyed concurrency, parent runs, retention columns). |
+| ✅ Single-writer guard for `File` mode | Atomic lockfile with pid (a sibling temp file `link(2)`ed into place) so a second engine on the same path fails fast with a clear error instead of corrupting assumptions. |
+| ✅ WAL hygiene | Periodic `PRAGMA wal_checkpoint(PASSIVE)` on a timer plus a `TRUNCATE` checkpoint on close; cap WAL growth for long-running File deployments. |
+
+As built: migrations apply per-version in one transaction (v0.1 file DBs
+baseline at 1); the guard is an atomically-created lockfile with a
+`kill(pid, 0)` stale check; checkpoints are `PASSIVE` every
+`WithCheckpointInterval` (default 60s) plus `TRUNCATE` on close.
 
 ### P1 — concurrency control (flagship v0.2 features)
 

@@ -40,6 +40,7 @@ func Open(opts ...Option) (*Quacker, error) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
+	cfg.storage.CheckpointInterval = cfg.checkpointInterval
 	st, err := store.Open(cfg.storage)
 	if err != nil {
 		return nil, err

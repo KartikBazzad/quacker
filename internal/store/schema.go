@@ -97,9 +97,61 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS idx_logs_run ON logs (run_id, seq);
 `
 
+// migration is one schema change applied atomically with its version row.
+// Migrations run in list order; each applies only when its version is ahead
+// of the database's recorded version.
+type migration struct {
+	version int
+	sql     string
+}
+
+var migrations = []migration{
+	{version: 1, sql: schema},
+}
+
+// migrate brings the database to the latest schema version. The
+// schema_migrations table is created first so every later migration can be
+// recorded in the same transaction as its DDL. Migration 1 is all
+// CREATE-IF-NOT-EXISTS, so a v0.1 File database (tables present, no version
+// row) baselines to version 1 without touching existing data.
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.write.ExecContext(ctx, schema); err != nil {
+	if _, err := s.write.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at INTEGER NOT NULL
+	)`); err != nil {
 		return fmt.Errorf("quacker: migrate: %w", err)
+	}
+	var version int
+	if err := s.write.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
+		return fmt.Errorf("quacker: migrate: %w", err)
+	}
+	// A database written by a newer build records a version this build
+	// doesn't know; refuse rather than run it through older assumptions.
+	// migrations is ordered ascending, so the last entry is the max.
+	if max := migrations[len(migrations)-1].version; version > max {
+		return fmt.Errorf("quacker: database schema version %d is newer than this build supports (max %d)", version, max)
+	}
+	for _, m := range migrations {
+		if m.version <= version {
+			continue
+		}
+		tx, err := s.write.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("quacker: migrate: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, m.sql); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("quacker: migrate to version %d: %w", m.version, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)`, m.version, nowUnix()); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("quacker: record migration %d: %w", m.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("quacker: migrate to version %d: %w", m.version, err)
+		}
 	}
 	return nil
 }

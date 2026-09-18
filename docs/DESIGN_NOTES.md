@@ -65,6 +65,29 @@ Run-level final updates are conditioned on
 against executors recording their own outcome, without any locking between
 them.
 
+### 8. The single-writer guard is a lockfile, not a SQLite probe
+
+A probe transaction can prove a database is writable, but only while held
+— keeping exclusion would mean holding an exclusive txn for the process
+lifetime, which blocks checkpoints and every other tool that touches the
+file. A lockfile (`<path>.quacker.lock` with pid/host/time) is
+held for free, fails `Open` before any connection touches the database,
+and is inspectable when debugging. Crash leftovers are reclaimed by a
+`kill(pid, 0)` liveness check; non-unix builds conservatively treat every
+pid as alive. Creation is atomic — the content is written to a sibling
+temp file and `link(2)`ed into place — because an `O_EXCL`
+create-then-write left a window where a second opener could read the file
+empty, call it stale, and steal the lock.
+
+### 9. Checkpoints are PASSIVE on the timer, TRUNCATE only at close
+
+A periodic `wal_checkpoint(TRUNCATE)` waits on reader snapshots (up to
+busy_timeout) — the wrong thing to run on a hot path whose selling point
+is non-blocking reads. `PASSIVE` checkpoints whatever is safely
+checkpointable and returns immediately, so the timer caps WAL growth
+whenever readers are momentarily idle. At `Close` no readers remain, so
+one best-effort TRUNCATE leaves an empty (usually deleted) `-wal` file.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

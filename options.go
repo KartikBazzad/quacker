@@ -40,10 +40,11 @@ func (s Storage) RecoverRunningOnBoot(requeue bool) Storage {
 }
 
 type config struct {
-	storage store.Config
-	queues  map[string]int
-	poll    time.Duration
-	logger  *slog.Logger
+	storage            store.Config
+	checkpointInterval time.Duration
+	queues             map[string]int
+	poll               time.Duration
+	logger             *slog.Logger
 }
 
 // Option configures Open.
@@ -72,6 +73,14 @@ func WithQueue(name string, concurrency int) Option {
 // how late a delayed run can start after its run_at passes. Default 50ms.
 func WithPollInterval(d time.Duration) Option {
 	return func(c *config) { c.poll = d }
+}
+
+// WithCheckpointInterval sets how often WAL-backed storage (Ephemeral,
+// File) runs a passive wal_checkpoint to bound WAL growth. The checkpoint
+// never blocks readers or the writer. Default 60s; Memory storage has no
+// WAL and never checkpoints.
+func WithCheckpointInterval(d time.Duration) Option {
+	return func(c *config) { c.checkpointInterval = d }
 }
 
 // WithLogger sets the engine logger (default slog.Default()).

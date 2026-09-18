@@ -59,6 +59,17 @@ Connection topology:
 
 Pragmas on every connection: `busy_timeout=10000`, `foreign_keys=1`.
 
+File mode additionally serializes *engines*, not just writers: `Open`
+creates `<path>.quacker.lock` atomically — content written to a sibling
+temp file, `link(2)`ed into place — before any connection touches the
+file (recording pid/host/time). A live owner pid fails `Open` fast; a
+dead one is stale and reclaimed. `Close` removes it if it's still ours.
+
+WAL modes run a goroutine issuing `PRAGMA wal_checkpoint(PASSIVE)` every
+`Config.CheckpointInterval` (default 60s) — never blocking, capping WAL
+growth whenever readers are momentarily idle — plus a best-effort
+`wal_checkpoint(TRUNCATE)` at `Close`.
+
 ### Schema
 
 ```
@@ -69,7 +80,13 @@ steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       run_at, created_at, started_at, completed_at)
 crons(id, name UNIQUE, spec, task, input, next_at, created_at)
 logs(seq AUTOINCREMENT, run_id, step, at, level, message)
+schema_migrations(version PRIMARY KEY, applied_at)
 ```
+
+Schema changes ship as an ordered migration list; `migrate` applies each
+pending entry in one transaction together with its `schema_migrations`
+version row. Migration 1 is all `CREATE TABLE IF NOT EXISTS`, so a v0.1
+File database (tables present, no version row) baselines at version 1.
 
 Every task execution is a **step** row; a single-task run has exactly one.
 `steps.name` is the DAG identity, `steps.task` is the registered function to

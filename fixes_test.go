@@ -315,7 +315,8 @@ func TestMultiEngineLogsStayIsolated(t *testing.T) {
 	}
 	waitFor(t, 3*time.Second, func() bool {
 		logs1, _ := q1.Logs(context.Background(), h1.RunID(), 10)
-		return len(logs1) > 0
+		logs2, _ := q2.Logs(context.Background(), h2.RunID(), 10)
+		return len(logs1) > 0 && len(logs2) > 0
 	})
 	logs1, _ := q1.Logs(context.Background(), h1.RunID(), 10)
 	logs2, _ := q2.Logs(context.Background(), h2.RunID(), 10)

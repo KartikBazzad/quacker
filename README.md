@@ -65,6 +65,15 @@ quacker.Open(quacker.WithStorage(quacker.File("state.db").RecoverRunningOnBoot(t
   are truly lock-free versus the write path.
 - **`File`** — survives restarts. Runs interrupted by a previous process are
   re-queued on boot (or marked failed with `RecoverRunningOnBoot(false)`).
+  Opening a `File` path takes an exclusive `<path>.quacker.lock`, so a
+  second engine on the same path fails fast; locks left by dead processes
+  are reclaimed by pid check. The pid probe is unix-only — on other
+  platforms a leftover lock fails safe (reports in-use) and can be
+  removed manually.
+
+WAL modes (`Ephemeral`, `File`) run a passive `wal_checkpoint` every 60s
+(`WithCheckpointInterval`) and a truncating checkpoint on `Close`, so a
+clean shutdown leaves the `-wal` file empty (usually deleted).
 
 How non-blocking introspection works: the store keeps a **single writer
 connection** and a **separate read-only pool**. In WAL mode readers never
@@ -143,7 +152,9 @@ at shutdown.
   Unregistered tasks are retried every 5s until registered.
 - **`@every` intervals round up to 1 second** (cron parser limitation).
 - Tasks should honor `ctx` — timeouts and cancellation are cooperative.
-- One engine per process assumes a single writer to a given `File` path.
+- One engine per process assumes a single writer to a given `File` path —
+  enforced by the `.quacker.lock` guard: a second engine on the same path
+  fails fast at `Open` instead of corrupting assumptions.
 
 ## Not in v0.1
 
