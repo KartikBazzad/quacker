@@ -33,6 +33,7 @@ type taskConfig struct {
 	backoff     Backoff
 	keyFn       func(json.RawMessage) string
 	keyLimit    int
+	wrap        []engine.Middleware
 }
 
 // Retries sets how many times a failed attempt is retried (maxAttempts =
@@ -87,6 +88,13 @@ func WithKeyConcurrency(n int) TaskOption {
 	return func(c *taskConfig) { c.keyLimit = n }
 }
 
+// Wrap attaches per-task middleware around this task's body. Engine-wide
+// middleware (WithMiddleware / Quacker.Use) still wraps the result, so the
+// order is global → per-task → body.
+func Wrap(mw ...Middleware) TaskOption {
+	return func(c *taskConfig) { c.wrap = append(c.wrap, mw...) }
+}
+
 // Task is a named, typed unit of work. Create with NewTask; the same value
 // is used to enqueue runs, register for restart recovery, and attach crons.
 type Task[I, O any] struct {
@@ -137,5 +145,6 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	}
 	def.KeyFn = t.cfg.keyFn
 	def.KeyLimit = t.cfg.keyLimit
+	def.Wrappers = t.cfg.wrap
 	return def
 }

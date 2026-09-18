@@ -116,6 +116,10 @@ type Metrics struct {
 	Queues map[string]QueueStats `json:"queues"`
 }
 
+// MetricsSnapshot is the value handed to the WithMetricsFunc callback; it has
+// the same shape as Metrics.
+type MetricsSnapshot = Metrics
+
 // LogEntry is one task log line captured via TaskLogger.
 type LogEntry struct {
 	RunID   string    `json:"run_id"`

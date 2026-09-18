@@ -119,9 +119,16 @@ CREATE INDEX IF NOT EXISTS idx_steps_key ON steps (concurrency_key, status);
 CREATE INDEX IF NOT EXISTS idx_steps_claimed ON steps (queue, claimed_at);
 `
 
+// migration 3 adds an index supporting retention/purge, which selects
+// terminal runs by completion time (status IN (...) AND completed_at < ?).
+const migration3 = `
+CREATE INDEX IF NOT EXISTS idx_runs_purge ON runs (status, completed_at);
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
+	{version: 3, sql: migration3},
 }
 
 // init validates the migration list's invariant before any Open can rely

@@ -45,9 +45,24 @@ func Open(opts ...Option) (*Quacker, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng, err := engine.New(engine.Options{
+	eopts := engine.Options{
 		Store: st, Log: cfg.logger, PollInterval: cfg.poll,
-	})
+		Middleware:      cfg.middleware,
+		LogStorage:      cfg.logStorage,
+		MetricsInterval: cfg.metricsInterval,
+		Retention:       cfg.retention,
+	}
+	if cfg.logSink != nil {
+		fn := cfg.logSink
+		eopts.LogSink = func(e store.LogEntry) {
+			fn(LogEntry{RunID: e.RunID, Step: e.Step, At: unixToTime(e.At), Level: e.Level, Message: e.Message})
+		}
+	}
+	if cfg.metricsFn != nil {
+		fn := cfg.metricsFn
+		eopts.OnMetrics = func(s engine.MetricsSnapshot) { fn(metricsFromSnapshot(s)) }
+	}
+	eng, err := engine.New(eopts)
 	if err != nil {
 		st.Close()
 		return nil, err
@@ -86,6 +101,10 @@ func (q *Quacker) Cancel(runID string) error { return q.eng.Cancel(runID) }
 
 // SetQueue adjusts a queue's concurrency at runtime.
 func (q *Quacker) SetQueue(name string, concurrency int) { q.eng.SetQueue(name, concurrency) }
+
+// Use appends engine-wide middleware at runtime; safe before or after work
+// starts. The first registered middleware is the outermost wrapper.
+func (q *Quacker) Use(mw ...Middleware) { q.eng.Use(mw...) }
 
 // SetRateLimit adjusts a queue's start-rate cap at runtime — at most n runs
 // started per sliding window. n<=0 disables the cap; window<=0 is one second.
@@ -204,4 +223,17 @@ func Cron[I any, O any](q *Quacker, name, spec string, t *Task[I, O], input I) e
 		return err
 	}
 	return q.eng.RegisterCron(name, spec, t.toDef(), inputJSON)
+}
+
+// metricsFromSnapshot converts the engine's string-keyed snapshot into the
+// public Metrics shape used by the WithMetricsFunc callback.
+func metricsFromSnapshot(s engine.MetricsSnapshot) *Metrics {
+	m := &Metrics{Runs: make(map[Status]int64, len(s.Runs)), Queues: make(map[string]QueueStats, len(s.Queues))}
+	for st, n := range s.Runs {
+		m.Runs[Status(st)] = n
+	}
+	for name, qs := range s.Queues {
+		m.Queues[name] = QueueStats{Queued: qs.Queued, Running: qs.Running, Blocked: qs.Blocked}
+	}
+	return m
 }

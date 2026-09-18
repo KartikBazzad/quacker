@@ -35,6 +35,15 @@ var (
 // never configured via SetQueue.
 const DefaultQueueConcurrency = 10
 
+// Handler is the JSON-level signature of a task body. Middleware wraps
+// Handlers.
+type Handler func(ctx context.Context, input json.RawMessage) (json.RawMessage, error)
+
+// Middleware decorates task execution. The first middleware registered is
+// the outermost: global middlewares run before per-task ones, which run
+// before the task body. A middleware may short-circuit by not calling next.
+type Middleware func(next Handler) Handler
+
 // TaskDef is the engine-level, non-generic description of a task.
 type TaskDef struct {
 	Name        string
@@ -42,7 +51,10 @@ type TaskDef struct {
 	MaxAttempts int
 	Timeout     time.Duration
 	Backoff     Backoff
-	Fn          func(ctx context.Context, input json.RawMessage) (json.RawMessage, error)
+	Fn          Handler
+	// Wrappers are per-task middlewares, applied inside the engine's global
+	// middleware chain.
+	Wrappers []Middleware
 	// KeyFn extracts a concurrency key from the step input; steps sharing
 	// a key are capped at KeyLimit concurrent executions across all queues.
 	// nil means unkeyed.
@@ -109,12 +121,13 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu      sync.RWMutex
-	queues  map[string]*queueState
-	tasks   map[string]*TaskDef
-	crons   map[string]*cronEntry
-	waiters map[string]*Waiter
-	cancels map[string]context.CancelFunc
+	mu         sync.RWMutex
+	queues     map[string]*queueState
+	tasks      map[string]*TaskDef
+	crons      map[string]*cronEntry
+	waiters    map[string]*Waiter
+	cancels    map[string]context.CancelFunc
+	middleware []Middleware
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -122,15 +135,27 @@ type Engine struct {
 	haltSteps map[string]struct{}
 
 	wg      sync.WaitGroup // in-flight step executions
-	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron)
+	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
 	wake    chan struct{}
 	closing atomic.Bool
 
+	// logSinks are the fanned-out destinations for task log lines. They are
+	// fixed at construction (the storage sink, if any, plus a base sink when
+	// no custom one was supplied).
+	logSinks []func(store.LogEntry)
+	// logStorage enables the built-in SQLite log sink and its flusher.
+	logStorage  bool
 	logCh       chan store.LogEntry
 	logWG       sync.WaitGroup
 	logMu       sync.Mutex
 	logClosed   bool
 	droppedLogs atomic.Int64
+
+	// metrics, when non-nil, is invoked on metricsInterval with a snapshot.
+	onMetrics       func(MetricsSnapshot)
+	metricsInterval time.Duration
+	// retention, when non-nil, purges terminal runs on its own interval.
+	retention *RetentionPolicy
 
 	unknownWarned sync.Map // task name -> warned once
 }
@@ -145,6 +170,20 @@ type Options struct {
 	PollInterval time.Duration
 	// Now overrides the clock (tests).
 	Now func() time.Time
+	// Middleware is the engine-wide middleware chain, applied outside every
+	// task's own Wrappers.
+	Middleware []Middleware
+	// LogSink is the base task-log destination. When nil and LogStorage is
+	// off, task logs go to the engine logger; when nil and LogStorage is on,
+	// they persist to SQLite only.
+	LogSink func(store.LogEntry)
+	// LogStorage enables the built-in SQLite task-log sink (and q.Logs).
+	LogStorage bool
+	// OnMetrics, when set, is called every MetricsInterval with a snapshot.
+	OnMetrics       func(MetricsSnapshot)
+	MetricsInterval time.Duration
+	// Retention, when set, runs PurgeRuns on RetentionInterval.
+	Retention *RetentionPolicy
 }
 
 // New returns an engine. Call Start to begin scheduling.
@@ -165,7 +204,7 @@ func New(o Options) (*Engine, error) {
 		o.Bus = bus.New()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Engine{
+	e := &Engine{
 		st:        o.Store,
 		bus:       o.Bus,
 		log:       o.Log,
@@ -180,8 +219,32 @@ func New(o Options) (*Engine, error) {
 		cancels:   map[string]context.CancelFunc{},
 		haltSteps: map[string]struct{}{},
 		wake:      make(chan struct{}, 1),
-		logCh:     make(chan store.LogEntry, 4096),
-	}, nil
+
+		middleware:      append([]Middleware(nil), o.Middleware...),
+		onMetrics:       o.OnMetrics,
+		metricsInterval: o.MetricsInterval,
+		retention:       o.Retention,
+	}
+	if e.metricsInterval <= 0 {
+		e.metricsInterval = 15 * time.Second
+	}
+	if e.metricsInterval < 100*time.Millisecond {
+		e.metricsInterval = 100 * time.Millisecond
+	}
+	e.logStorage = o.LogStorage
+	var sinks []func(store.LogEntry)
+	if o.LogSink != nil {
+		sinks = append(sinks, o.LogSink)
+	}
+	if e.logStorage {
+		sinks = append(sinks, e.storageLogSink)
+		e.logCh = make(chan store.LogEntry, 4096)
+	}
+	if len(sinks) == 0 {
+		sinks = append(sinks, e.slogLogSink)
+	}
+	e.logSinks = sinks
+	return e, nil
 }
 
 // Start launches the scheduler, cron, and log-flush loops. Queues that exist
@@ -193,11 +256,21 @@ func (e *Engine) Start() {
 			e.ensureQueue(q)
 		}
 	}
-	e.logWG.Add(1)
-	go e.flushLogs()
+	if e.logStorage {
+		e.logWG.Add(1)
+		go e.flushLogs()
+	}
 	e.loopWG.Add(2)
 	go func() { defer e.loopWG.Done(); e.schedulerLoop() }()
 	go func() { defer e.loopWG.Done(); e.cronLoop() }()
+	if e.onMetrics != nil {
+		e.loopWG.Add(1)
+		go func() { defer e.loopWG.Done(); e.metricsLoop() }()
+	}
+	if e.retention != nil {
+		e.loopWG.Add(1)
+		go func() { defer e.loopWG.Done(); e.retentionLoop() }()
+	}
 }
 
 // Close stops the engine: no new work is claimed, in-flight executions drain
@@ -235,12 +308,14 @@ func (e *Engine) Close(ctx context.Context) error {
 	}
 	// Seal the log channel before closing it: logSend checks logClosed under
 	// the same mutex, so a task that outlived the drain can never send on a
-	// closed channel.
-	e.logMu.Lock()
-	e.logClosed = true
-	e.logMu.Unlock()
-	close(e.logCh)
-	e.logWG.Wait()
+	// closed channel. Only the built-in storage sink uses the channel.
+	if e.logStorage {
+		e.logMu.Lock()
+		e.logClosed = true
+		e.logMu.Unlock()
+		close(e.logCh)
+		e.logWG.Wait()
+	}
 	return ctx.Err()
 }
 
@@ -624,13 +699,15 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 			}
 		}
 	}
+	stepCtx := withStepContext(taskCtx, c, depOutputs, e.logSend)
+	handler := e.wrapHandler(def)
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("panic: %v\n%s", r, stack())
 			}
 		}()
-		out, err = def.Fn(withStepContext(taskCtx, c, depOutputs, e.logSend), st.Input)
+		out, err = handler(stepCtx, st.Input)
 	}()
 
 	now := e.now()
@@ -744,6 +821,24 @@ func (e *Engine) taskDef(name string) *TaskDef {
 	return e.tasks[name]
 }
 
+// wrapHandler composes the middleware chain around a task body:
+// global[0] → … → global[n] → task[0] → … → Fn. The global slice is
+// copy-on-write (Use never mutates it in place), so reading the header under
+// RLock and composing outside the lock is race-free.
+func (e *Engine) wrapHandler(def *TaskDef) Handler {
+	h := def.Fn
+	for i := len(def.Wrappers) - 1; i >= 0; i-- {
+		h = def.Wrappers[i](h)
+	}
+	e.mu.RLock()
+	globals := e.middleware
+	e.mu.RUnlock()
+	for i := len(globals) - 1; i >= 0; i-- {
+		h = globals[i](h)
+	}
+	return h
+}
+
 func (e *Engine) publish(runID, step, from, to, errMsg string, at int64) {
 	e.bus.Publish(bus.Event{RunID: runID, Step: step, From: from, To: to, At: at, Error: errMsg})
 }
@@ -768,10 +863,18 @@ func (e *Engine) ForgetTask(name string) {
 	delete(e.tasks, name)
 }
 
-// logSend funnels a task log line into the engine's batched flusher. It is
-// engine-scoped (never a package global) and seals itself off at Close so a
-// task that outlived the drain cannot send on the closed channel.
+// logSend fans a task log line out to the engine's configured sinks. It is
+// engine-scoped (never a package global).
 func (e *Engine) logSend(entry store.LogEntry) {
+	for _, sink := range e.logSinks {
+		sink(entry)
+	}
+}
+
+// storageLogSink funnels a task log line into the engine's batched SQLite
+// flusher. It seals itself off at Close so a task that outlived the drain
+// cannot send on the closed channel.
+func (e *Engine) storageLogSink(entry store.LogEntry) {
 	e.logMu.Lock()
 	defer e.logMu.Unlock()
 	if e.logClosed {
@@ -782,6 +885,37 @@ func (e *Engine) logSend(entry store.LogEntry) {
 	default:
 		e.droppedLogs.Add(1)
 	}
+}
+
+// slogLogSink writes task log lines to the engine logger. It is the default
+// when neither a custom sink nor built-in storage is configured.
+func (e *Engine) slogLogSink(entry store.LogEntry) {
+	var lvl slog.Level
+	switch entry.Level {
+	case "DEBUG":
+		lvl = slog.LevelDebug
+	case "WARN":
+		lvl = slog.LevelWarn
+	case "ERROR":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	e.log.Log(context.Background(), lvl, entry.Message, "run", entry.RunID, "step", entry.Step)
+}
+
+// Use appends engine-wide middleware. It is safe to call before or after
+// Start; each execution snapshots the chain under the engine lock.
+func (e *Engine) Use(mw ...Middleware) {
+	if len(mw) == 0 {
+		return
+	}
+	e.mu.Lock()
+	next := make([]Middleware, 0, len(e.middleware)+len(mw))
+	next = append(next, e.middleware...)
+	next = append(next, mw...)
+	e.middleware = next
+	e.mu.Unlock()
 }
 
 // flushLogs batches task log lines into the store until the channel closes.

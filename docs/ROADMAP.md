@@ -1,15 +1,22 @@
 # Roadmap
 
-Status: **v0.1 shipped** (tasks, retries, timeouts, queues, priorities, DAG
-workflows, cron, delayed runs, cancel, graceful shutdown, File persistence +
-recovery, non-blocking introspection, subscribe, task logs, benchmarks).
+Status: **v0.2 in progress** — P0 (hardening) and P1 (concurrency control +
+operations) are shipped; P2 (triggers & ergonomics) is next.
+
+- v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
+  cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
+  non-blocking introspection, subscribe, task logs, benchmarks.
+- v0.2 P0 shipped: schema migrations, single-writer kernel-lock guard, WAL
+  hygiene.
+- v0.2 P1 shipped: per-key concurrency, rate limiting, middleware,
+  retention/purge, metrics callback, log-sink ownership.
 
 Each iteration below is independently shippable; priorities are the
 recommended order. Items marked ⚖ are decision points — see the end.
 
 ---
 
-## v0.2 — hardening & control (next iteration)
+## v0.2 — hardening & control (in progress: P0 + P1 ✅, P2 next)
 
 Goal: make v0.1 safe to run long-lived and multi-instance, and close the
 biggest feature gaps vs Hatchet for single-process users.
@@ -45,7 +52,7 @@ same-process exclusion; checkpoints are `PASSIVE` every
 bounded-timeout `TRUNCATE` on File-mode close whose failure is reported
 to the caller.
 
-### P1 — concurrency control (flagship v0.2 features)
+### P1 — concurrency control (flagship v0.2 features) (✅ DONE)
 
 | Item | Design sketch |
 |---|---|
@@ -68,13 +75,35 @@ Acceptance: tests asserting max-concurrent-per-key under load; rate-limited
 queue never exceeds N starts per window; both observable in `Execution`
 (key visible in snapshots).
 
-### P1 — operations
+### P1 — operations (✅ DONE)
 
 | Item | Design sketch |
 |---|---|
-| Middleware hooks | `quacker.Use(func(next quacker.Handler) quacker.Handler)` wrapping task execution: timing, custom metrics, error taxonomies, per-task tracing. Handler receives step context + typed payload. |
-| Retention / purge | `q.Purge(ctx, PurgeOptions{OlderThan, Statuses, IncludeLogs bool})` deleting terminal runs + their logs in batches, plus an optional auto-purge policy at Open. Needed before File mode is credible for long-lived apps. |
-| Metrics callback | `WithMetricsFunc(func(MetricsSnapshot))` invoked on an interval — one-liner for Prometheus users until OTel lands. |
+| ✅ Middleware hooks | Engine-wide `WithMiddleware` / `q.Use` plus per-task `Wrap`, wrapping task execution: timing, custom metrics, error taxonomies, per-task tracing. |
+| ✅ Retention / purge | `q.Purge(PurgeOptions{OlderThan, Statuses, KeepLogs, BatchSize})` deletes terminal runs, steps, and (by default) logs in batches, plus `WithRetention` for a scheduled policy. |
+| ✅ Metrics callback | `WithMetricsFunc(func(*Metrics))` invoked on `WithMetricsInterval` — one-liner for Prometheus users until OTel lands. |
+| ✅ Log ownership | Task logs default to a sink (engine slog) instead of SQLite; `WithLogStorage(true)` restores built-in persistence + `q.Logs`. |
+
+As built (deviating from the sketch where it was weaker):
+middleware composes `global → per-task → body` inside the existing
+panic-recover, so a middleware panic fails the step like a task panic, and
+`StepContext` gained `Task` (the registered function) so tracing can tell a
+named workflow step from its task. Retention is *storage-agnostic*, not
+File-only: a long-lived `Memory`/`Ephemeral` daemon grows RAM or its temp WAL
+until Close, so `q.Purge` bounds growth in every mode. Purge only ever
+touches terminal runs, never one whose step is still `RUNNING` (closing the
+cancel-window race where a run turns terminal before its step records
+`CANCELLED`), and deletes steps/runs explicitly rather than trusting the
+FK cascade. The field is `KeepLogs` (zero value = delete, the safe default)
+rather than the sketch's `IncludeLogs`; an orphan-log sweep cleans up logs
+left by an earlier `KeepLogs` purge. Schema migration v3 adds
+`idx_runs_purge (status, completed_at)`. Logs became a sink chain: engine
+slog by default, custom via `WithTaskLogSink`/`WithLogSink`, and opt-in
+SQLite persistence, so the engine stops growing log data it never reads.
+
+Acceptance: middleware ordering/panic/retry tests; purge cutoff, batching,
+`RUNNING`-guard, keep-logs + orphan-sweep, and auto-retention tests; metrics
+interval, panic-recovery, and stop-on-close tests. All pass under `-race`.
 
 ### P2 — triggers & ergonomics
 

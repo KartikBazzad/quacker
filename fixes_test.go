@@ -262,7 +262,7 @@ func TestJitterAppliedToDefaults(t *testing.T) {
 // logs via TaskLogger must not panic (send on closed channel), and its step
 // must end INTERRUPTED rather than SUCCEEDED.
 func TestRogueTaskLoggerAfterClose(t *testing.T) {
-	q, err := Open(WithStorage(Memory()), WithPollInterval(5*time.Millisecond))
+	q, err := Open(WithStorage(Memory()), WithPollInterval(5*time.Millisecond), WithLogStorage(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,8 +295,8 @@ func TestRogueTaskLoggerAfterClose(t *testing.T) {
 // TestMultiEngineLogsStayIsolated: two engines in one process each keep
 // their own task logs (the old global log sink misrouted them).
 func TestMultiEngineLogsStayIsolated(t *testing.T) {
-	q1 := newTestQ(t)
-	q2 := newTestQ(t)
+	q1 := newTestQ(t, WithLogStorage(true))
+	q2 := newTestQ(t, WithLogStorage(true))
 	t1 := NewTask("logger-1", func(ctx context.Context, in greetIn) (greetOut, error) {
 		TaskLogger(ctx).Info("from-engine-1")
 		return greetOut{}, nil

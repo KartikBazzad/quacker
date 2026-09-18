@@ -44,6 +44,13 @@ is the wrong amount of infrastructure.
   a key, enforced by counting RUNNING rows at claim time
 - **Rate limiting** — `WithRate(queue, n, per)` caps starts per sliding
   window; the window is persisted, so it survives File-mode restarts
+- **Middleware** — `quacker.Use` / `Wrap` decorators around task execution
+  for timing, tracing, error taxonomies, and custom metrics
+- **Bring-your-own logs** — task logs flow to a sink you choose (engine slog
+  by default); opt into SQLite persistence with `WithLogStorage(true)`
+- **Retention / purge** — `q.Purge` and `WithRetention` bound a long-lived
+  process's growth in every storage mode
+- **Metrics callback** — `WithMetricsFunc` pushes periodic state snapshots
 - **DAG workflows** — steps with dependencies, upstream outputs via `DepOutput`
 - **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`, `"@every 1s"`)
   and `quacker.WithDelay`
@@ -129,6 +136,83 @@ A due step whose key is saturated — or whose queue's window is full — stays
 `QUEUED` until a slot opens; nothing is rejected or dropped. Keys are visible
 in `Execution` snapshots (`Key` on the run and each step).
 
+## Middleware
+
+```go
+// Engine-wide: the first registered is the outermost.
+q.Use(func(next quacker.Handler) quacker.Handler {
+    return func(ctx context.Context, in json.RawMessage) (json.RawMessage, error) {
+        start := time.Now()
+        out, err := next(ctx, in)
+        observe(quacker.RunIDFromContext(ctx), time.Since(start), err)
+        return out, err
+    }
+})
+
+// Or per task:
+task := quacker.NewTask("charge", fn, quacker.Wrap(myTracingMW))
+```
+
+Middleware runs once per attempt, so timing and retry observability are
+accurate. Order is global → per-task → body; a middleware may short-circuit
+by returning without calling `next`. Panics are recovered exactly like a task
+panic. `StepFromContext` exposes `RunID`, `Step`, `Task`, and `Attempt`.
+
+## Task logs
+
+Task logs are **not stored by the engine by default**. `TaskLogger(ctx)`
+writes each line to a sink you choose: the engine logger by default, or
+whatever you pass to `WithTaskLogSink` (and/or redirect per step with
+`WithLogSink` inside middleware). This keeps a long-lived daemon from growing
+logs it never reads.
+
+```go
+q, _ := quacker.Open(
+    // Send lines anywhere — file, ring buffer, external collector:
+    quacker.WithTaskLogSink(func(e quacker.LogEntry) { myStore.Add(e) }),
+)
+
+// Or opt back into built-in SQLite persistence + q.Logs:
+q, _ := quacker.Open(quacker.WithLogStorage(true))
+```
+
+Sinks run synchronously in the task's goroutine, so keep them fast (buffer or
+hand off if the destination can block). Built-in storage writes through the
+same batched path as before (~50ms batches, dropped on overflow rather than
+slowing your task) and is read back with `q.Logs`.
+
+```go
+task := quacker.NewTask("import", func(ctx context.Context, in Input) (Output, error) {
+    log := quacker.TaskLogger(ctx)
+    log.Info("starting batch", "size", len(in.Rows))
+    ...
+})
+```
+
+## Retention & purge
+
+```go
+res, err := q.Purge(ctx, quacker.PurgeOptions{
+    OlderThan: 24 * time.Hour,        // terminal runs finished before this
+    // Statuses: []quacker.Status{quacker.StatusSucceeded}, // default: all terminal
+    // KeepLogs: true,                // default false: delete logs with the run
+})
+// res.Runs, res.Steps, res.Logs
+
+// Or let the engine do it on a schedule:
+q, _ := quacker.Open(quacker.WithRetention(quacker.RetentionPolicy{
+    OlderThan: 24 * time.Hour,
+    Interval:  time.Hour,
+}))
+```
+
+Purging is storage-agnostic and bounds growth in every mode, including
+`Memory` (which otherwise grows RAM for the process's lifetime) and
+`Ephemeral`. Only terminal runs are ever eligible, and never while any of
+their steps is still `RUNNING` — so a purge cannot race a step recording its
+own cancellation. When logs are purged, an orphan sweep removes logs whose run
+no longer exists.
+
 ## Cancellation & shutdown
 
 ```go
@@ -145,25 +229,15 @@ q.Close(ctx)               // stop claiming, drain in-flight (30s default deadli
 snap, _ := q.Execution(ctx, h.RunID())          // full snapshot (JSON-tagged)
 runs, _ := q.Runs(ctx, quacker.RunFilter{Status: quacker.StatusRunning})
 m, _ := q.Metrics(ctx)                          // counts by status, queue depths
-logs, _ := q.Logs(ctx, h.RunID(), 100)          // TaskLogger output
+logs, _ := q.Logs(ctx, h.RunID(), 100)          // needs WithLogStorage(true)
 events, stop := q.Subscribe("")                 // "" = all runs
 ```
 
-All snapshot types marshal to JSON, so exposing them over HTTP is trivial.
-
-## Task logs inside tasks
-
-```go
-task := quacker.NewTask("import", func(ctx context.Context, in Input) (Output, error) {
-    log := quacker.TaskLogger(ctx)
-    log.Info("starting batch", "size", len(in.Rows))
-    ...
-})
-```
-
-Lines are batched (~50ms) into the store and readable via `Logs`. On
-overflow they are dropped rather than slowing your task; a warning is logged
-at shutdown.
+`q.Logs` returns nothing unless built-in storage is enabled. For a
+turnkey push, `quacker.WithMetricsFunc(fn)` (with `WithMetricsInterval`)
+invokes `fn(*Metrics)` on an interval — a one-liner for Prometheus until OTel
+lands. All snapshot types marshal to JSON, so exposing them over HTTP is
+trivial.
 
 ## Notes & semantics
 

@@ -7,21 +7,25 @@ How quacker works inside one process. For user-facing docs see the
 ## Component map
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│ package quacker (public API)                                   │
-│   Open/Close · Task[I,O] · Workflow[I] · RunHandle[O]          │
-│   Enqueue/EnqueueWorkflow/Cron · Execution/Runs/Metrics/Logs   │
-│   Subscribe · Cancel                                           │
-└──────────────┬─────────────────────────────┬───────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ package quacker (public API)                                        │
+│   Open/Close · Task[I,O] · Workflow[I] · RunHandle[O]               │
+│   Enqueue/EnqueueWorkflow/Cron · Execution/Runs/Metrics/Logs        │
+│   Subscribe · Cancel                                                │
+│   Use/Wrap (middleware) · Purge/WithRetention · WithMetricsFunc     │
+│   WithTaskLogSink/WithLogSink · WithLogStorage                      │
+└──────────────┬─────────────────────────────┬────────────────────────┘
                │ writes + queries            │ JSON adapter
-┌──────────────▼──────────────┐   ┌──────────▼──────────────────┐
-│ internal/engine             │   │ internal/store (SQLite)     │
-│  scheduler loop (50ms tick  │──▶│  1 writer connection        │
-│  + wake channel)            │   │  4 read-only connections    │
-│  per-queue worker pools     │   │  keeper pool (memory mode)  │
-│  retries · DAG · cron       │   │  runs / steps / crons / logs│
-│  cancel · graceful close    │   └─────────────────────────────┘
-│  log flusher                │
+┌──────────────▼──────────────┐   ┌──────────▼───────────────────────┐
+│ internal/engine             │   │ internal/store (SQLite)          │
+│  scheduler loop (50ms tick  │──▶│  1 writer connection             │
+│  + wake channel)            │   │  4 read-only connections         │
+│  per-queue worker pools     │   │  keeper pool (memory mode)       │
+│  retries · DAG · cron       │   │  runs / steps / crons / logs     │
+│  middleware chain           │   │  schema_migrations               │
+│  cancel · graceful close    │   └──────────────────────────────────┘
+│  metrics + retention loops  │
+│  log sink chain / flusher   │
 └──────────────┬──────────────┘
         ┌──────▼──────┐
         │ internal/bus│  push events for Subscribe
@@ -93,6 +97,12 @@ Schema changes ship as an ordered migration list; `migrate` applies each
 pending entry in one transaction together with its `schema_migrations`
 version row. Migration 1 is all `CREATE TABLE IF NOT EXISTS`, so a v0.1
 File database (tables present, no version row) baselines at version 1.
+Migration 3 adds `idx_runs_purge (status, completed_at)` for retention.
+
+The `logs` table still exists, but is only written when
+`WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
+unless `WithTaskLogSink`/`WithLogSink` overrides it) and `q.Logs` returns
+empty.
 
 Every task execution is a **step** row; a single-task run has exactly one.
 `steps.name` is the DAG identity, `steps.task` is the registered function to
@@ -182,15 +192,27 @@ retry attempts.
 - `internal/bus` keeps a subscriber map; `Publish` is non-blocking (slow
   subscribers drop events; snapshots are authoritative). Cancelling a
   subscription closes its channel.
-- Task logs flow: `TaskLogger(ctx)` → handler → engine channel (4096 buffer,
-  drop-on-full with a shutdown warning) → batched inserts (64 rows / 50ms)
-  into `logs`.
+- Task logs flow: `TaskLogger(ctx)` → handler → the engine's sink chain. The
+  base sink is the engine logger, unless `WithTaskLogSink` supplies one or
+  middleware installs a per-step sink via `WithLogSink(ctx, fn)`. When
+  `WithLogStorage(true)` is set, the SQLite sink is appended: a 4096-buffer
+  channel (drop-on-full with a shutdown warning) → batched inserts (64 rows /
+  50ms) into `logs`.
+- Middleware (global `Use`/`WithMiddleware` + per-task `Wrap`) composes
+  `global → per-task → body` inside the executor's panic-recover, per attempt.
+- `loopWG` also owns two optional loops: the metrics push
+  (`WithMetricsFunc`/`WithMetricsInterval`) and the retention purge
+  (`WithRetention`), both joined before the store closes.
 
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
   panics, timeouts, concurrency caps, priority order, DAG ordering and
-  failure, cancel, delayed runs, cron, logs, filters).
+  failure, cancel, delayed runs, cron, logs, filters, middleware
+  ordering/panic/retry, log-sink routing, metrics push, purge/retention).
+- Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
+  keep-logs + orphan sweep, batching) and the migration-v3 index live in
+  `internal/store`.
 - `TestIntrospectionUnderLoad`: 8 readers hammer snapshots while 200 runs
   execute — the non-blocking guarantee, run under `-race`.
 - File-mode recovery tests: drain-timeout close → requeue (or fail) →

@@ -42,6 +42,168 @@ func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
 	return tx.Commit()
 }
 
+// ErrNonTerminalPurge is returned when a purge is asked to delete a
+// non-terminal status. Only terminal runs may ever be purged.
+var ErrNonTerminalPurge = errors.New("quacker: purge statuses must be terminal")
+
+// terminalStatuses is the default purge set when Statuses is empty.
+var terminalStatuses = []string{StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted}
+
+// PurgeOptions selects terminal runs for deletion.
+type PurgeOptions struct {
+	// Before is the exclusive completion-time cutoff in unix nanoseconds:
+	// runs with completed_at == 0 or completed_at >= Before are never
+	// eligible. Required (> 0).
+	Before int64
+	// Statuses restricts deletion to these terminal statuses; empty means
+	// every terminal status. A non-terminal status is an error.
+	Statuses []string
+	// KeepLogs retains the logs of purged runs and skips the orphan sweep.
+	KeepLogs bool
+	// BatchSize bounds rows deleted per transaction. <= 0 uses 500.
+	BatchSize int
+}
+
+// PurgeResult reports how many rows a purge removed.
+type PurgeResult struct {
+	Runs  int64
+	Steps int64
+	Logs  int64
+}
+
+// PurgeRuns deletes terminal runs older than opts.Before, in batches, along
+// with their steps and (unless KeepLogs) their logs. A run is never eligible
+// while any of its steps is RUNNING, which keeps a purge from racing a step
+// that is still recording its own cancellation. When logs are purged, an
+// orphan sweep then removes logs whose run no longer exists (e.g. left by an
+// earlier KeepLogs purge).
+func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, error) {
+	if opts.Before <= 0 {
+		return PurgeResult{}, errors.New("quacker: purge requires a positive Before cutoff")
+	}
+	statuses := opts.Statuses
+	if len(statuses) == 0 {
+		statuses = terminalStatuses
+	}
+	for _, st := range statuses {
+		if !IsTerminal(st) {
+			return PurgeResult{}, fmt.Errorf("%w: %s", ErrNonTerminalPurge, st)
+		}
+	}
+	batch := opts.BatchSize
+	if batch <= 0 {
+		batch = 500
+	}
+	var res PurgeResult
+	for {
+		n, r, err := s.purgeRunBatch(ctx, statuses, opts.Before, batch, opts.KeepLogs)
+		if err != nil {
+			return res, err
+		}
+		res.Runs += r.Runs
+		res.Steps += r.Steps
+		res.Logs += r.Logs
+		if n < batch {
+			break
+		}
+	}
+	if !opts.KeepLogs {
+		for {
+			n, err := s.purgeOrphanLogs(ctx, batch)
+			if err != nil {
+				return res, err
+			}
+			res.Logs += n
+			if n < int64(batch) {
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
+// purgeRunBatch deletes one batch of eligible runs (and their steps/logs) in
+// a single transaction, returning how many runs were selected.
+func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
+	var res PurgeResult
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, res, err
+	}
+	defer tx.Rollback()
+
+	q := `SELECT r.id FROM runs r
+		WHERE r.status IN (` + placeholders(len(statuses)) + `)
+		  AND r.completed_at > 0 AND r.completed_at < ?
+		  AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id AND s.status = ?)
+		ORDER BY r.completed_at LIMIT ?`
+	args := make([]any, 0, len(statuses)+3)
+	for _, st := range statuses {
+		args = append(args, st)
+	}
+	args = append(args, before, StatusRunning, batch)
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return 0, res, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, res, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, res, err
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, res, tx.Commit()
+	}
+	idArgs := argsAny(ids)
+	ph := placeholders(len(ids))
+	if !keepLogs {
+		r, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE run_id IN (`+ph+`)`, idArgs...)
+		if err != nil {
+			return 0, res, err
+		}
+		res.Logs, _ = r.RowsAffected()
+	}
+	if r, err := tx.ExecContext(ctx, `DELETE FROM steps WHERE run_id IN (`+ph+`)`, idArgs...); err != nil {
+		return 0, res, err
+	} else {
+		res.Steps, _ = r.RowsAffected()
+	}
+	if r, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE id IN (`+ph+`)`, idArgs...); err != nil {
+		return 0, res, err
+	} else {
+		res.Runs, _ = r.RowsAffected()
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, res, err
+	}
+	return len(ids), res, nil
+}
+
+// purgeOrphanLogs deletes up to batch log rows whose run no longer exists.
+func (s *Store) purgeOrphanLogs(ctx context.Context, batch int) (int64, error) {
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE seq IN (
+		SELECT seq FROM logs WHERE run_id NOT IN (SELECT id FROM runs) LIMIT ?)`, batch)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := r.RowsAffected()
+	return n, tx.Commit()
+}
+
 // Claim is a step atomically moved to RUNNING, with its parent run.
 type Claim struct {
 	Step *Step

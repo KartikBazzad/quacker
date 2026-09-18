@@ -177,6 +177,81 @@ would let retried steps sneak past the window (a retry is a start).
 `ParkStep` clears `claimed_at` for the same reason it returns the attempt:
 a parked claim never ran, so it shouldn't spend rate budget either.
 
+### 12. Middleware wraps the task body, inside the panic guard
+
+Middleware is a `func(engine.Handler) engine.Handler` decorator composed
+`global → per-task → body`. Two choices matter:
+
+- It is applied **inside** the executor's existing `recover`, not around the
+  whole step lifecycle, so a panic in middleware fails the step with a stack
+  trace exactly like a task panic — one recovery path, not two.
+- The chain reads the global slice copy-on-write under `RLock` and composes
+  **outside** the lock. Composing while holding the lock would let a
+  middleware constructor that calls `Use` deadlock; mutating in place would
+  race a concurrent executor. `Use` therefore always replaces the slice.
+
+Middleware runs per attempt, which is what makes timing and retry
+observability correct. `StepContext` gained `Task` (the registered function)
+alongside `Step` (the DAG identity), because a named workflow step's tracing
+label must be the workflow step while its function is a different task.
+
+### 13. Task logs are a sink chain; SQLite persistence is opt-in
+
+The engine used to own task logs: `TaskLogger` → buffered channel → batched
+SQLite inserts. That made the engine the log store, which is the wrong job
+for an embedded library and the biggest source of growth for a long-lived
+daemon. Now `TaskLogger` writes to a sink chain:
+
+- default: the engine's `slog.Logger` (nothing is silently lost);
+- `WithTaskLogSink`: a custom base sink, so callers own retention, sharding,
+  and export;
+- `WithLogStorage(true)`: the original SQLite sink is *appended*, keeping
+  `q.Logs` working for callers who want built-in querying;
+- `WithLogSink(ctx, fn)` (used from middleware): redirects lines for a single
+  step/ctx.
+
+The context-scoped override is what makes "let the user store logs" possible
+at all: a middleware wraps the body, but `TaskLogger` resolves its sink from
+the context, so the sink must be injectable there. Sinks run synchronously in
+the task goroutine — a deliberate contract that callers buffer a slow
+destination themselves, rather than the engine hiding latency or dropping
+lines. One consequence: a step's logs are no longer necessarily in SQLite,
+so `q.Logs` returning empty is expected unless storage is enabled.
+
+### 14. Purge invariants: terminal-only, no RUNNING step, explicit deletes
+
+`PurgeRuns` is deliberately conservative:
+
+- **Only terminal statuses are ever eligible.** A non-terminal status in the
+  filter is an error, not a silent skip, so a typo can't delete live work.
+- **`NOT EXISTS (step RUNNING)`.** `Cancel` makes a run `CANCELLED` while the
+  executing goroutine is still recording its own step `CANCELLED`; without
+  this guard a purge could delete the run out from under that write, turning
+  a benign no-op `UPDATE` into a spurious "record failure" log. Deferring the
+  purge until no step is RUNNING closes the window deterministically.
+- **Steps and runs are deleted explicitly**, in order, rather than relying on
+  `ON DELETE CASCADE`. The cascade is enabled, but retention is exactly the
+  feature where being wrong is unrecoverable, so it does not depend on a
+  pragma that some other connection or future DSN change could drop.
+- **Batching and `Before > 0`.** Large deletes are chunked transactions so
+  the single writer is never monopolized, and a zero cutoff (which would
+  match every finished run) is refused.
+
+The policy is storage-agnostic on purpose: `Memory`/`Ephemeral` daemons grow
+RAM or a temp WAL file for the process's lifetime, and pausing to think "but
+that's not durable" misses that the growth is real within a single run.
+
+### 15. The metrics callback is an interval push, not a transition hook
+
+`WithMetricsFunc` is a timer in the engine's `loopWG`, not a subscriber on
+the transition bus. A per-transition hook fires at the bus's drop-on-overflow
+cadence and couples callback cost to the hot path; Prometheus-style scrapers
+want a steady sample, and the store is the source of truth. The loop snapshots
+via the read pool (never blocking the writer in WAL mode), recovers callback
+panics so a bad exporter can't take down the engine, and is joined by
+`loopWG.Wait` before the store closes — the same shutdown discipline as the
+scheduler and cron loops.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

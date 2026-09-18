@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -143,5 +144,80 @@ func TestFileDSNRejectsMetachars(t *testing.T) {
 			!strings.Contains(err.Error(), "invalid path") {
 			t.Fatalf("Open(%q) err = %v, want an invalid-path error", p, err)
 		}
+	}
+}
+
+// TestMigrationV3Index: migration 3 creates the retention index.
+func TestMigrationV3Index(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.Read().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_runs_purge'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("idx_runs_purge count = %d, want 1", n)
+	}
+}
+
+// TestPurgeRejectsBadOptions: a non-terminal status or a zero cutoff is
+// refused, so a purge can never touch live work by accident.
+func TestPurgeRejectsBadOptions(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if _, err := s.PurgeRuns(ctx, PurgeOptions{Before: 0}); err == nil {
+		t.Fatal("expected error for Before <= 0")
+	}
+	if _, err := s.PurgeRuns(ctx, PurgeOptions{Before: 1, Statuses: []string{StatusRunning}}); !errors.Is(err, ErrNonTerminalPurge) {
+		t.Fatalf("err = %v, want ErrNonTerminalPurge", err)
+	}
+}
+
+// TestPurgeSkipsRunWithRunningStep: a terminal run whose step is still
+// RUNNING is not eligible (the cancel-window guard); once the step settles it
+// is.
+func TestPurgeSkipsRunWithRunningStep(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	if _, err := s.Write().ExecContext(ctx, `INSERT INTO runs
+		(id, workflow, kind, status, queue, run_at, created_at, completed_at)
+		VALUES ('r1','w','task','CANCELLED','q',?,?,?)`, now, now, now-1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write().ExecContext(ctx, `INSERT INTO steps
+		(id, run_id, name, task, ord, status, depends_on, queue, run_at, created_at)
+		VALUES ('r1/s','r1','s','t',0,'RUNNING','','q',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.PurgeRuns(ctx, PurgeOptions{Before: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Runs != 0 {
+		t.Fatalf("purged %d runs with a RUNNING step, want 0", res.Runs)
+	}
+	if _, err := s.Write().ExecContext(ctx,
+		`UPDATE steps SET status='CANCELLED' WHERE id='r1/s'`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s.PurgeRuns(ctx, PurgeOptions{Before: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Runs != 1 || res.Steps != 1 {
+		t.Fatalf("purge after settle = %+v, want 1 run 1 step", res)
 	}
 }

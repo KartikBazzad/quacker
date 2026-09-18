@@ -15,8 +15,13 @@ import (
 // StepContext carries per-execution information into task functions via
 // context.Context.
 type StepContext struct {
-	RunID   string
-	Step    string
+	RunID string
+	// Step is the DAG identity of the executing step (its name in a
+	// workflow, or the task name for a single-task run).
+	Step string
+	// Task is the registered task that executes the step. It differs from
+	// Step for named workflow steps.
+	Task    string
 	Attempt int
 }
 
@@ -70,12 +75,30 @@ type stepState struct {
 }
 
 func withStepContext(ctx context.Context, c *store.Claim, depOutputs map[string]json.RawMessage, send func(store.LogEntry)) context.Context {
-	ss := &stepState{
-		StepContext: StepContext{RunID: c.Step.RunID, Step: c.Step.Name, Attempt: int(c.Step.Attempts)},
-		depOutputs:  depOutputs,
-		send:        send,
+	sc := StepContext{RunID: c.Step.RunID, Step: c.Step.Name, Attempt: int(c.Step.Attempts)}
+	sc.Task = c.Step.Task
+	if sc.Task == "" {
+		sc.Task = c.Step.Name
 	}
+	ss := &stepState{StepContext: sc, depOutputs: depOutputs, send: send}
 	return context.WithValue(ctx, ctxKey{}, ss)
+}
+
+// WithLogSink returns a context whose TaskLogger writes each line to fn
+// rather than the engine's configured sink. Outside a task function it is a
+// no-op. Middleware uses it to route task logs to its own storage or
+// forwarder; a nil fn is ignored.
+func WithLogSink(ctx context.Context, fn func(store.LogEntry)) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	ss, ok := ctx.Value(ctxKey{}).(*stepState)
+	if !ok || ss == nil {
+		return ctx
+	}
+	clone := *ss
+	clone.send = fn
+	return context.WithValue(ctx, ctxKey{}, &clone)
 }
 
 // TaskLogger returns a logger that persists log lines to the run, visible via

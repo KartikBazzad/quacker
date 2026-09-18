@@ -540,7 +540,7 @@ func TestDelayedRun(t *testing.T) {
 }
 
 func TestLogs(t *testing.T) {
-	q := newTestQ(t)
+	q := newTestQ(t, WithLogStorage(true))
 	task := NewTask("logger", func(ctx context.Context, in greetIn) (greetOut, error) {
 		log := TaskLogger(ctx)
 		log.Info("starting work", "n", 1)

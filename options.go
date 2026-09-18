@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/kartikbazzad/quacker/internal/engine"
 	"github.com/kartikbazzad/quacker/internal/store"
 )
 
@@ -46,6 +47,12 @@ type config struct {
 	rates              map[string]rateConfig
 	poll               time.Duration
 	logger             *slog.Logger
+	middleware         []engine.Middleware
+	logSink            func(LogEntry)
+	logStorage         bool
+	metricsFn          func(*Metrics)
+	metricsInterval    time.Duration
+	retention          *engine.RetentionPolicy
 }
 
 type rateConfig struct {
@@ -107,4 +114,58 @@ func WithCheckpointInterval(d time.Duration) Option {
 // WithLogger sets the engine logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option {
 	return func(c *config) { c.logger = l }
+}
+
+// WithMiddleware registers engine-wide middleware, applied outside every
+// task's own Wrap middleware. The first registered is outermost.
+func WithMiddleware(mw ...Middleware) Option {
+	return func(c *config) { c.middleware = append(c.middleware, mw...) }
+}
+
+// WithTaskLogSink sets the base destination for task log lines, replacing
+// the default engine-logger sink. It composes with WithLogStorage(true),
+// which adds SQLite persistence in addition. A nil fn is ignored.
+func WithTaskLogSink(fn func(LogEntry)) Option {
+	return func(c *config) { c.logSink = fn }
+}
+
+// WithLogStorage enables the built-in SQLite task-log store (and q.Logs).
+// It is off by default so a long-lived engine does not grow logs it never
+// reads; when off, lines go to the base sink (engine logger unless
+// WithTaskLogSink is set). When on and no custom sink is set, logs persist
+// to SQLite only. Log lines are written through the same batched path as
+// before.
+func WithLogStorage(enabled bool) Option {
+	return func(c *config) { c.logStorage = enabled }
+}
+
+// WithMetricsFunc registers a callback invoked with a fresh snapshot every
+// WithMetricsInterval (default 15s). Panics in the callback are recovered
+// and logged. The callback should not block for long; it runs on its own
+// goroutine and never delays the scheduler.
+func WithMetricsFunc(fn func(*Metrics)) Option {
+	return func(c *config) { c.metricsFn = fn }
+}
+
+// WithMetricsInterval sets how often the metrics callback runs. <=0 uses the
+// 15s default; values below 100ms are clamped to 100ms. Without
+// WithMetricsFunc no loop is started.
+func WithMetricsInterval(d time.Duration) Option {
+	return func(c *config) { c.metricsInterval = d }
+}
+
+// WithRetention enables automatic purging of terminal runs older than the
+// policy's OlderThan, on its own interval. Purging is storage-agnostic and
+// bounds growth in every mode (Memory included). OlderThan must be > 0 for
+// the loop to act; interval defaults to one minute.
+func WithRetention(p RetentionPolicy) Option {
+	return func(c *config) {
+		rp := &engine.RetentionPolicy{
+			OlderThan: p.OlderThan,
+			Statuses:  statusStrings(p.Statuses),
+			KeepLogs:  p.KeepLogs,
+			Interval:  p.Interval,
+		}
+		c.retention = rp
+	}
 }
