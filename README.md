@@ -134,6 +134,9 @@ at shutdown.
 
 - **Task names are part of the storage format.** Renaming a task orphans its
   in-flight runs.
+- **Re-registering a task name replaces its function.** `Enqueue`,
+  `Register`, and `Cron` all overwrite the registered def for that name;
+  in-flight runs execute the currently registered def at claim time.
 - **Crons are in-memory.** Re-register them at startup
   (`quacker.Cron(...)`); with File storage, register tasks with
   `quacker.Register` before work resumed from a previous process can execute.

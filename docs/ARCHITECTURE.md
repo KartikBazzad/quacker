@@ -122,7 +122,11 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
 CANCELLED, and collects still-RUNNING step IDs; then it cancels their
 contexts and finishes waiters. The executing goroutine observes its context
 and records its own step CANCELLED (asynchronously — a snapshot taken
-mid-cancel can truthfully show `CANCELLED` run with `RUNNING` step).
+mid-cancel can truthfully show `CANCELLED` run with `RUNNING` step). Halt
+tombstones cover the claim→registration window: a Cancel/failure landing
+before the executor registers its cancel func leaves a tombstone in
+`haltSteps`, which the executor checks (and clears) atomically at
+registration so the step never starts the task's side effects.
 
 ### Shutdown
 
@@ -131,7 +135,10 @@ deadline (default 30s), sweeps any still-RUNNING rows to INTERRUPTED, closes
 the log channel after a final flush, and releases waiters with
 `ErrRunInterrupted`. On `File` storage, the next `Open` re-queues
 RUNNING/INTERRUPTED work (`RecoverRunningOnBoot`) and `Start()` re-creates
-the queue registry from `SELECT DISTINCT queue FROM steps`.
+the queue registry from `SELECT DISTINCT queue FROM steps`. Claims whose
+task isn't registered in the new process (work resumed before `Register`
+runs) are parked via `ParkStep` and requeued every ~5s without consuming
+retry attempts.
 
 ## Event bus & logs
 

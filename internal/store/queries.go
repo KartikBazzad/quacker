@@ -143,9 +143,6 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 	return claims, tx.Commit()
 }
 
-// CompleteStep marks a step SUCCEEDED and advances its DAG: unblocks dependents
-// whose dependencies are all satisfied and, when no steps remain active, moves
-// the run to SUCCEEDED (or FAILED if any step failed). The run output becomes
 // CompleteResult describes what a CompleteStep transaction changed.
 type CompleteResult struct {
 	// StepDone is false when the step was already terminal (cancelled or
@@ -300,7 +297,7 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 			rows.Close()
 			return CompleteResult{}, err
 		}
-		res.ReadySteps = append(res.ReadySteps, name) // reuse field: cancelled siblings
+		res.CancelledSteps = append(res.CancelledSteps, name)
 		res.CancelledStepIDs = append(res.CancelledStepIDs, id)
 	}
 	rows.Close()
@@ -323,49 +320,50 @@ func (s *Store) StepCancelled(ctx context.Context, stepID string, now int64) err
 
 // CancelRun cancels a run: queued/blocked steps become CANCELLED immediately
 // and the IDs of still-running steps are returned so the caller can interrupt
-// their contexts. Returns false if the run was already terminal.
-func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (runningSteps []string, ok bool, err error) {
+// their contexts. prevStatus is the run's status before the transition (for
+// event publishing). Returns false if the run was already terminal.
+func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (runningSteps []string, prevStatus string, ok bool, err error) {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	defer tx.Rollback()
 
 	var status string
 	err = tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, ErrNotFound
+		return nil, "", false, ErrNotFound
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	if IsTerminal(status) {
-		return nil, false, nil
+		return nil, status, false, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, completed_at=? WHERE id=?`,
 		StatusCancelled, now, runID); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED')`,
 		StatusCancelled, now, runID); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, false, err
+			return nil, "", false, err
 		}
 		runningSteps = append(runningSteps, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
-	return runningSteps, true, tx.Commit()
+	return runningSteps, status, true, tx.Commit()
 }
 
 // ---------------------------------------------------------------------------

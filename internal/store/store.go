@@ -55,6 +55,10 @@ func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
 	case ModeMemory:
 		// A named in-memory database with a shared cache so both pools see
 		// the same data. journal_mode defaults to MEMORY there.
+		// No _txlock=immediate here (unlike the file modes): on a shared
+		// cache an immediate write txn's RESERVED lock makes same-cache
+		// readers hit SQLITE_LOCKED, which bypasses busy_timeout. WAL/file
+		// readers don't contend, so _txlock=immediate is used only there.
 		name := fmt.Sprintf("quacker-%d-%d", os.Getpid(), c.unique())
 		dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&%s", name, common)
 		return dsn, dsn, "", nil

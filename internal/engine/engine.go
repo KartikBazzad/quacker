@@ -402,7 +402,7 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 // ErrRunCancelled. Cancelling an unknown or already-finished run is a no-op.
 func (e *Engine) Cancel(runID string) error {
 	now := e.now().UnixNano()
-	running, ok, err := e.st.CancelRun(e.ctx, runID, now)
+	running, prevStatus, ok, err := e.st.CancelRun(e.ctx, runID, now)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
 	}
@@ -429,7 +429,7 @@ func (e *Engine) Cancel(runID string) error {
 	if w != nil {
 		w.finish(store.StatusCancelled, nil, ErrRunCancelled)
 	}
-	e.publish(runID, "", store.StatusRunning, store.StatusCancelled, "", now)
+	e.publish(runID, "", prevStatus, store.StatusCancelled, "", now)
 	return nil
 }
 
@@ -466,6 +466,7 @@ func (e *Engine) tick() {
 	e.mu.Unlock()
 
 	now := e.now().UnixNano()
+	runStarted := map[string]bool{} // one run-level QUEUED→RUNNING per run per tick
 	for q, qs := range snapshot {
 		for {
 			slots := int(qs.concurrency.Load()) - int(qs.inFlight.Load())
@@ -485,11 +486,14 @@ func (e *Engine) tick() {
 			for _, c := range claims {
 				qs.inFlight.Add(1)
 				e.wg.Add(1)
-				go e.execute(c, qs)
+				// Publish before spawning: a fast task's completion event must
+				// never overtake its claim event.
 				e.publish(c.Step.RunID, c.Step.Name, store.StatusQueued, store.StatusRunning, "", now)
-				if c.Run != nil && c.Run.StartedAt == now {
+				if c.Run != nil && c.Run.StartedAt == now && !runStarted[c.Step.RunID] {
+					runStarted[c.Step.RunID] = true
 					e.publish(c.Step.RunID, "", store.StatusQueued, store.StatusRunning, "", now)
 				}
+				go e.execute(c, qs)
 			}
 			if len(claims) < slots {
 				break // queue drained
@@ -585,6 +589,9 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		if !res.StepDone {
 			// Another path (Cancel / run failure) already made this step
 			// terminal; its outcome must not be resurrected to SUCCEEDED.
+			// The CompleteStep tx converged it to CANCELLED, so publish that
+			// transition — subscribers would otherwise see it stuck RUNNING.
+			e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusCancelled, "", now.UnixNano())
 			return
 		}
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSucceeded, "", now.UnixNano())
@@ -618,7 +625,7 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 			return
 		}
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusFailed, errStr, now.UnixNano())
-		for _, name := range res.ReadySteps {
+		for _, name := range res.CancelledSteps {
 			e.publish(st.RunID, name, store.StatusRunning, store.StatusCancelled, "", now.UnixNano())
 		}
 		e.cancelStepContexts(res.CancelledStepIDs)

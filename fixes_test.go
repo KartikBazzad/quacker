@@ -80,8 +80,9 @@ func TestParkDoesNotConsumeAttempts(t *testing.T) {
 	}, Retries(2), BackoffPolicy(Constant(1*time.Millisecond)))
 
 	// Enqueue registers the task; drop the registration so the claim hits the
-	// park path, then restore it.
-	h, err := Enqueue(context.Background(), q, task, greetIn{})
+	// park path, then restore it. The delay keeps the scheduler from claiming
+	// (and running) the step before ForgetTask lands.
+	h, err := Enqueue(context.Background(), q, task, greetIn{}, WithDelay(150*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}

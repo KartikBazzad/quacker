@@ -9,8 +9,9 @@ import (
 	"github.com/kartikbazzad/quacker/internal/engine"
 )
 
-// Backoff configures retry delays. The zero value means "no delay, no
-// jitter" — use Exponential or Constant (or set fields) for real policies.
+// Backoff configures retry delays. A zero value is not "no delay": empty
+// fields fall back to the library defaults (base 500ms, factor 2, cap 30s,
+// no jitter) — use Exponential or Constant (or set fields) for real policies.
 type Backoff = engine.Backoff
 
 // Exponential returns a backoff that doubles from base, capped at 30s, with

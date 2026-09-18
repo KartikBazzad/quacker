@@ -15,7 +15,8 @@ type Backoff struct {
 	// Max caps the delay. Default 30s.
 	Max time.Duration
 	// Jitter in [0,1] randomizes the delay upward by up to that fraction to
-	// avoid retry thundering herds. Default 0.1.
+	// avoid retry thundering herds. Zero means no jitter; the 0.1 default is
+	// applied at the task layer (quacker.Exponential/defaultBackoff).
 	Jitter float64
 }
 
