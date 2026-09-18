@@ -1,0 +1,197 @@
+// Package quacker is an embeddable task and workflow orchestration engine —
+// a single-process alternative to Hatchet. State lives in in-memory SQLite
+// (or a file, if you want durability), tasks are plain Go functions, and
+// execution state is readable at any moment without pausing execution:
+//
+//	q := quacker.Open()  // ephemeral in-memory state
+//	task := quacker.NewTask("greet", func(ctx context.Context, in Input) (string, error) {
+//	    return "hi " + in.Name, nil
+//	})
+//	h, _ := quacker.Enqueue(ctx, q, task, Input{Name: "world"})
+//	out, _ := h.Result(ctx)
+//	snap, _ := q.Execution(ctx, h.RunID()) // QUEUED/RUNNING/... at any instant
+package quacker
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"time"
+
+	"github.com/kartikbazzad/quacker/internal/engine"
+	"github.com/kartikbazzad/quacker/internal/store"
+)
+
+// Quacker is an embedded orchestration engine. Create with Open; safe for
+// concurrent use.
+type Quacker struct {
+	st  *store.Store
+	eng *engine.Engine
+	log *slog.Logger
+}
+
+// Open starts an engine. State is stored per WithStorage (default
+// Ephemeral: a temp-file WAL database deleted on Close).
+func Open(opts ...Option) (*Quacker, error) {
+	cfg := config{storage: store.Config{Mode: store.ModeEphemeral, RecoverRunningOnBoot: true}}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.logger == nil {
+		cfg.logger = slog.Default()
+	}
+	st, err := store.Open(cfg.storage)
+	if err != nil {
+		return nil, err
+	}
+	eng, err := engine.New(engine.Options{
+		Store: st, Log: cfg.logger, PollInterval: cfg.poll,
+	})
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	for name, conc := range cfg.queues {
+		eng.SetQueue(name, conc)
+	}
+	eng.Start()
+	return &Quacker{st: st, eng: eng, log: cfg.logger}, nil
+}
+
+// Close shuts down gracefully: no new work is claimed, in-flight tasks drain
+// until ctx expires (30s if ctx has no deadline), leftovers are marked
+// INTERRUPTED, and pending Results return ErrRunInterrupted. Ephemeral and
+// Memory storage are deleted; File storage is kept for the next Open.
+func (q *Quacker) Close(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+	err := q.eng.Close(ctx)
+	if serr := q.st.Close(); serr != nil && err == nil {
+		err = serr
+	}
+	return err
+}
+
+// Cancel cancels a run. Queued/blocked steps become CANCELLED immediately;
+// running steps have their contexts cancelled. Waiters receive
+// ErrRunCancelled. Cancelling an unknown or finished run is a no-op.
+func (q *Quacker) Cancel(runID string) error { return q.eng.Cancel(runID) }
+
+// SetQueue adjusts a queue's concurrency at runtime.
+func (q *Quacker) SetQueue(name string, concurrency int) { q.eng.SetQueue(name, concurrency) }
+
+// Crons lists registered cron triggers.
+func (q *Quacker) Crons() []CronInfo {
+	infos := q.eng.Crons()
+	out := make([]CronInfo, 0, len(infos))
+	for _, c := range infos {
+		out = append(out, CronInfo{Name: c.Name, Spec: c.Spec, Task: c.Task, Next: c.Next})
+	}
+	return out
+}
+
+// RemoveCron deletes a cron trigger.
+func (q *Quacker) RemoveCron(name string) error { return q.eng.RemoveCron(name) }
+
+// EnqueueOption configures a single enqueued run.
+type EnqueueOption func(*enqueueConfig)
+
+type enqueueConfig struct {
+	runAt    time.Time
+	priority int64
+}
+
+// WithDelay schedules the run to start at least d from now.
+func WithDelay(d time.Duration) EnqueueOption {
+	return func(c *enqueueConfig) { c.runAt = time.Now().Add(d) }
+}
+
+// WithRunAt schedules the run to start no earlier than t.
+func WithRunAt(t time.Time) EnqueueOption {
+	return func(c *enqueueConfig) { c.runAt = t }
+}
+
+// WithPriority orders the run ahead of lower-priority work in the same
+// queue. Higher numbers run first.
+func WithPriority(p int64) EnqueueOption {
+	return func(c *enqueueConfig) { c.priority = p }
+}
+
+// Enqueue enqueues one run of task with input.
+func Enqueue[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	ec := enqueueConfig{}
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
+		Workflow: t.name,
+		Kind:     store.KindTask,
+		Input:    inputJSON,
+		Priority: ec.priority,
+		RunAt:    ec.runAt,
+		Steps:    []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &RunHandle[O]{runID: w.RunID, w: w}, nil
+}
+
+// EnqueueWorkflow enqueues a workflow run. All steps receive input; the
+// handle's Result decodes the output of the last declared step, so callers
+// specify O explicitly while I is inferred from the workflow:
+//
+//	h, err := quacker.EnqueueWorkflow[Shipment](ctx, q, wf, order)
+func EnqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow[I], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	ec := enqueueConfig{}
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	steps := make([]engine.StepReq, len(wf.steps))
+	for i, s := range wf.steps {
+		steps[i] = engine.StepReq{Name: s.name, Deps: s.deps, Def: s.def}
+	}
+	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
+		Workflow: wf.name,
+		Kind:     store.KindWorkflow,
+		Input:    inputJSON,
+		Priority: ec.priority,
+		RunAt:    ec.runAt,
+		Steps:    steps,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &RunHandle[O]{runID: w.RunID, w: w}, nil
+}
+
+// Register makes a task executable without enqueuing a run. Needed when
+// using File storage: register tasks at startup so runs recovered from the
+// previous process can execute. Registration also happens automatically on
+// Enqueue and Cron.
+func Register[I, O any](q *Quacker, t *Task[I, O]) {
+	q.eng.RegisterTask(t.toDef())
+}
+
+// Cron registers a trigger that enqueues task with input on the cron spec
+// (standard 5-field syntax plus descriptors like "@hourly" and "@every 5m").
+// Crons are in-memory: re-register at startup, ideally before Open resumes
+// work.
+func Cron[I any, O any](q *Quacker, name, spec string, t *Task[I, O], input I) error {
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	return q.eng.RegisterCron(name, spec, t.toDef(), inputJSON)
+}

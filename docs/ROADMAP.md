@@ -1,0 +1,110 @@
+# Roadmap
+
+Status: **v0.1 shipped** (tasks, retries, timeouts, queues, priorities, DAG
+workflows, cron, delayed runs, cancel, graceful shutdown, File persistence +
+recovery, non-blocking introspection, subscribe, task logs, benchmarks).
+
+Each iteration below is independently shippable; priorities are the
+recommended order. Items marked ⚖ are decision points — see the end.
+
+---
+
+## v0.2 — hardening & control (next iteration)
+
+Goal: make v0.1 safe to run long-lived and multi-instance, and close the
+biggest feature gaps vs Hatchet for single-process users.
+
+### P0 — correctness patch (✅ DONE — shipped as part of v0.1 pre-release)
+
+The pre-release review's fixes landed, each with a regression test in
+`fixes_test.go`: engine-scoped log sink (multi-instance log routing),
+`StepFromContext`/`RunIDFromContext` dead-accessor fix, bounded waiters,
+park-without-attempt-consumption, queue-concurrency race, caller-ctx
+enqueues, cancel/claim race halt-tombstones, sibling-context cancellation on
+run failure, step-resurrection guards, real default jitter, sealed log
+channel (no post-Close panic), and the enqueue-during-Close TOCTOU guard.
+See DESIGN_NOTES.md for the full list.
+
+Acceptance: a test that runs two engines concurrently and asserts each run's
+logs appear only in its own instance's store.
+
+### P0 — storage foundation
+
+| Item | Design sketch |
+|---|---|
+| Schema migrations | `schema_migrations(version INT PRIMARY KEY, applied_at)` + ordered migration list; `CREATE TABLE IF NOT EXISTS` stops being the whole story. **Prerequisite for every later schema change** (keyed concurrency, parent runs, retention columns). |
+| Single-writer guard for `File` mode | Advisory lock (SQLite's own locking via a probe txn, or an `O_EXCL` lockfile with pid) so a second engine on the same path fails fast with a clear error instead of corrupting assumptions. |
+| WAL hygiene | Periodic `PRAGMA wal_checkpoint(TRUNCATE)` on a timer; cap WAL growth for long-running File deployments. |
+
+### P1 — concurrency control (flagship v0.2 features)
+
+| Item | Design sketch |
+|---|---|
+| Per-key concurrency | `quacker.WithKey(func(in I) string)` on a task; key persisted on `runs`/`steps` (new column + index, needs migrations). Engine keeps per-key semaphores in memory; scheduler claims a step only when its key has a free slot. Strategies: `N concurrent per key` (v0.2) and `strict order per key` (serialize; v0.3). |
+| Rate limiting | Token bucket per queue (and optionally per key): scheduler delays claims when the bucket is empty instead of claiming. Config: `quacker.WithRate("emails", 50, time.Minute)`. |
+
+Acceptance: tests asserting max-concurrent-per-key under load; rate-limited
+queue never exceeds N starts per window; both observable in `Execution`
+(key visible in snapshots).
+
+### P1 — operations
+
+| Item | Design sketch |
+|---|---|
+| Middleware hooks | `quacker.Use(func(next quacker.Handler) quacker.Handler)` wrapping task execution: timing, custom metrics, error taxonomies, per-task tracing. Handler receives step context + typed payload. |
+| Retention / purge | `q.Purge(ctx, PurgeOptions{OlderThan, Statuses, IncludeLogs bool})` deleting terminal runs + their logs in batches, plus an optional auto-purge policy at Open. Needed before File mode is credible for long-lived apps. |
+| Metrics callback | `WithMetricsFunc(func(MetricsSnapshot))` invoked on an interval — one-liner for Prometheus users until OTel lands. |
+
+### P2 — triggers & ergonomics
+
+| Item | Design sketch |
+|---|---|
+| Sub-second `@every` | Parse `@every <d>` ourselves and construct `cron.ConstantDelaySchedule(d)` directly — bypasses the parser's 1s floor. |
+| Persistent cron arming | On `Start()`, load `crons` rows; when the app later `Register`s the target task, arm the schedule automatically. File-mode apps then only need `Register`, not re-`Cron`. |
+| In-process events | `q.Emit(ctx, "order.placed", payload)`; tasks subscribe via `quacker.On("order.placed", task)` — stored in a table (needs migrations), fan-out on emit. |
+| CI + license | GitHub Actions (fmt, vet, test, `-race` on mac/linux), MIT LICENSE, semver tags. |
+
+---
+
+## v0.3 — durable execution & visibility
+
+- **Durable sleep**: `quacker.SleepDurable(ctx, 2*time.Hour)` checkpoints the
+  step (persisted "phase" + input), returns without failing, and the engine
+  resumes the continuation later — the state machine gains a
+  `SUSPENDED(step_phase)` state. Requires a resumable-task protocol
+  (`StepFunc` receiving a resume handle) — biggest design item on the board.
+- **Event waits**: durable `WaitFor(ctx, "payment.received", timeout)` built
+  on the same suspension mechanism.
+- **Child runs**: enqueue from inside a task with `runs.parent_id` for
+  lineage; `Execution` exposes children.
+- **Embedded debug endpoint**: `q.HTTPHandler() http.Handler` serving the
+  JSON snapshots (already fully tagged) plus a minimal single-page HTML view
+  — "the Hatchet UI, 200 lines, zero deploy".
+- **Perf**: batch enqueue, multi-queue claim batching in one transaction,
+  `-cpu` parallel benchmarks.
+
+---
+
+## v1.0 — stability
+
+- API freeze + semver discipline.
+- Chaos suite for File mode: injected process kills at every write site,
+  verifying recovery re-queues exactly-once-ish (at-least-once, no lost
+  terminal states).
+- Fuzzing for the DAG validator and cron parsing.
+- Docs site / pkg.go.dev examples baked into `example_test.go`.
+
+---
+
+## ⚖ Decision points (input welcome, defaults chosen)
+
+1. **v0.2 flagship**: plan assumes per-key concurrency + rate limiting are
+   the headline features, with hardening first. If you'd rather ship
+   durable sleep early (it's the sexiest Hatchet-parity feature but the
+   biggest design lift), v0.2 and v0.3 can swap.
+2. **Debug UI**: bundled `http.Handler` in the core module (zero extra deps)
+   vs a separate `quackerui` module. Default: core module, opt-in handler.
+3. **Events**: in-process emit/listen is planned; if you want webhook or
+   external-event ingestion, that changes the schema — flag it before the
+   migrations land.
+4. **License**: MIT assumed for the repo; say the word before the first tag.

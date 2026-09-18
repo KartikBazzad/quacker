@@ -1,0 +1,11 @@
+# Test artifacts (quacker File-storage tests use t.TempDir(), this is a belt)
+*.db
+*.db-wal
+*.db-shm
+*.test
+
+# macOS Finder metadata
+.DS_Store
+
+# Agent/tool session state
+.zcode/
