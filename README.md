@@ -65,11 +65,12 @@ quacker.Open(quacker.WithStorage(quacker.File("state.db").RecoverRunningOnBoot(t
   are truly lock-free versus the write path.
 - **`File`** — survives restarts. Runs interrupted by a previous process are
   re-queued on boot (or marked failed with `RecoverRunningOnBoot(false)`).
-  Opening a `File` path takes an exclusive `<path>.quacker.lock`, so a
-  second engine on the same path fails fast; locks left by dead processes
-  are reclaimed by pid check. The pid probe is unix-only — on other
-  platforms a leftover lock fails safe (reports in-use) and can be
-  removed manually.
+  Opening a `File` path takes an exclusive kernel advisory lock
+  (`flock`/`LockFileEx`) on a `<path>.quacker.lock` sidecar file, so a
+  second engine on the same path fails fast — and the lock is released
+  automatically when the process dies, even on SIGKILL. On platforms
+  without kernel advisory locks (`!unix && !windows`), only same-process
+  exclusion holds.
 
 WAL modes (`Ephemeral`, `File`) run a passive `wal_checkpoint` every 60s
 (`WithCheckpointInterval`) and a truncating checkpoint on `Close`, so a
@@ -153,8 +154,8 @@ at shutdown.
 - **`@every` intervals round up to 1 second** (cron parser limitation).
 - Tasks should honor `ctx` — timeouts and cancellation are cooperative.
 - One engine per process assumes a single writer to a given `File` path —
-  enforced by the `.quacker.lock` guard: a second engine on the same path
-  fails fast at `Open` instead of corrupting assumptions.
+  enforced by the `.quacker.lock` kernel-lock guard: a second engine on
+  the same path fails fast at `Open` instead of corrupting assumptions.
 
 ## Not in v0.1
 

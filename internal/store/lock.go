@@ -1,99 +1,150 @@
 package store
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// acquireFileLock takes the single-writer lock for a File-mode database: a
-// lockfile at dbPath+".quacker.lock" recording pid, host, and time. The
-// content is written to a sibling temp file and link(2)ed into place —
-// link fails EEXIST atomically when the lock exists, so a concurrent
-// opener can never observe a half-written lockfile, call it stale, and
-// steal the lock (the earlier O_EXCL create-then-write left that window).
-// A lock whose recorded pid is alive on this host fails fast; a stale lock
-// (dead pid, unparseable foreign garbage) is reclaimed. Returns the lock
-// path so the owner can release it on Close.
-func acquireFileLock(dbPath string) (string, error) {
+// The single-writer guard is a kernel-held advisory lock on a permanent
+// sidecar file (dbPath+".quacker.lock"), held open for the Store's whole
+// lifetime. Unlike the old pid-recording lockfile this is correct by
+// construction: the lock lives in the kernel, not the file content, so it
+// is acquired atomically and released automatically when the holder dies
+// — even via SIGKILL — with no stale-lock reclamation and no
+// check-then-remove TOCTOU.
+//
+// The lock goes on a sidecar, never the database file: on NFS, flock(2)
+// is emulated as a whole-file fcntl lock, which would collide with
+// SQLite's own fcntl byte-range locks on the same inode (every write
+// transaction would hit SQLITE_BUSY). SQLite never touches the sidecar,
+// so the lock is conflict-free.
+//
+// The sidecar is created once and never deleted: unlinking a file another
+// process holds open lets a new inode be created for the same path, and
+// two inodes mean two independent locks — a double-owner split-brain.
+// Its content (pid/host/time) is diagnostic only, written best-effort
+// after the lock is taken; an empty or stale file is fine.
+//
+// fileLocks adds same-process exclusion on top of the kernel lock. POSIX
+// fcntl locks are per-process — two Stores in one process could both
+// "acquire" the OS lock — so the registry is consulted first and makes
+// the second Open fail deterministically on every platform.
+var fileLocks sync.Map // absolute lock path -> *os.File holding it;
+// a value is briefly nil between the LoadOrStore reservation and the
+// Store that upgrades it to the locked file once the OS call lands.
+
+// Sentinels the platform lock helpers classify their failures into, so
+// lock.go can build the right error without knowing OS-specific errnos.
+var (
+	// errLockHeld means another process holds the lock.
+	errLockHeld = errors.New("quacker: file lock held")
+	// errLockUnsupported means the filesystem cannot do advisory locks.
+	errLockUnsupported = errors.New("quacker: advisory file locking unsupported")
+)
+
+// acquireFileLock takes the single-writer lock for a File-mode database
+// and returns the open, locked sidecar file; the Store holds it and
+// passes it to releaseFileLock on Close.
+func acquireFileLock(dbPath string) (*os.File, error) {
 	lockPath := dbPath + ".quacker.lock"
-	hostname, _ := os.Hostname()
-	// The pid in the temp name keeps two racing processes from sharing one
-	// temp file; same-process racers write identical content, which is
-	// harmless.
-	tmpPath := fmt.Sprintf("%s.tmp.%d", lockPath, os.Getpid())
-	content := fmt.Sprintf("%d\n%s\n%s\n", os.Getpid(), hostname, time.Now().Format(time.RFC3339))
-	if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
-		return "", fmt.Errorf("quacker: create lock %s: %w", lockPath, err)
+	key := lockPath
+	if abs, err := filepath.Abs(lockPath); err == nil {
+		key = abs
 	}
-	defer os.Remove(tmpPath)
-
-	for attempt := 0; attempt < 2; attempt++ {
-		err := os.Link(tmpPath, lockPath)
-		if err == nil {
-			return lockPath, nil
-		}
-		if !os.IsExist(err) {
-			return "", fmt.Errorf("quacker: create lock %s: %w", lockPath, err)
-		}
-		// The lock exists: reclaim it only if it's provably stale.
-		pid, host, ok, rerr := readLockFile(lockPath)
-		switch {
-		case rerr != nil && !os.IsNotExist(rerr):
-			// Present but unreadable: assume a live lock rather than
-			// stealing one we merely can't inspect.
-			return "", fmt.Errorf("quacker: state file %s is already in use by another quacker process", dbPath)
-		case rerr == nil && ok:
-			// A pid recorded under a different hostname lives in another
-			// namespace (shared FS, containers) where kill(2) can't prove
-			// it dead; without a local hostname we can't even compare.
-			// Both cases fail safe: report the lock in use.
-			if hostname == "" || host != hostname {
-				return "", fmt.Errorf("quacker: state file %s is already in use by quacker on host %q (pid %d)", dbPath, host, pid)
-			}
-			if pidAlive(pid) {
-				return "", fmt.Errorf("quacker: state file %s is already in use by another quacker process (pid %d)", dbPath, pid)
-			}
-		}
-		// Stale — dead pid, unparseable garbage, or vanished between the
-		// failed link and the read. Reclaim and retry.
-		if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
-			return "", fmt.Errorf("quacker: remove stale lock %s: %w", lockPath, err)
-		}
+	// Same-process check first, before any OS call: it must win even on
+	// platforms whose OS lock wouldn't conflict within one process.
+	if _, loaded := fileLocks.LoadOrStore(key, nil); loaded {
+		return nil, fmt.Errorf("quacker: state file %s is already in use by this process", dbPath)
 	}
-	return "", fmt.Errorf("quacker: state file %s is already in use by another quacker process", dbPath)
-}
-
-// releaseFileLock removes the lockfile on Close, but only if it's still
-// ours: a lock recording our pid, or unparseable foreign garbage, is
-// removed; a lock recording a different pid belongs to a process that
-// replaced ours (stolen lock, admin recreation) and is left alone.
-func releaseFileLock(lockPath string) {
-	pid, _, ok, err := readLockFile(lockPath)
+	f, err := openLockFile(lockPath)
 	if err != nil {
-		return // gone or unreadable: nothing safe to remove
+		fileLocks.Delete(key)
+		return nil, fmt.Errorf("quacker: create lock %s: %w", lockPath, err)
 	}
-	if !ok || pid == os.Getpid() {
-		_ = os.Remove(lockPath)
+	if err := lockPlatformFile(f); err != nil {
+		_ = f.Close()
+		fileLocks.Delete(key)
+		switch {
+		case errors.Is(err, errLockHeld):
+			return nil, lockInUseError(dbPath, lockPath)
+		case errors.Is(err, errLockUnsupported):
+			return nil, fmt.Errorf("quacker: state file %s: filesystem does not support advisory file locking", dbPath)
+		default:
+			return nil, fmt.Errorf("quacker: lock %s: %w", lockPath, err)
+		}
 	}
+	writeLockDiagnostics(f)
+	fileLocks.Store(key, f)
+	return f, nil
 }
 
-// readLockFile reads the lockfile's pid and host. ok=false means the file
-// read fine but doesn't parse — foreign garbage, treated as stale. A read
-// error is returned separately so a present-but-unreadable lock is never
-// mistaken for a dead one.
-func readLockFile(lockPath string) (pid int, host string, ok bool, err error) {
+// releaseFileLock unlocks (best-effort — closing the fd releases the
+// kernel lock anyway), closes the sidecar, and frees the in-process
+// registry entry.
+func releaseFileLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	unlockPlatformFile(f)
+	_ = f.Close()
+	// Delete by value rather than recomputing the key: the registry holds
+	// this exact *os.File, so the match is unambiguous even if the process
+	// changed directories since Open (a recomputed relative path could
+	// collide with a different store's entry). The map holds one entry per
+	// open File store, so the sweep is trivial.
+	fileLocks.Range(func(k, v any) bool {
+		if v == f {
+			fileLocks.Delete(k)
+		}
+		return true
+	})
+}
+
+// lockInUseError builds the "already in use" failure, enriching it with
+// the holder's pid and host when the sidecar's diagnostic content parses.
+func lockInUseError(dbPath, lockPath string) error {
+	if pid, host, ok := readLockDiagnostics(lockPath); ok {
+		// The holder can be this very process: an aliased path (a symlinked
+		// directory component, say) resolves to the same sidecar but a
+		// different registry key, so the kernel lock reports the conflict
+		// the in-process map missed. Say so rather than blaming a stranger.
+		if pid == os.Getpid() {
+			return fmt.Errorf("quacker: state file %s is already in use by this process", dbPath)
+		}
+		return fmt.Errorf("quacker: state file %s is already in use by another quacker process (pid %d on host %q)", dbPath, pid, host)
+	}
+	return fmt.Errorf("quacker: state file %s is already in use by another quacker process", dbPath)
+}
+
+// writeLockDiagnostics records pid, hostname, and time in the sidecar
+// through the already-open fd — purely informational for debugging a held
+// lock; the lock state itself lives in the kernel.
+func writeLockDiagnostics(f *os.File) {
+	hostname, _ := os.Hostname()
+	_ = f.Truncate(0)
+	_, _ = f.Seek(0, io.SeekStart)
+	_, _ = fmt.Fprintf(f, "%d\n%s\n%s\n", os.Getpid(), hostname, time.Now().Format(time.RFC3339))
+}
+
+// readLockDiagnostics parses the sidecar's pid and host lines. ok=false
+// means empty or unparseable content — no holder identity to report.
+func readLockDiagnostics(lockPath string) (pid int, host string, ok bool) {
 	b, err := os.ReadFile(lockPath)
 	if err != nil {
-		return 0, "", false, err
+		return 0, "", false
 	}
 	line, rest, _ := strings.Cut(string(b), "\n")
 	host, _, _ = strings.Cut(rest, "\n")
 	n, perr := strconv.Atoi(strings.TrimSpace(line))
 	if perr != nil || n <= 0 {
-		return 0, "", false, nil
+		return 0, "", false
 	}
-	return n, strings.TrimSpace(host), true, nil
+	return n, strings.TrimSpace(host), true
 }

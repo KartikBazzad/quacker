@@ -110,6 +110,7 @@ type Engine struct {
 	haltSteps map[string]struct{}
 
 	wg      sync.WaitGroup // in-flight step executions
+	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron)
 	wake    chan struct{}
 	closing atomic.Bool
 
@@ -182,8 +183,9 @@ func (e *Engine) Start() {
 	}
 	e.logWG.Add(1)
 	go e.flushLogs()
-	go e.schedulerLoop()
-	go e.cronLoop()
+	e.loopWG.Add(2)
+	go func() { defer e.loopWG.Done(); e.schedulerLoop() }()
+	go func() { defer e.loopWG.Done(); e.cronLoop() }()
 }
 
 // Close stops the engine: no new work is claimed, in-flight executions drain
@@ -193,6 +195,13 @@ func (e *Engine) Close(ctx context.Context) error {
 	if !e.closing.Swap(true) {
 		e.cancel()
 	}
+	// Join the ctx-driven loops before draining: a detached scheduler or
+	// cron iteration could otherwise hit the store while Quacker.Close
+	// proceeds to st.Close (which now runs a truncating checkpoint). Both
+	// loops select on e.ctx and their store calls are bounded by
+	// busy_timeout, so the join can't deadlock — at worst it waits out
+	// one in-flight store call.
+	e.loopWG.Wait()
 	done := make(chan struct{})
 	go func() { e.wg.Wait(); close(done) }()
 	select {

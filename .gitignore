@@ -2,6 +2,7 @@
 *.db
 *.db-wal
 *.db-shm
+*.quacker.lock
 *.test
 
 # macOS Finder metadata

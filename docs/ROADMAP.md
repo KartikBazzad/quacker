@@ -33,13 +33,17 @@ logs appear only in its own instance's store.
 | Item | Design sketch |
 |---|---|
 | ✅ Schema migrations | `schema_migrations(version INT PRIMARY KEY, applied_at)` + ordered migration list; `CREATE TABLE IF NOT EXISTS` stops being the whole story. **Prerequisite for every later schema change** (keyed concurrency, parent runs, retention columns). |
-| ✅ Single-writer guard for `File` mode | Atomic lockfile with pid (a sibling temp file `link(2)`ed into place) so a second engine on the same path fails fast with a clear error instead of corrupting assumptions. |
+| ✅ Single-writer guard for `File` mode | Exclusive non-blocking kernel advisory lock (`flock`/`LockFileEx`) on a permanent `<path>.quacker.lock` sidecar, held for the store's lifetime — a second engine on the same path fails fast with a clear error instead of corrupting assumptions, and the lock releases automatically on process death. |
 | ✅ WAL hygiene | Periodic `PRAGMA wal_checkpoint(PASSIVE)` on a timer plus a `TRUNCATE` checkpoint on close; cap WAL growth for long-running File deployments. |
 
 As built: migrations apply per-version in one transaction (v0.1 file DBs
-baseline at 1); the guard is an atomically-created lockfile with a
-`kill(pid, 0)` stale check; checkpoints are `PASSIVE` every
-`WithCheckpointInterval` (default 60s) plus `TRUNCATE` on close.
+baseline at 1); the guard is a kernel advisory lock on a permanent
+sidecar (no stale locks, no reclamation TOCTOU — the kernel releases it
+on process death, even SIGKILL) plus an in-process registry for
+same-process exclusion; checkpoints are `PASSIVE` every
+`WithCheckpointInterval` (default 60s, clamped to ≥10ms) plus a
+bounded-timeout `TRUNCATE` on File-mode close whose failure is reported
+to the caller.
 
 ### P1 — concurrency control (flagship v0.2 features)
 
@@ -82,9 +86,10 @@ queue never exceeds N starts per window; both observable in `Execution`
   on the same suspension mechanism.
 - **Child runs**: enqueue from inside a task with `runs.parent_id` for
   lineage; `Execution` exposes children.
-- **Embedded debug endpoint**: `q.HTTPHandler() http.Handler` serving the
-  JSON snapshots (already fully tagged) plus a minimal single-page HTML view
-  — "the Hatchet UI, 200 lines, zero deploy".
+- **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to a channel, which can be consumed by the user.
+  - "We dont want the quacker to serve http. so a method can return debug logs"
+- **DAG Visualizer**: `q.DAGJSON()` returns a JSON representation of the DAG, which can be consumed by the user.
+  - "We need this JSON to return Current State of the Entire DAG"
 - **Perf**: batch enqueue, multi-queue claim batching in one transaction,
   `-cpu` parallel benchmarks.
 
@@ -101,14 +106,27 @@ queue never exceeds N starts per window; both observable in `Execution`
 
 ---
 
+## v1.1 - Database Support
+- Support for PostgreSQL
+- Migration scripts for PostgreSQL
+- Reuse existing connection
+
+## v1.2 - Performance Optimizations
+- Optimize for high throughput and low latency
+- Add support for horizontal scaling
+
+
+## v1.3 - Advanced Features
+- Plugin system for extending functionality
+- Support for custom storage backends
+
 ## ⚖ Decision points (input welcome, defaults chosen)
 
 1. **v0.2 flagship**: plan assumes per-key concurrency + rate limiting are
    the headline features, with hardening first. If you'd rather ship
    durable sleep early (it's the sexiest Hatchet-parity feature but the
    biggest design lift), v0.2 and v0.3 can swap.
-2. **Debug UI**: bundled `http.Handler` in the core module (zero extra deps)
-   vs a separate `quackerui` module. Default: core module, opt-in handler.
+2. **Debug logger**: embedded debug logger is planned; it will be a method on the quacker instance that returns a logger that writes to a channel, which can be consumed by the user.
 3. **Events**: in-process emit/listen is planned; if you want webhook or
    external-event ingestion, that changes the schema — flag it before the
    migrations land.

@@ -65,19 +65,58 @@ Run-level final updates are conditioned on
 against executors recording their own outcome, without any locking between
 them.
 
-### 8. The single-writer guard is a lockfile, not a SQLite probe
+### 8. The single-writer guard is a kernel advisory lock, not a lockfile
 
 A probe transaction can prove a database is writable, but only while held
 — keeping exclusion would mean holding an exclusive txn for the process
 lifetime, which blocks checkpoints and every other tool that touches the
-file. A lockfile (`<path>.quacker.lock` with pid/host/time) is
-held for free, fails `Open` before any connection touches the database,
-and is inspectable when debugging. Crash leftovers are reclaimed by a
-`kill(pid, 0)` liveness check; non-unix builds conservatively treat every
-pid as alive. Creation is atomic — the content is written to a sibling
-temp file and `link(2)`ed into place — because an `O_EXCL`
-create-then-write left a window where a second opener could read the file
-empty, call it stale, and steal the lock.
+file. Instead `Open` takes an exclusive non-blocking kernel advisory lock
+(`flock` on unix, `LockFileEx` on Windows, `fcntl(F_SETLK)` on unixes
+without `flock`) on a permanent sidecar file, `<path>.quacker.lock`, held
+open for the store's lifetime.
+
+The first implementation was a pid-recording lockfile created by
+tmp-file + `link(2)`. It was replaced because the advisory lock is
+correct by construction: acquisition is atomic (the kernel serializes
+opens), the lock is released automatically when the holder dies — even
+via SIGKILL — so there is no stale lock to reclaim and no
+check-then-remove TOCTOU where two processes racing to reclaim the same
+stale lock could both end up owning it. The sidecar's content
+(pid/host/time) is now diagnostic only, written best-effort through the
+already-open fd after the lock lands; an empty or stale file means
+nothing.
+
+Why a sidecar rather than locking the database file itself: on NFS,
+`flock(2)` is emulated as a whole-file `fcntl` lock, which would collide
+with SQLite's own `fcntl` byte-range locks on the same inode — every
+write transaction would hit `SQLITE_BUSY`. SQLite never touches the
+sidecar, so the lock is conflict-free. The sidecar is also never deleted:
+unlinking a file another process holds open lets a new inode be created
+for the path, and two inodes mean two independent locks — a double-owner
+split-brain.
+
+An in-process registry (`sync.Map` keyed by the absolute lock path) sits
+in front of the OS call so a second `Open` of the same path in the same
+process fails deterministically everywhere — POSIX `fcntl` locks are
+per-process and would not self-conflict.
+
+Caveats:
+
+- The filesystem must support advisory locking (on NFS that means the
+  server runs lockd); unsupported filesystems fail `Open` with a clear
+  error rather than silently unguarding the database.
+- On `!unix && !windows` platforms (and hurd, which ships neither
+  `flock` nor `fcntl` locking in x/sys) there is no kernel lock at all:
+  only same-process exclusion holds. File mode there is best-effort.
+- Hardlink or symlink aliases to the same database inode get different
+  sidecar paths and therefore different locks — a documented limitation;
+  the guard covers the *path*, not the inode.
+
+Upgrade note: binaries running the previous pid-file design hold no
+kernel lock, so every old-binary process on a database path must be
+stopped before a new-binary process opens it — the old lockfile's
+content is invisible to `flock`, and the old release path could unlink
+the sidecar out from under the new lock.
 
 ### 9. Checkpoints are PASSIVE on the timer, TRUNCATE only at close
 

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,14 +49,20 @@ type Config struct {
 	// they are marked FAILED with an "interrupted" error. Default true.
 	RecoverRunningOnBoot bool
 	// CheckpointInterval is how often WAL modes (Ephemeral, File) run a
-	// passive wal_checkpoint to bound WAL growth. <=0 uses the 60s default.
-	// ModeMemory never checkpoints: :memory: databases have no WAL.
+	// passive wal_checkpoint to bound WAL growth. <=0 uses the 60s
+	// default; values below 10ms are clamped to 10ms. ModeMemory never
+	// checkpoints: :memory: databases have no WAL.
 	CheckpointInterval time.Duration
 }
 
-// defaultCheckpointInterval bounds WAL growth when CheckpointInterval is
-// unset.
-const defaultCheckpointInterval = 60 * time.Second
+const (
+	// defaultCheckpointInterval bounds WAL growth when CheckpointInterval
+	// is unset.
+	defaultCheckpointInterval = 60 * time.Second
+	// minCheckpointInterval keeps a hot-ticker configuration from turning
+	// the checkpoint loop into a spin; smaller values are clamped up.
+	minCheckpointInterval = 10 * time.Millisecond
+)
 
 // dsn returns the writer DSN, reader DSN, and (for ModeEphemeral) the temp
 // file path to remove on Close.
@@ -87,6 +94,23 @@ func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
 		if c.Path == "" {
 			return "", "", "", fmt.Errorf("quacker: storage.File requires a path")
 		}
+		// The path is embedded into a "file:" DSN and SQLite parses it as
+		// a URI: ?/#/& become DSN pragmas or a fragment, % is URI-decoded
+		// ("dir/a%2fb.db" opens "dir/a/b.db"), and a leading "//" is
+		// stripped as a URI authority ("//host/dir/x.db" opens
+		// "/dir/x.db") — each makes SQLite open a different file than
+		// the .quacker.lock sidecar guards, or injects options. (Windows
+		// UNC paths use backslashes, so the "//" check doesn't touch
+		// them.) A path cleaning to ":memory:" would silently swap
+		// durable storage for an in-memory database behind a useless
+		// on-disk sidecar. Control runes have no business in a path
+		// either.
+		if strings.ContainsAny(c.Path, "?&#%") ||
+			strings.HasPrefix(c.Path, "//") ||
+			filepath.Clean(c.Path) == ":memory:" ||
+			strings.IndexFunc(c.Path, func(r rune) bool { return r < 0x20 }) >= 0 {
+			return "", "", "", fmt.Errorf("quacker: storage.File: invalid path %q", c.Path)
+		}
 		if dir := filepath.Dir(c.Path); dir != "." {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return "", "", "", fmt.Errorf("quacker: create db dir: %w", err)
@@ -110,14 +134,16 @@ type Store struct {
 	read    *sql.DB // read-only connections (query_only)
 	keep    *sql.DB // keeper pool pinning the shared-cache in-memory DB
 	tmpPath string
-	// lockPath is set only when this store created the File-mode lockfile;
-	// Close removes it so a dead process never leaves a stale lock.
-	lockPath   string
+	// lock is the open, kernel-locked sidecar file held for the store's
+	// lifetime (File mode only); Close releases it.
+	lock       *os.File
 	wal        bool // WAL journal modes run checkpoints
-	ckptDone   chan struct{}
 	ckptCancel context.CancelFunc
 	ckptWG     sync.WaitGroup
-	closed     atomic.Bool
+	// ckptCount ticks once per checkpoint attempt; tests read it to prove
+	// the loop runs without waiting a full interval.
+	ckptCount atomic.Int64
+	closed    atomic.Bool
 }
 
 var memSerial atomic.Int64
@@ -132,13 +158,13 @@ func Open(cfg Config) (*Store, error) {
 
 	if cfg.Mode == ModeFile {
 		// Take the single-writer lock before any connection touches the
-		// file: the lockfile is created atomically (tmp + link(2)), so two
-		// opens can never both win.
-		lockPath, err := acquireFileLock(cfg.Path)
+		// file: a kernel advisory lock on the sidecar, so opens serialize
+		// in the kernel and the lock dies with its holder.
+		lock, err := acquireFileLock(cfg.Path)
 		if err != nil {
 			return nil, err
 		}
-		s.lockPath = lockPath
+		s.lock = lock
 	}
 
 	w, err := sql.Open("sqlite", wdsn)
@@ -203,7 +229,9 @@ func Open(cfg Config) (*Store, error) {
 		if interval <= 0 {
 			interval = defaultCheckpointInterval
 		}
-		s.ckptDone = make(chan struct{})
+		if interval < minCheckpointInterval {
+			interval = minCheckpointInterval
+		}
 		ckptCtx, ckptCancel := context.WithCancel(context.Background())
 		s.ckptCancel = ckptCancel
 		s.ckptWG.Add(1)
@@ -229,29 +257,27 @@ func (s *Store) checkpointLoop(ctx context.Context, d time.Duration) {
 	defer t.Stop()
 	for {
 		select {
-		case <-s.ckptDone:
-			return
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			// ExecContext lets Close interrupt an Exec queued behind a
 			// long write tx on the single-conn pool.
 			_, _ = s.write.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+			s.ckptCount.Add(1)
 		}
 	}
 }
 
 // Close closes both pools and removes any ephemeral database file. On WAL
 // modes it first stops the checkpoint goroutine, then — once the read pool
-// is closed and no reader snapshot can linger — runs a best-effort
-// truncating checkpoint so a clean close leaves an empty (usually deleted)
-// -wal file.
+// is closed and no reader snapshot can linger — runs a truncating
+// checkpoint (File mode only) so a clean close leaves an empty (usually
+// deleted) -wal file.
 func (s *Store) Close() error {
 	if s == nil || s.closed.Swap(true) {
 		return nil
 	}
-	if s.ckptDone != nil {
-		close(s.ckptDone)
+	if s.ckptCancel != nil {
 		s.ckptCancel()
 		s.ckptWG.Wait()
 	}
@@ -266,18 +292,25 @@ func (s *Store) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if s.wal && s.write != nil {
-		// Best-effort: with the read pool closed no snapshot remains, so
-		// TRUNCATE merges and empties the WAL in one shot.
-		_, _ = s.write.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if s.wal && s.tmpPath == "" && s.write != nil {
+		// File mode only (Ephemeral deletes its file right after anyway):
+		// with the read pool closed no snapshot remains, so TRUNCATE merges
+		// and empties the WAL in one shot. Still best-effort — Close
+		// proceeds regardless — but the failure is reported to the caller.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := s.write.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("quacker: wal checkpoint on close: %w", err))
+		}
 	}
 	if s.write != nil {
 		if err := s.write.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if s.lockPath != "" {
-		releaseFileLock(s.lockPath)
+	if s.lock != nil {
+		releaseFileLock(s.lock)
 	}
 	if s.tmpPath != "" {
 		for _, p := range []string{s.tmpPath, s.tmpPath + "-wal", s.tmpPath + "-shm"} {

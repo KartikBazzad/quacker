@@ -77,8 +77,9 @@ func WithPollInterval(d time.Duration) Option {
 
 // WithCheckpointInterval sets how often WAL-backed storage (Ephemeral,
 // File) runs a passive wal_checkpoint to bound WAL growth. The checkpoint
-// never blocks readers or the writer. Default 60s; Memory storage has no
-// WAL and never checkpoints.
+// never blocks readers or the writer. <=0 uses the 60s default; values
+// below 10ms are clamped to 10ms. Memory storage has no WAL and never
+// checkpoints.
 func WithCheckpointInterval(d time.Duration) Option {
 	return func(c *config) { c.checkpointInterval = d }
 }

@@ -60,10 +60,14 @@ Connection topology:
 Pragmas on every connection: `busy_timeout=10000`, `foreign_keys=1`.
 
 File mode additionally serializes *engines*, not just writers: `Open`
-creates `<path>.quacker.lock` atomically — content written to a sibling
-temp file, `link(2)`ed into place — before any connection touches the
-file (recording pid/host/time). A live owner pid fails `Open` fast; a
-dead one is stale and reclaimed. `Close` removes it if it's still ours.
+takes an exclusive non-blocking kernel advisory lock (`flock`/`LockFileEx`)
+on a permanent `<path>.quacker.lock` sidecar before any connection touches
+the file, and holds it for the store's lifetime. The kernel releases the
+lock on process death — no stale locks, no reclamation. A sidecar (not the
+DB file) is locked because flock-on-NFS degrades to whole-file `fcntl`
+locks that would collide with SQLite's own byte-range locks; the sidecar's
+pid/host/time content is diagnostic only. An in-process registry provides
+same-process exclusion on every platform. `Close` unlocks and closes it.
 
 WAL modes run a goroutine issuing `PRAGMA wal_checkpoint(PASSIVE)` every
 `Config.CheckpointInterval` (default 60s) — never blocking, capping WAL

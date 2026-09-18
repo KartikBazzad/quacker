@@ -109,6 +109,23 @@ var migrations = []migration{
 	{version: 1, sql: schema},
 }
 
+// init validates the migration list's invariant before any Open can rely
+// on it: non-empty, with strictly ascending versions. migrate assumes the
+// last entry is the maximum version and applies entries in list order —
+// a duplicate or out-of-order version would silently skip or misorder
+// DDL, so it panics at startup instead.
+func init() {
+	if len(migrations) == 0 {
+		panic("quacker: store: no schema migrations defined")
+	}
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].version <= migrations[i-1].version {
+			panic(fmt.Sprintf("quacker: store: migrations out of order: version %d follows version %d",
+				migrations[i].version, migrations[i-1].version))
+		}
+	}
+}
+
 // migrate brings the database to the latest schema version. The
 // schema_migrations table is created first so every later migration can be
 // recorded in the same transaction as its DDL. Migration 1 is all
