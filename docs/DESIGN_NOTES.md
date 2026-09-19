@@ -824,6 +824,34 @@ runs (DLQ retry, and future replay) must keep this in mind.
   signal, so it may be recovered like a normal run. Ephemeral's "no recovery"
   guarantee is exact for single-process File storage.
 
+### 38. v1.8: cancel strategies reuse the enqueue transaction and the replace path
+
+Cancel strategies (cancel the newest, cancel in progress, keep newest/oldest
+queued) are decided **inside the enqueue transaction**, not by the scheduler.
+The existing claim gate already handles the default `Hold` by counting RUNNING
+rows, but the cancel strategies must act at insert time, atomically with the
+insert, or two concurrent enqueues could both decide to cancel the same victim
+(or neither).
+
+Two pieces made this cheap to add:
+
+- **Ordering came from the sequence counter.** A batch stamps every run with the
+  same `created_at`, and `id` has a random suffix, so neither orders runs. Every
+  keyed run now takes a `seq` from the `counters` table in the insert
+  transaction, giving cancel strategies an exact insertion order — the same
+  mechanism sequences use, extended to keyed runs.
+- **Victims are just `ReplacedRun`s.** The store cancels the strategy's victims
+  (which may include the run being inserted, for cancel-newest and
+  keep-oldest) and returns them; the engine already knew how to interrupt a
+  replaced run's contexts and release its waiter from `UniqueReplace`. So the
+  engine change was to feed the strategy's victims through the same path, and a
+  cancelled incoming run's handle resolves `ErrRunCancelled`.
+
+`CancelInProgress` orders victims running-first so it preempts active work
+before older queued work, matching Oban/River. Multi-instance is safe for the
+same reason unique jobs are: the decision is one transaction, and the store's
+claim lock / single writer serializes it.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

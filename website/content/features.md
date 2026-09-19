@@ -94,6 +94,9 @@ across processes sharing a database.
   starts per sliding window, counted over claim timestamps.
 - **Worker labels** — `WithLabels("gpu")` on a task and
   `WithWorkerLabels("gpu")` on an engine route work only to capable workers.
+- **Cancel strategies** — `WithKeyStrategy` chooses what happens when a key is
+  full: hold (default), cancel the newest, cancel in progress, or keep the
+  newest/oldest queued runs.
 
 ## Job control
 

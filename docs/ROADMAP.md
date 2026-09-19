@@ -1,12 +1,13 @@
 # Roadmap
 
-Status: **v1.0–v1.7 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.8 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
 storage-driver contract with a MySQL/MariaDB driver, v1.5 job-control
 primitives (unique jobs, snooze, queue pause, run pause/resume), v1.6
 (retention per queue, enqueue-on-`*sql.Tx`, dead-letter queue, sequences), and
-v1.7 (encrypted payloads, ephemeral runs). The v1.0 stability gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
+v1.7 (encrypted payloads, ephemeral runs), and v1.8 (concurrency cancel
+strategies). The v1.0 stability gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
 complete; release tags wait on a git remote.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
@@ -531,6 +532,19 @@ halt tombstone is now honored only while the run is terminal.
   history remains. A run executed on another engine returns `ErrRunGone` to an
   observer. Migrations: SQLite 18, Postgres 10, MySQL 7.
 
+## v1.8 — concurrency cancel strategies (✅ DONE)
+
+- ✅ **`WithKeyStrategy`**: `ConcurrencyHold` (default), `ConcurrencyCancelInProgress`,
+  `ConcurrencyCancelNewest`, `ConcurrencyCancelQueuedExceptNewest`,
+  `ConcurrencyCancelQueuedExceptOldest`. Applied inside the enqueue
+  transaction — keyed runs get an insertion-order `seq`, and when a key is over
+  its limit the store cancels the strategy's victims (possibly the incoming
+  run) and returns them so the engine interrupts local contexts and releases
+  waiters. No migration.
+
+Still open on concurrency: multiple/shared keys, per-worker slots, dynamic
+limit expressions (all documented below).
+
 ## Backlog
 - Custom storage backends
 - Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
@@ -545,7 +559,7 @@ names the closest API today.
 |---|---|---|
 | Batching | ✅ | `EnqueueBatch` — one transaction, all-or-nothing, handles in input order. |
 | Cancelling jobs | ✅ | `q.Cancel(runID)`: QUEUED/BLOCKED/SUSPENDED → CANCELLED, RUNNING gets ctx cancel. No bulk/by-filter cancel. |
-| Concurrency limits | 🟡 | Queue (`WithQueue`), per-key (`WithKey`/`WithKeyConcurrency`), sliding-window rate (`WithRate`). Missing: cancel strategies, multiple/shared keys, per-worker slots, dynamic limits. |
+| Concurrency limits | 🟡 | Queue, per-key + **cancel strategies** (`WithKeyStrategy`), and rate limits. Missing: multiple/shared keys, per-worker slots, dynamic limits. |
 | Getting the client within workers | 🟡 | Go tasks close over `q`; context exposes `RunIDFromContext`/`StepFromContext` only — no engine accessor (trivial for embedded use). |
 | Dead letter queue | ✅ | Opt-in `WithDeadLetter`; `DeadLetters`/`RetryDeadLetter`/`DismissDeadLetter` (v1.6). |
 | Durable periodic jobs | ✅ | `Cron` persists and re-arms on `Register`; fires once per occurrence across instances. |
@@ -571,15 +585,17 @@ names the closest API today.
 | Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
 
 Tally: 24 shipped, 2 partial, 0 missing — v1.7 added encrypted payloads and
-ephemeral runs. The remaining partial items are concurrency-limit cancel
-strategies and the client-in-context accessor.
+ephemeral runs, and v1.8 added concurrency cancel strategies. The remaining
+partial items are the rest of concurrency limits (multiple/shared keys,
+per-worker slots, dynamic limits) and the client-in-context accessor.
 
 ### Missing / partial — suggested follow-ups
 
 Addable within the embedded model, roughly by value:
 
-1. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
-2. **Client in context** — an engine accessor inside a task (Go closures usually suffice).
+1. **Multiple/shared concurrency keys** — several limits per task and named limits shared across tasks; needs a per-step key table and a shared-limits table.
+2. **Per-worker slots / dynamic limits** — local capacity caps and limit expressions.
+3. **Client in context** — an engine accessor inside a task (Go closures usually suffice).
 
 The list reads like a Postgres-backed job-library matrix (River/Oban-shaped),
 which is a useful parity target beyond Hatchet.
