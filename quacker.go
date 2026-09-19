@@ -14,7 +14,6 @@ package quacker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -57,6 +56,7 @@ func Open(opts ...Option) (*Quacker, error) {
 		WorkerID:        cfg.workerID,
 		LeaseTTL:        cfg.leaseTTL,
 		Hooks:           cfg.plugins,
+		Codec:           cfg.codec,
 	}
 	if cfg.logSink != nil {
 		fn := cfg.logSink
@@ -171,7 +171,7 @@ func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], 
 	}
 	reqs := make([]*engine.EnqueueRequest, len(inputs))
 	for i, in := range inputs {
-		b, err := json.Marshal(in)
+		b, err := q.eng.Codec().Marshal(in)
 		if err != nil {
 			return nil, err
 		}
@@ -190,7 +190,7 @@ func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], 
 	}
 	out := make([]*RunHandle[O], len(ws))
 	for i, w := range ws {
-		out[i] = &RunHandle[O]{runID: w.RunID, w: w}
+		out[i] = &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}
 	}
 	return out, nil
 }
@@ -212,7 +212,7 @@ func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], i
 	for _, opt := range opts {
 		opt(&ec)
 	}
-	inputJSON, err := json.Marshal(input)
+	inputJSON, err := q.eng.Codec().Marshal(input)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +228,7 @@ func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], i
 	if err != nil {
 		return nil, err
 	}
-	return &RunHandle[O]{runID: w.RunID, w: w}, nil
+	return &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}, nil
 }
 
 // EnqueueWorkflow enqueues a workflow run. All steps receive input; the
@@ -255,7 +255,7 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 	for _, opt := range opts {
 		opt(&ec)
 	}
-	inputJSON, err := json.Marshal(input)
+	inputJSON, err := q.eng.Codec().Marshal(input)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 	if err != nil {
 		return nil, err
 	}
-	return &RunHandle[O]{runID: w.RunID, w: w}, nil
+	return &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}, nil
 }
 
 // Register makes a task executable without enqueuing a run. Needed when
@@ -291,7 +291,7 @@ func Register[I, O any](q *Quacker, t *Task[I, O]) {
 // Crons are in-memory: re-register at startup, ideally before Open resumes
 // work.
 func Cron[I any, O any](q *Quacker, name, spec string, t *Task[I, O], input I) error {
-	inputJSON, err := json.Marshal(input)
+	inputJSON, err := q.eng.Codec().Marshal(input)
 	if err != nil {
 		return err
 	}

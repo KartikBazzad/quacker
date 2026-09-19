@@ -14,6 +14,7 @@ How quacker works inside one process. For user-facing docs see the
 │   Subscribe · Cancel                                                │
 │   Use/Wrap (middleware) · Purge/WithRetention · WithMetricsFunc     │
 │   WithTaskLogSink/WithLogSink · WithLogStorage · DAGJSON/DAGSVG     │
+│   WithPlugin (hooks) · WithCodec · WithWorkerLabels/WithLeaseTTL    │
 └──────────────┬─────────────────────────────┬────────────────────────┘
                │ writes + queries            │ JSON adapter
 ┌──────────────▼──────────────┐   ┌──────────▼───────────────────────┐
@@ -358,6 +359,12 @@ in reverse and are observe-only, with panics recovered and logged. There is no
 global registry and no dynamic loading; plugins are trusted in-process code and
 must be concurrency-safe. See DESIGN_NOTES §32.
 
+A payload **codec** (`WithCodec`) swaps the encoder for user payloads — task
+input/output, `DepOutput`, event payloads, durable `RunOnce`/`WaitFor` values —
+while `depends_on` and `labels` stay JSON for the SQL gates. It is engine-wide
+and decoded where the values are used (step context, handle, engine); default is
+`JSONCodec`. See DESIGN_NOTES §33.
+
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
@@ -370,8 +377,9 @@ must be concurrency-safe. See DESIGN_NOTES §32.
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
   XML-escaping, debug-log capture/close, recovery of suspended steps,
   batch enqueue, multi-queue claim, worker-label routing, OTel spans including
-  the cross-restart link, and plugin hooks (ordering, veto, panic recovery,
-  per-attempt, concurrency).
+  the cross-restart link, plugin hooks (ordering, veto, panic recovery,
+  per-attempt, concurrency), and the payload codec (workflow/deps, events,
+  durable values, keys)).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

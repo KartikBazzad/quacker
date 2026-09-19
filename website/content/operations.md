@@ -11,9 +11,9 @@ error translation, context enrichment:
 
 ```go
 func timing(next quacker.Handler) quacker.Handler {
-    return func(ctx context.Context) (any, error) {
+    return func(ctx context.Context, in json.RawMessage) (json.RawMessage, error) {
         start := time.Now()
-        out, err := next(ctx)
+        out, err := next(ctx, in)
         sc, _ := quacker.StepFromContext(ctx)
         log.Printf("%s attempt %d took %s", sc.Task, sc.Attempt, time.Since(start))
         return out, err
@@ -32,6 +32,29 @@ boundary, applied per attempt. A middleware that returns without calling
 > Middleware must not `recover()` over `next()` — it would swallow the
 > durable suspension panic. See the
 > [determinism contract](durable.html#the-determinism-contract).
+
+## Payload codec
+
+Payloads are JSON by default. `WithCodec` swaps the encoder for **user
+payloads** — task input/output, dependency outputs (`DepOutput`), event
+payloads, and durable `RunOnce`/`WaitFor` values:
+
+```go
+type msgpackCodec struct{}
+
+func (msgpackCodec) Name() string                    { return "msgpack" }
+func (msgpackCodec) Marshal(v any) ([]byte, error)   { return msgpack.Marshal(v) }
+func (msgpackCodec) Unmarshal(b []byte, v any) error { return msgpack.Unmarshal(b, v) }
+
+q, _ := quacker.Open(quacker.WithCodec(msgpackCodec{}))
+```
+
+- Schema structures — `steps.depends_on` and `steps.labels` — stay **JSON**,
+  because the SQL claim gates read them; a codec never affects dependencies,
+  labels, routing, or concurrency.
+- Engine-wide, and the same codec must be used across restarts for a database
+  (durable values and dependency outputs are decoded by the process that
+  encoded them). The default is `quacker.JSONCodec`.
 
 ## Task logs
 

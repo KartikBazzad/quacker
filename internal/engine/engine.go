@@ -64,7 +64,7 @@ type TaskDef struct {
 	// KeyFn extracts a concurrency key from the step input; steps sharing
 	// a key are capped at KeyLimit concurrent executions across all queues.
 	// nil means unkeyed.
-	KeyFn func(input json.RawMessage) string
+	KeyFn func(c Codec, input json.RawMessage) string
 	// KeyLimit is the max simultaneously-running steps sharing one key;
 	// <1 is normalized to 1 at enqueue when a key is present.
 	KeyLimit int
@@ -168,6 +168,8 @@ type Engine struct {
 	leaseTTL  time.Duration
 	// hookGroups are plugin hooks in registration order (immutable after New).
 	hookGroups []Hooks
+	// codec (de)serializes user payloads; defaults to JSONCodec.
+	codec Codec
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -234,6 +236,8 @@ type Options struct {
 	LeaseTTL time.Duration
 	// Hooks are plugin lifecycle callbacks, invoked in slice order.
 	Hooks []Hooks
+	// Codec (de)serializes user payloads; nil uses JSONCodec.
+	Codec Codec
 	// LogSink is the base task-log destination. When nil and LogStorage is
 	// off, task logs go to the engine logger; when nil and LogStorage is on,
 	// they persist to SQLite only.
@@ -329,6 +333,10 @@ func New(o Options) (*Engine, error) {
 		e.leaseTTL = 30 * time.Second
 	}
 	e.hookGroups = append([]Hooks(nil), o.Hooks...)
+	e.codec = o.Codec
+	if e.codec == nil {
+		e.codec = JSONCodec{}
+	}
 	return e, nil
 }
 
@@ -681,7 +689,7 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 		var key string
 		var keyLimit int64
 		if def.KeyFn != nil {
-			key = def.KeyFn(req.Input)
+			key = def.KeyFn(e.codec, req.Input)
 			if key != "" {
 				keyLimit = int64(def.KeyLimit)
 				if keyLimit < 1 {

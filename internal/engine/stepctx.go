@@ -45,9 +45,9 @@ func RunIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// DepOutput decodes the JSON output of a succeeded dependency step into out.
-// It returns an error outside a task function, for unknown dependencies, or
-// on JSON mismatch.
+// DepOutput decodes the recorded output of a succeeded dependency step into
+// out using the engine's codec. It returns an error outside a task function,
+// for unknown dependencies, or on a decode failure.
 func DepOutput[T any](ctx context.Context, name string) (T, error) {
 	var zero T
 	ss, ok := ctx.Value(ctxKey{}).(*stepState)
@@ -59,7 +59,7 @@ func DepOutput[T any](ctx context.Context, name string) (T, error) {
 		return zero, fmt.Errorf("quacker: dep %q has no recorded output", name)
 	}
 	var out T
-	if err := json.Unmarshal(depRaw, &out); err != nil {
+	if err := ss.codec().Unmarshal(depRaw, &out); err != nil {
 		return zero, fmt.Errorf("quacker: decode dep %q: %w", name, err)
 	}
 	return out, nil

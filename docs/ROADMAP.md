@@ -2,8 +2,8 @@
 
 Status: **v1.3 in progress** — v0.4/v1.1/v1.2 are shipped (durable execution,
 DAG visualizer, debug logger, worker labels, OTel tracing, Postgres with
-multi-instance leases, and the perf pass). v1.3 lifecycle-hook plugins are
-done; the codec and a public storage-driver package are next.
+multi-instance leases, and the perf pass). v1.3 lifecycle-hook plugins and the
+payload codec are done; a public custom-storage driver package is next.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -286,10 +286,10 @@ it stays type-safe, cross-platform, and single-binary.
   veto fails the step immediately, without retries); `After*` callbacks run in
   reverse, are observe-only, and recover panics. Plugins are explicit
   instances (no global registry) and must be concurrency-safe.
-- **Codec.** Replace `encoding/json` for user payloads (task input/output,
-  deps, event payloads, durable journal values) with a pluggable `Codec`;
-  schema structures (`depends_on`, `labels`) stay JSON. Engine-wide, default
-  unchanged.
+- ✅ **Codec.** `WithCodec` replaces `encoding/json` for user payloads (task
+  input/output, `DepOutput`, event payloads, and durable `RunOnce`/`WaitFor`
+  values); schema structures (`depends_on`, `labels`) stay JSON because the SQL
+  gates read them. Engine-wide, default unchanged, same codec across restarts.
 - **Custom storage backends.** Expose a curated public driver package (a small
   interface with its own DTOs, adapted to the internal store) so third parties
   can implement MySQL/Redis/etc. without freezing the entire store contract.

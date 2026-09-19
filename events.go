@@ -29,18 +29,15 @@ func Off[I any, O any](q *Quacker, event string, t *Task[I, O]) error {
 // unbound events still persist, but a crash between the persist and the
 // enqueues can lose those dispatches.
 func (q *Quacker) Emit(ctx context.Context, event string, payload any) (int, error) {
-	raw, err := marshalEventPayload(payload)
+	raw, err := q.marshalEventPayload(payload)
 	if err != nil {
 		return 0, err
 	}
 	return q.eng.Emit(ctx, event, raw)
 }
 
-func marshalEventPayload(payload any) (json.RawMessage, error) {
-	if raw, ok := payload.(json.RawMessage); ok {
-		return raw, nil
-	}
-	b, err := json.Marshal(payload)
+func (q *Quacker) marshalEventPayload(payload any) (json.RawMessage, error) {
+	b, err := q.eng.Codec().Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("quacker: marshal event payload: %w", err)
 	}

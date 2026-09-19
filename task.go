@@ -31,7 +31,7 @@ type taskConfig struct {
 	maxAttempts int
 	timeout     time.Duration
 	backoff     Backoff
-	keyFn       func(json.RawMessage) string
+	keyFn       func(engine.Codec, json.RawMessage) string
 	keyLimit    int
 	wrap        []engine.Middleware
 	labels      []string
@@ -70,10 +70,10 @@ func Queue(name string) TaskOption {
 // that run unkeyed.
 func WithKey[I any](fn func(I) string) TaskOption {
 	return func(c *taskConfig) {
-		c.keyFn = func(raw json.RawMessage) string {
+		c.keyFn = func(codec engine.Codec, raw json.RawMessage) string {
 			var in I
-			if len(raw) > 0 && string(raw) != "null" {
-				if err := json.Unmarshal(raw, &in); err != nil {
+			if len(raw) > 0 {
+				if err := codec.Unmarshal(raw, &in); err != nil {
 					return "" // undecodable input leaves the run unkeyed; the task's own decode surfaces the error at execution
 				}
 			}
@@ -139,9 +139,10 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 		Timeout:     t.cfg.timeout,
 		Backoff:     t.cfg.backoff,
 		Fn: func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+			codec := engine.CodecFromContext(ctx)
 			var in I
-			if len(raw) > 0 && string(raw) != "null" {
-				if err := json.Unmarshal(raw, &in); err != nil {
+			if len(raw) > 0 {
+				if err := codec.Unmarshal(raw, &in); err != nil {
 					return nil, fmt.Errorf("quacker: decode input for task %q: %w", t.name, err)
 				}
 			}
@@ -149,7 +150,7 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 			if err != nil {
 				return nil, err
 			}
-			return json.Marshal(out)
+			return codec.Marshal(out)
 		},
 	}
 	def.KeyFn = t.cfg.keyFn

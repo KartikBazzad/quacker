@@ -2,7 +2,6 @@ package quacker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -38,6 +37,7 @@ var (
 type RunHandle[O any] struct {
 	runID string
 	w     *engine.Waiter
+	codec engine.Codec
 }
 
 // RunID returns the run's stable identifier.
@@ -59,7 +59,11 @@ func (h *RunHandle[O]) Result(ctx context.Context) (O, error) {
 		return out, err
 	}
 	if status == store.StatusSucceeded && len(raw) > 0 {
-		if err := json.Unmarshal(raw, &out); err != nil {
+		codec := h.codec
+		if codec == nil {
+			codec = engine.JSONCodec{}
+		}
+		if err := codec.Unmarshal(raw, &out); err != nil {
 			return out, fmt.Errorf("quacker: decode output of run %s: %w", h.runID, err)
 		}
 	}

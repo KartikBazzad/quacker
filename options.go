@@ -67,6 +67,7 @@ type config struct {
 	workerID           string
 	leaseTTL           time.Duration
 	plugins            []engine.Hooks
+	codec              engine.Codec
 	logSink            func(LogEntry)
 	logStorage         bool
 	metricsFn          func(*Metrics)

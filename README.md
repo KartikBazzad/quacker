@@ -36,7 +36,7 @@ is the wrong amount of infrastructure.
 
 ## Features
 
-- **Typed tasks** — `NewTask[I, O]` with JSON-serialized payloads
+- **Typed tasks** — `NewTask[I, O]` with JSON payloads (or a pluggable codec)
 - **Retries** — attempt counts, exponential/constant backoff with jitter
 - **Timeouts** — per-attempt, via `context`
 - **Queues** — named queues with independent concurrency limits and priorities
@@ -50,6 +50,8 @@ is the wrong amount of infrastructure.
   for timing, tracing, error taxonomies, and custom metrics
 - **Plugins** — compile-time `WithPlugin` lifecycle hooks (enqueue, step, run
   finished, emit) that can observe or veto in-process
+- **Pluggable codec** — `WithCodec` replaces JSON for user payloads (task
+  input/output, dependencies, events, durable values)
 - **Bring-your-own logs** — task logs flow to a sink you choose (engine slog
   by default); opt into SQLite persistence with `WithLogStorage(true)`
 - **Retention / purge** — `q.Purge` and `WithRetention` bound a long-lived
@@ -288,6 +290,29 @@ the outcome). Hooks run per attempt, for workflows and recovered runs. They are
 trusted, in-process code and must be safe for concurrent use. For wrapping the
 *task body* use [middleware](#middleware); for a post-hoc transition stream use
 `Subscribe`.
+
+## Payload codec
+
+Payloads are JSON by default. `WithCodec` swaps in your own encoder for **user
+payloads only** — task input and output, dependency outputs, event payloads,
+and durable `RunOnce`/`WaitFor` values:
+
+```go
+type msgpackCodec struct{}
+
+func (msgpackCodec) Name() string                          { return "msgpack" }
+func (msgpackCodec) Marshal(v any) ([]byte, error)         { return msgpack.Marshal(v) }
+func (msgpackCodec) Unmarshal(b []byte, v any) error       { return msgpack.Unmarshal(b, v) }
+
+q, _ := quacker.Open(quacker.WithCodec(msgpackCodec{}))
+```
+
+Schema structures — `steps.depends_on` and `steps.labels` — are **always JSON**,
+because the SQL claim gates read them, so a custom codec never affects
+scheduling, dependencies, or labels. It is engine-wide, and the same codec must
+be used across restarts for a given database (durable journal values and
+dependency outputs are decoded by the engine that encoded them). See
+[design notes §33](docs/DESIGN_NOTES.md) for the scope.
 
 ## Task logs
 
@@ -540,9 +565,9 @@ overhead at all.
 ## Not yet
 
 Strict (ordered) per-key concurrency and a web UI. Compile-time lifecycle-hook
-plugins shipped (v1.3); a pluggable payload codec and custom storage drivers
-are next. Multi-process scaling over Postgres, worker labels, OTel tracing,
-durable execution, and DAG visualization are all shipped.
+plugins and a pluggable payload codec shipped (v1.3); a public custom-storage
+driver package is next. Multi-process scaling over Postgres, worker labels,
+OTel tracing, durable execution, and DAG visualization are all shipped.
 
 ## Documentation
 

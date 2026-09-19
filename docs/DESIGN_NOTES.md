@@ -645,6 +645,34 @@ Semantics chosen for least surprise:
 - Hooks run per attempt, for workflows and recovered runs; the unregistered-task
   park path is skipped. In-process plugins are trusted code.
 
+### 33. The codec covers user payloads, never the schema's own JSON
+
+`WithCodec` swaps the encoder for the data tasks move around — task input and
+output, `DepOutput`, event payloads, and durable `RunOnce`/`WaitFor` values —
+but deliberately **not** `steps.depends_on` and `steps.labels`. Those two are
+read by SQL in the claim gate (`json_each`/`jsonb_array_elements_text`), so
+letting a codec change them would couple scheduling to the wire format. Keeping
+them JSON means a custom codec has zero effect on dependencies, labels,
+routing, or concurrency — only on how payloads are (de)serialized.
+
+Two consequences worth stating:
+
+- **The codec lives where the values are decoded.** Task bodies and `DepOutput`
+  read it from the step context (`CodecFromContext`); `RunOnce`/`WaitFor` use
+  their step state's engine; `Result` carries the engine's codec on the
+  `RunHandle`; enqueue/emit use the engine directly. That is why the key
+  extractor (`WithKey`) takes the codec too: it decodes the input at enqueue
+  time, and a custom codec would otherwise silently leave every run unkeyed.
+- **One codec per database, held across restarts.** Durable journal values and
+  dependency outputs are stored in whatever the codec produced and decoded by a
+  later process, so switching codecs mid-flight (or between two nodes) would
+  mis-decode stored bytes. This is documented on `WithCodec` rather than
+  guarded, because pinning the codec name in the schema would be a heavier
+  commitment than the feature warrants.
+
+Default is `JSONCodec` (a thin `encoding/json` wrapper), so existing data and
+behavior are byte-identical.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

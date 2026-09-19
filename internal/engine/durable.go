@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -130,7 +129,7 @@ func runOnce[T any](ss *stepState, key string, fn func() (T, error)) (T, error) 
 			return zero, errors.New(e.Err)
 		}
 		if len(e.Result) > 0 {
-			if uerr := json.Unmarshal(e.Result, &zero); uerr != nil {
+			if uerr := ss.eng.codec.Unmarshal(e.Result, &zero); uerr != nil {
 				return zero, fmt.Errorf("quacker: RunOnce %q: decode memoized result: %w", key, uerr)
 			}
 		}
@@ -147,7 +146,7 @@ func runOnce[T any](ss *stepState, key string, fn func() (T, error)) (T, error) 
 	if ferr != nil {
 		return zero, ferr // leave the entry undone; a retry re-runs fn
 	}
-	res, merr := json.Marshal(out)
+	res, merr := ss.eng.codec.Marshal(out)
 	if merr != nil {
 		return zero, fmt.Errorf("quacker: RunOnce %q: encode result: %w", key, merr)
 	}
@@ -200,7 +199,7 @@ func waitFor[T any](ss *stepState, event string, timeout time.Duration) (T, erro
 		return zero, fmt.Errorf("%w: WaitFor call #%d expected event %q, journal has %q", ErrJournalMisaligned, idx, event, e.Event)
 	}
 	if e.Done {
-		return waitResult[T](e)
+		return waitResult[T](ss, e)
 	}
 	now := ss.eng.now().UnixNano()
 	if e.Deadline > 0 && now >= e.Deadline {
@@ -218,7 +217,7 @@ func waitFor[T any](ss *stepState, event string, timeout time.Duration) (T, erro
 			return zero, lerr
 		}
 		if updated != nil && updated.Done && !updated.TimedOut {
-			return waitResult[T](updated)
+			return waitResult[T](ss, updated)
 		}
 		return zero, ErrWaitTimeout
 	}
@@ -229,13 +228,13 @@ func waitFor[T any](ss *stepState, event string, timeout time.Duration) (T, erro
 	panic(&suspendSignal{})
 }
 
-func waitResult[T any](e *store.JournalEntry) (T, error) {
+func waitResult[T any](ss *stepState, e *store.JournalEntry) (T, error) {
 	var out T
 	if e.TimedOut {
 		return out, ErrWaitTimeout
 	}
 	if len(e.Payload) > 0 {
-		if uerr := json.Unmarshal(e.Payload, &out); uerr != nil {
+		if uerr := ss.eng.codec.Unmarshal(e.Payload, &out); uerr != nil {
 			return out, fmt.Errorf("quacker: WaitFor %q: decode payload: %w", e.Event, uerr)
 		}
 	}
