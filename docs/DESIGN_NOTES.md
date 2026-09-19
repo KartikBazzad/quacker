@@ -673,6 +673,32 @@ Two consequences worth stating:
 Default is `JSONCodec` (a thin `encoding/json` wrapper), so existing data and
 behavior are byte-identical.
 
+### 34. Storage stays first-party; there is no public backend contract
+
+We considered shipping a public plugin point for storage and decided against
+it. The two shapes both fail:
+
+- **Publish `Backend` (the SQL-dialect seam).** It is not a storage contract at
+  all — it is SQL internals: `Rebind` (`?`→`$n`), per-dialect DDL, the
+  `json_each`/`jsonb_array_elements_text` label gate, advisory/`FOR UPDATE`
+  locks. Exposing it freezes those internals and still only lets someone write
+  *another SQL database*, not a different store.
+- **A backend-agnostic `Store` interface.** The engine plus public API drive
+  ~39 operations, and the transactional correctness lives *inside* them —
+  claim key/rate/label gating, DAG completion, atomic event delivery, cron CAS,
+  and leases. A third-party driver would have to reimplement all of it with
+  identical guarantees, and we cannot enforce that without a conformance suite
+  we'd have to build and maintain.
+
+For an embedded, single-binary library the value doesn't justify a large frozen
+surface plus an unverifiable correctness contract on someone else's code.
+Storage is first-party: SQLite (Memory/Ephemeral/File) and Postgres. Adding a
+new SQL database is a normal in-repo change — implement a `Backend` and its
+migrations, and let the existing query layer and tests cover it (the Postgres
+driver is the template). v1.3's extension story is the compile-time plugin
+hooks (§32) and the payload codec (§33), which extend behavior without moving
+the durability guarantees out of the engine.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

@@ -1,9 +1,8 @@
 # Roadmap
 
-Status: **v1.3 in progress** — v0.4/v1.1/v1.2 are shipped (durable execution,
-DAG visualizer, debug logger, worker labels, OTel tracing, Postgres with
-multi-instance leases, and the perf pass). v1.3 lifecycle-hook plugins and the
-payload codec are done; a public custom-storage driver package is next.
+Status: **v1.3 shipped** — v0.4/v1.1/v1.2 are shipped, and v1.3 adds
+lifecycle-hook plugins and a pluggable payload codec. Custom storage backends
+are a deliberate non-goal (storage stays first-party SQLite + Postgres).
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -274,7 +273,7 @@ Children are ordinary runs and are aged/purged independently.
 - Optional: `WithDB(*sql.DB)` connection reuse (the last v1.1 item).
 
 
-## v1.3 - Advanced Features (in progress)
+## v1.3 - Advanced Features (✅ DONE)
 
 Compile-time plugins, not dynamic `plugin` loading or out-of-process servers —
 the same interface + explicit registration model the Postgres driver uses, so
@@ -290,14 +289,24 @@ it stays type-safe, cross-platform, and single-binary.
   input/output, `DepOutput`, event payloads, and durable `RunOnce`/`WaitFor`
   values); schema structures (`depends_on`, `labels`) stay JSON because the SQL
   gates read them. Engine-wide, default unchanged, same codec across restarts.
-- **Custom storage backends.** Expose a curated public driver package (a small
-  interface with its own DTOs, adapted to the internal store) so third parties
-  can implement MySQL/Redis/etc. without freezing the entire store contract.
+- ⛔ **Custom storage backends — deliberately not planned.** The internal
+  `Backend` seam is SQL-dialect-specific (`Rebind`, DDL, `json_each` gates,
+  advisory locks); publishing it would freeze SQL internals. The alternative —
+  a backend-agnostic `Store` interface — is ~39 operations, and it would move
+  all the transactional correctness (claim key/rate/label gating, DAG
+  completion, atomic event delivery, cron CAS, leases) onto every third-party
+  driver, with a conformance burden we can't enforce. Storage stays first-party
+  (SQLite + Postgres). New SQL backends are welcome as in-repo dialects/PRs;
+  see DESIGN_NOTES §34.
 
 Design input from Jev (semantic judgments, not tests): After* ordering
 (reverse, 0.91), After* error handling (recover+log, 0.99), and surface shape
 (a single `Hooks` struct over capability interfaces, 0.72). Trust model:
 in-process plugins are trusted code; no sandboxing.
+
+
+## Backlog
+- Pause and Resume Jobs/workflows
 
 ## ⚖ Open decisions (input welcome, defaults chosen)
 

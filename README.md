@@ -565,9 +565,11 @@ overhead at all.
 ## Not yet
 
 Strict (ordered) per-key concurrency and a web UI. Compile-time lifecycle-hook
-plugins and a pluggable payload codec shipped (v1.3); a public custom-storage
-driver package is next. Multi-process scaling over Postgres, worker labels,
-OTel tracing, durable execution, and DAG visualization are all shipped.
+plugins and a pluggable payload codec shipped (v1.3); **custom storage backends
+are deliberately out of scope** — storage is first-party SQLite + Postgres, and
+new SQL dialects are in-repo/PR work. Multi-process scaling over Postgres,
+worker labels, OTel tracing, durable execution, and DAG visualization are all
+shipped.
 
 ## Documentation
 
