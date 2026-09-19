@@ -49,6 +49,7 @@ reference implementations):
 | `SupportsLeases` / `SupportsCheckpoint` / `RecoverOnBoot` | Capability flags |
 | `KeyGate` | Per-key concurrency predicate (see below) |
 | `SequenceGate` | Per-sequence ordering predicate (see below) |
+| `KeysGate` | Extra-concurrency-keys predicate (see below) |
 | `LabelGate` | Worker-label subset predicate |
 | `BlockedDependentsSQL` | Direct dependents of a finished step |
 | `UpsertSQL` | `ON CONFLICT` vs `ON DUPLICATE KEY` |
@@ -91,6 +92,9 @@ once. A driver must satisfy these:
 - **Sequences use a `counters` table** for insertion order; a driver's
   migrations must create it (and seed `('run', 0)`) and index
   `steps(sequence_key, seq)`.
+- **Extra concurrency keys use a `step_keys` table** (`step_id, name, value,
+  key_limit`) with an index on `(name, value)`; a driver's migrations must
+  create it.
 - **Migrations are split on `;`** and each statement runs separately, so a
   migration script must not contain a semicolon inside a string literal.
 

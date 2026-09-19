@@ -97,6 +97,9 @@ across processes sharing a database.
 - **Cancel strategies** — `WithKeyStrategy` chooses what happens when a key is
   full: hold (default), cancel the newest, cancel in progress, or keep the
   newest/oldest queued runs.
+- **Multiple / shared keys** — `WithKeyLimit(name, fn, limit)` gates a task on
+  several keys at once; tasks declaring the same name and equal values share
+  one budget.
 
 ## Job control
 

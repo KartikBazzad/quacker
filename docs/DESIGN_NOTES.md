@@ -852,6 +852,26 @@ before older queued work, matching Oban/River. Multi-instance is safe for the
 same reason unique jobs are: the decision is one transaction, and the store's
 claim lock / single writer serializes it.
 
+### 39. v1.9: multiple keys are a child table; the gate reuses the dialect-hook pattern
+
+`WithKeyLimit` adds named concurrency keys. Two properties had to hold:
+
+- **Several keys gate together.** A step is claimable only when every one of
+  its keys has fewer than its limit RUNNING siblings. That is naturally an
+  `AND` of `NOT EXISTS` subqueries, so the gate is one predicate over a
+  `step_keys(step_id, name, value, key_limit)` child table keyed by
+  `(name, value)` — no per-key column, no JSON parsing in SQL.
+- **A name is shared across tasks.** Because counting is by `(name, value)`,
+  two different tasks that declare the same name and compute equal values
+  consume one budget. "Shared" therefore falls out of the same mechanism as
+  "multiple" rather than needing a separate limits registry.
+
+The gate follows the established dialect-hook pattern: correlated on
+SQLite/Postgres and a derived-table form on MySQL (`driver.KeysGate`), exactly
+like `KeyGate` and `SequenceGate`. The legacy single key (`WithKey`) stays on
+`steps.concurrency_key` so cancel strategies and introspection are unchanged;
+`WithKeyLimit` is purely additive, and a run may use both.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned
