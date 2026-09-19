@@ -45,6 +45,7 @@ Three modes (`internal/store.Config`):
 | `Memory` | `file:quacker-<pid>-<n>?mode=memory&cache=shared` | MEMORY (WAL unavailable to `:memory:`) | none |
 | `Ephemeral` (default) | temp file | WAL, `synchronous=OFF` | deleted on Close |
 | `File` | user path | WAL, `synchronous=NORMAL` | durable |
+| `Postgres` | user DSN (pgx) | MVCC | durable, networked |
 
 Connection topology:
 
@@ -79,6 +80,27 @@ WAL modes run a goroutine issuing `PRAGMA wal_checkpoint(PASSIVE)` every
 growth whenever readers are momentarily idle — plus a best-effort
 `wal_checkpoint(TRUNCATE)` at `Close`.
 
+### Backends
+
+The query layer is dialect-neutral (it writes `?` placeholders); a registered
+`Backend` supplies the connection setup, placeholder rebinding, DDL, and the
+dialect-only operations. SQLite is built in (`sqliteBackend`); Postgres lives
+in the public `postgres/` package and registers itself from `init`, so
+importing it (`_ "…/postgres"`) is what pulls in pgx — builds that stay on
+SQLite never compile it.
+
+- `Rebind` rewrites `?` to `$n` for Postgres (skipping quoted literals and
+  comments), memoized per query.
+- Each backend has its own `Migrations()` list; version numbers are
+  per-dialect (a database is never both). Postgres DDL uses `BIGINT` for every
+  timestamp/counter (unix nanos overflow `INTEGER`), identity columns, and a
+  `jsonb` label gate; `MigrateLock` takes a `pg_advisory_xact_lock` so
+  concurrent boots serialize DDL.
+- The engine no longer touches the raw pools: the shutdown sweep is
+  `Store.InterruptAll`, and `Store.Write`/`Read` are used only by tests. This
+  is the seam the multi-instance phase (leases, `FOR UPDATE` run locks) will
+  build on.
+
 ### Schema
 
 ```
@@ -112,7 +134,9 @@ adds the durable-execution columns on `steps` and the `step_journal` table
 leave a dangling id); migration 7 rewrites `steps.depends_on` from
 comma-joined text to a JSON array; migration 8 adds `steps.labels` (JSON
 array) for worker-label routing; migration 9 adds `runs.trace_parent` (the
-W3C traceparent captured at enqueue).
+W3C traceparent captured at enqueue). Postgres has a single initial migration
+with the same columns in dialect types (BIGINT throughout, identity `seq`,
+BYTEA, BOOLEAN journal flags, JSON kept as TEXT).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -312,6 +336,9 @@ does not fail the parent. See DESIGN_NOTES §22.
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path
   live in `internal/store`.
+- Postgres integration tests live in `postgres/` and skip unless
+  `QUACKER_TEST_POSTGRES_DSN` is set; CI runs them on ubuntu against a
+  `postgres` service container (the SQLite suite runs on ubuntu and macos).
 - CI runs gofmt/vet/test/`-race` on ubuntu and macos
   (`.github/workflows/ci.yml`); the repo is MIT-licensed.
 - `TestIntrospectionUnderLoad`: 8 readers hammer snapshots while 200 runs

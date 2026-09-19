@@ -11,10 +11,11 @@ import (
 )
 
 // Storage selects where run state lives. Construct with Memory, Ephemeral,
-// or File.
+// File, or Postgres.
 type Storage struct {
 	mode    store.Mode
 	path    string
+	dsn     string
 	recover bool
 }
 
@@ -33,6 +34,18 @@ func Ephemeral() Storage { return Storage{mode: store.ModeEphemeral, recover: tr
 // interrupted by a previous process are handled according to
 // RecoverRunningOnBoot.
 func File(path string) Storage { return Storage{mode: store.ModeFile, path: path, recover: true} }
+
+// Postgres persists state to the database at dsn. It requires importing the
+// driver package for its side effect:
+//
+//	import _ "github.com/kartikbazzad/quacker/postgres"
+//
+// Without that import, Open fails with a clear "backend not registered" error.
+// Single-instance only for now: boot recovery and shutdown assume one engine
+// owns the database; multi-instance leases are a later phase.
+func Postgres(dsn string) Storage {
+	return Storage{mode: store.ModePostgres, dsn: dsn, recover: true}
+}
 
 // RecoverRunningOnBoot configures startup recovery for File storage: when
 // true (default) runs left RUNNING/INTERRUPTED by a previous process are
@@ -70,7 +83,7 @@ type Option func(*config)
 // WithStorage selects the storage backend (default Ephemeral).
 func WithStorage(s Storage) Option {
 	return func(c *config) {
-		c.storage = store.Config{Mode: s.mode, Path: s.path, RecoverRunningOnBoot: s.recover}
+		c.storage = store.Config{Mode: s.mode, Path: s.path, DSN: s.dsn, RecoverRunningOnBoot: s.recover}
 	}
 }
 

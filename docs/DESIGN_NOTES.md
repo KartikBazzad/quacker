@@ -512,6 +512,38 @@ When tracing is off, `Engine.tracing` is false and every helper returns
 before touching attributes, so the disabled path allocates nothing on the
 claim/enqueue hot paths.
 
+### 29. Postgres is a dialect seam, not a second query layer
+
+Adding a second database could have meant duplicating ~1000 lines of SQL or an
+interface with two full implementations. Instead the query layer stays single
+and dialect-neutral: it writes `?` placeholders and calls a registered
+`Backend` for the pieces that differ — connection setup, `Rebind`
+(`?`→`$n`, memoized, quote/comment-aware), `Migrations`, `MigrateLock`,
+`SupportsCheckpoint`, `RecoverOnBoot`, and the `LabelGate` SQL. The driver
+lives in the public `postgres/` package and registers from `init`, so pgx is
+compiled only when a build imports it (the database/sql driver pattern) — the
+core and SQLite-only users never see it.
+
+Running against a real Postgres immediately caught two bugs a WAL-only test
+suite could not:
+
+- **`CASE … ELSE 0 END` pinned the parameter type to int4.** In
+  `recoverInterrupted`, a unix-nanos parameter inside a `CASE` with an integer
+  `ELSE` made Postgres infer 32-bit `INTEGER`, overflowing on every recovery.
+  Rewriting `keep`/`!keep` as distinct statements (rather than a `CASE`) is
+  both clearer and type-safe. The general lesson: `?` hides type inference, so
+  any parameter whose value is 64-bit must sit in a context that infers a
+  64-bit type.
+- **Boolean columns need boolean literals.** `done=1`/`done=0` are fine for
+  SQLite's INTEGER storage but error on Postgres `BOOLEAN`; `TRUE`/`FALSE`
+  work on both (SQLite understands them as 1/0).
+
+The backend is single-instance by construction for now: `recoverInterrupted`
+re-queues all RUNNING rows on boot and `InterruptAll` sweeps them all on
+shutdown, which is only safe when one engine owns the database. That is
+exactly what the multi-instance phase (§Phase 2: worker leases, claim advisory
+lock, `FOR UPDATE` run locks, cron CAS) replaces.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

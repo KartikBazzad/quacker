@@ -83,7 +83,7 @@ func (s *Store) AppendJournal(ctx context.Context, e *JournalEntry) error {
 // CompleteJournalOnce memoizes a successful RunOnce result.
 func (s *Store) CompleteJournalOnce(ctx context.Context, stepID string, idx int64, result []byte, errMsg string) error {
 	_, err := s.write.ExecContext(ctx,
-		`UPDATE step_journal SET done=1, result=?, err=? WHERE step_id=? AND idx=?`,
+		`UPDATE step_journal SET done=TRUE, result=?, err=? WHERE step_id=? AND idx=?`,
 		result, errMsg, stepID, idx)
 	return err
 }
@@ -115,12 +115,12 @@ func (s *Store) SuspendStep(ctx context.Context, stepID, waitKind, waitEvent str
 // RUNNING (an Emit between the two would otherwise be lost when the step then
 // suspended with resume_at=0).
 func (s *Store) SuspendWithJournal(ctx context.Context, e *JournalEntry, waitKind, waitEvent string, resumeAt, now int64) error {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE steps SET
+	res, err := tx.exec(ctx, `UPDATE steps SET
 		status=?, resume_at=?, wait_kind=?, wait_event=?
 		WHERE id=? AND status=?`,
 		StatusSuspended, resumeAt, waitKind, waitEvent, e.StepID, StatusRunning)
@@ -130,7 +130,7 @@ func (s *Store) SuspendWithJournal(ctx context.Context, e *JournalEntry, waitKin
 	if n, _ := res.RowsAffected(); n != 1 {
 		return ErrStepNotRunning
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO step_journal
+	if _, err := tx.exec(ctx, `INSERT INTO step_journal
 		(step_id, idx, kind, key, event, wake_at, deadline, payload, result, err, done, timed_out)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.StepID, e.Idx, e.Kind, e.Key, e.Event, e.WakeAt, e.Deadline,
@@ -155,7 +155,7 @@ func (s *Store) GetJournalEntry(ctx context.Context, stepID string, idx int64) (
 // must use the payload instead of the timeout.
 func (s *Store) TimeoutWait(ctx context.Context, stepID string, idx int64) (bool, error) {
 	res, err := s.write.ExecContext(ctx,
-		`UPDATE step_journal SET timed_out=1, done=1 WHERE step_id=? AND idx=? AND done=0`, stepID, idx)
+		`UPDATE step_journal SET timed_out=TRUE, done=TRUE WHERE step_id=? AND idx=? AND done=FALSE`, stepID, idx)
 	if err != nil {
 		return false, err
 	}
@@ -168,17 +168,17 @@ func (s *Store) TimeoutWait(ctx context.Context, stepID string, idx int64) (bool
 // Only undone wait entries are considered, so a wait that already timed out is
 // never resurrected, and events emitted before a wait registered do not count.
 func (s *Store) DeliverEvent(ctx context.Context, name string, payload []byte, now int64) (int, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
+	if _, err := tx.exec(ctx,
 		`INSERT INTO events (name, payload, created_at) VALUES (?,?,?)`, name, payload, now); err != nil {
 		return 0, err
 	}
-	rows, err := tx.QueryContext(ctx, `UPDATE step_journal SET payload=?, done=1
-		WHERE kind=? AND done=0 AND event=?
+	rows, err := tx.query(ctx, `UPDATE step_journal SET payload=?, done=TRUE
+		WHERE kind=? AND done=FALSE AND event=?
 		  AND step_id IN (
 			SELECT st.id FROM steps st JOIN runs r ON r.id = st.run_id
 			WHERE r.status NOT IN (?,?,?,?))
@@ -202,7 +202,7 @@ func (s *Store) DeliverEvent(ctx context.Context, name string, payload []byte, n
 	}
 	rows.Close()
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, resume_at=0, wait_kind='', wait_event='' WHERE id=? AND status=?`,
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, resume_at=0, wait_kind='', wait_event='' WHERE id=? AND status=?`,
 			StatusQueued, id, StatusSuspended); err != nil {
 			return 0, err
 		}

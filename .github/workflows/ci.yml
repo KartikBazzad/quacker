@@ -28,3 +28,34 @@ jobs:
         run: go test ./...
       - name: race
         run: go test -race ./...
+
+  # Postgres integration tests need a real database, so they run on a runner
+  # with a service container (Linux only) and the env var that un-skips them.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: quacker
+          POSTGRES_PASSWORD: quacker
+          POSTGRES_DB: quacker
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quacker"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      QUACKER_TEST_POSTGRES_DSN: postgres://quacker:quacker@localhost:5432/quacker?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: test
+        run: go test ./postgres/ -count=1
+      - name: race
+        run: go test -race ./postgres/ -count=1

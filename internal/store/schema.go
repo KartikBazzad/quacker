@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // Status values shared by runs and steps.
@@ -98,12 +99,12 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS idx_logs_run ON logs (run_id, seq);
 `
 
-// migration is one schema change applied atomically with its version row.
+// Migration is one schema change applied atomically with its version row.
 // Migrations run in list order; each applies only when its version is ahead
-// of the database's recorded version.
-type migration struct {
-	version int
-	sql     string
+// of the database's recorded version. Version numbers are per-dialect.
+type Migration struct {
+	Version int
+	SQL     string
 }
 
 // migration 2 adds per-key concurrency and rate-limit columns. The key
@@ -204,31 +205,35 @@ const migration9 = `
 ALTER TABLE runs ADD COLUMN trace_parent TEXT NOT NULL DEFAULT '';
 `
 
-var migrations = []migration{
-	{version: 1, sql: schema},
-	{version: 2, sql: migration2},
-	{version: 3, sql: migration3},
-	{version: 4, sql: migration4},
-	{version: 5, sql: migration5},
-	{version: 6, sql: migration6},
-	{version: 7, sql: migration7},
-	{version: 8, sql: migration8},
-	{version: 9, sql: migration9},
+var sqliteMigrations = []Migration{
+	{Version: 1, SQL: schema},
+	{Version: 2, SQL: migration2},
+	{Version: 3, SQL: migration3},
+	{Version: 4, SQL: migration4},
+	{Version: 5, SQL: migration5},
+	{Version: 6, SQL: migration6},
+	{Version: 7, SQL: migration7},
+	{Version: 8, SQL: migration8},
+	{Version: 9, SQL: migration9},
 }
 
-// init validates the migration list's invariant before any Open can rely
-// on it: non-empty, with strictly ascending versions. migrate assumes the
-// last entry is the maximum version and applies entries in list order —
-// a duplicate or out-of-order version would silently skip or misorder
-// DDL, so it panics at startup instead.
+// init validates each migration list's invariant before any Open can rely on
+// it: non-empty, with strictly ascending versions. migrate assumes the last
+// entry is the maximum version and applies entries in list order — a
+// duplicate or out-of-order version would silently skip or misorder DDL, so
+// it panics at startup instead.
 func init() {
-	if len(migrations) == 0 {
+	checkMigrations(sqliteMigrations)
+}
+
+func checkMigrations(ms []Migration) {
+	if len(ms) == 0 {
 		panic("quacker: store: no schema migrations defined")
 	}
-	for i := 1; i < len(migrations); i++ {
-		if migrations[i].version <= migrations[i-1].version {
+	for i := 1; i < len(ms); i++ {
+		if ms[i].Version <= ms[i-1].Version {
 			panic(fmt.Sprintf("quacker: store: migrations out of order: version %d follows version %d",
-				migrations[i].version, migrations[i-1].version))
+				ms[i].Version, ms[i-1].Version))
 		}
 	}
 }
@@ -239,9 +244,12 @@ func init() {
 // CREATE-IF-NOT-EXISTS, so a v0.1 File database (tables present, no version
 // row) baselines to version 1 without touching existing data.
 func (s *Store) migrate(ctx context.Context) error {
+	ms := s.be.Migrations()
+	// BIGINT, not INTEGER: applied_at holds unix nanoseconds, which overflow
+	// Postgres' 32-bit INTEGER. SQLite's INTEGER affinity accepts BIGINT.
 	if _, err := s.write.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version INTEGER PRIMARY KEY,
-		applied_at INTEGER NOT NULL
+		version BIGINT PRIMARY KEY,
+		applied_at BIGINT NOT NULL
 	)`); err != nil {
 		return fmt.Errorf("quacker: migrate: %w", err)
 	}
@@ -252,32 +260,54 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	// A database written by a newer build records a version this build
 	// doesn't know; refuse rather than run it through older assumptions.
-	// migrations is ordered ascending, so the last entry is the max.
-	if max := migrations[len(migrations)-1].version; version > max {
+	// ms is ordered ascending, so the last entry is the max.
+	if max := ms[len(ms)-1].Version; version > max {
 		return fmt.Errorf("quacker: database schema version %d is newer than this build supports (max %d)", version, max)
 	}
-	for _, m := range migrations {
-		if m.version <= version {
+	for _, m := range ms {
+		if m.Version <= version {
 			continue
 		}
-		tx, err := s.write.BeginTx(ctx, nil)
+		tx, err := s.beginTx(ctx)
 		if err != nil {
 			return fmt.Errorf("quacker: migrate: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, m.sql); err != nil {
+		// Serialize concurrent migrations across processes (no-op for SQLite)
+		// so two nodes booting at once can't race DDL.
+		if err := s.be.MigrateLock(ctx, tx.Tx); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("quacker: migrate to version %d: %w", m.version, err)
+			return fmt.Errorf("quacker: migrate lock: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)`, m.version, nowUnix()); err != nil {
+		for _, stmt := range splitStatements(m.SQL) {
+			if _, err := tx.exec(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("quacker: migrate to version %d: %w", m.Version, err)
+			}
+		}
+		if _, err := tx.exec(ctx,
+			`INSERT INTO schema_migrations (version, applied_at) VALUES (?,?)`, m.Version, nowUnix()); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("quacker: record migration %d: %w", m.version, err)
+			return fmt.Errorf("quacker: record migration %d: %w", m.Version, err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("quacker: migrate to version %d: %w", m.version, err)
+			return fmt.Errorf("quacker: migrate to version %d: %w", m.Version, err)
 		}
 	}
 	return nil
+}
+
+// splitStatements breaks a migration script into individual statements on
+// ";", so each executes separately — Postgres' extended protocol rejects a
+// multi-statement Exec. Migration SQL must not contain a semicolon inside a
+// string literal (none does).
+func splitStatements(script string) []string {
+	var out []string
+	for _, s := range strings.Split(script, ";") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // recoverInterrupted applies boot-time recovery for File mode: runs and steps
@@ -285,18 +315,12 @@ func (s *Store) migrate(ctx context.Context) error {
 // or failed (keep=false). Attempt counts are preserved; completed steps are
 // never touched.
 func (s *Store) recoverInterrupted(ctx context.Context, keep bool) error {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	newStatus := StatusQueued
-	runErr := ""
-	if !keep {
-		newStatus = StatusFailed
-		runErr = "interrupted by restart"
-	}
 	now := nowUnix()
 	for _, table := range []string{"steps", "runs"} {
 		statuses := []string{StatusRunning, StatusInterrupted}
@@ -312,17 +336,26 @@ func (s *Store) recoverInterrupted(ctx context.Context, keep bool) error {
 				statuses = append(statuses, StatusSuspended)
 			}
 		}
-		q := fmt.Sprintf(`UPDATE %s SET
-			status = ?,
-			run_at = ?%s,
-			error = CASE WHEN ? = 'FAILED' THEN ? ELSE error END,
-			completed_at = CASE WHEN ? = 'FAILED' THEN ? ELSE 0 END
-			WHERE status IN (%s)`, table, extra, placeholders(len(statuses)))
-		args := []any{newStatus, now, newStatus, runErr, newStatus, now}
-		for _, s := range statuses {
-			args = append(args, s)
+		// keep and !keep are distinct statements rather than one CASE: a CASE
+		// with an integer ELSE makes Postgres infer a 32-bit type for the
+		// unix-nanos parameter, which overflows.
+		var (
+			q    string
+			args []any
+		)
+		if keep {
+			q = fmt.Sprintf(`UPDATE %s SET status = ?, run_at = ?%s WHERE status IN (%s)`,
+				table, extra, placeholders(len(statuses)))
+			args = []any{StatusQueued, now}
+		} else {
+			q = fmt.Sprintf(`UPDATE %s SET status = ?, run_at = ?, error = ?, completed_at = ?%s WHERE status IN (%s)`,
+				table, extra, placeholders(len(statuses)))
+			args = []any{StatusFailed, now, "interrupted by restart", now}
 		}
-		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		for _, st := range statuses {
+			args = append(args, st)
+		}
+		if _, err := tx.exec(ctx, q, args...); err != nil {
 			return fmt.Errorf("quacker: recover %s: %w", table, err)
 		}
 	}

@@ -1148,16 +1148,7 @@ func (e *RunError) Error() string {
 
 // interruptAll marks in-flight work INTERRUPTED (shutdown sweep).
 func (e *Engine) interruptAll(now int64) error {
-	bg := context.Background()
-	if _, err := e.st.Write().ExecContext(bg,
-		`UPDATE steps SET status=?, completed_at=? WHERE status=?`,
-		store.StatusInterrupted, now, store.StatusRunning); err != nil {
-		return err
-	}
-	_, err := e.st.Write().ExecContext(bg,
-		`UPDATE runs SET status=?, completed_at=? WHERE status=?`,
-		store.StatusInterrupted, now, store.StatusRunning)
-	return err
+	return e.st.InterruptAll(context.Background(), now)
 }
 
 // ---------------------------------------------------------------------------

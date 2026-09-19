@@ -26,7 +26,7 @@ events, stop := q.Subscribe(h.RunID()) // live transition stream
 | | Hatchet | quacker |
 |---|---|---|
 | Deployment | Server + Postgres (+ Docker) | One `go get`, embedded in your binary |
-| State | Postgres | SQLite (pure Go driver, no CGo) |
+| State | Postgres | SQLite (default, pure Go) or Postgres |
 | Introspection | Web UI / API over HTTP | In-process snapshots & streams, zero network |
 | Scope | Distributed fleet | One process, all cores |
 
@@ -85,6 +85,9 @@ is the wrong amount of infrastructure.
 quacker.Open(quacker.WithStorage(quacker.Memory()))    // pure :memory: SQLite
 quacker.Open(quacker.WithStorage(quacker.Ephemeral())) // default; temp file, WAL, deleted on Close
 quacker.Open(quacker.WithStorage(quacker.File("state.db").RecoverRunningOnBoot(true)))
+
+import _ "github.com/kartikbazzad/quacker/postgres" // register the driver
+quacker.Open(quacker.WithStorage(quacker.Postgres("postgres://user:pass@host/db?sslmode=disable")))
 ```
 
 - **`Memory`** — nothing touches the filesystem. Note: SQLite `:memory:`
@@ -101,6 +104,14 @@ quacker.Open(quacker.WithStorage(quacker.File("state.db").RecoverRunningOnBoot(t
   automatically when the process dies, even on SIGKILL. On platforms
   without kernel advisory locks (`!unix && !windows`), only same-process
   exclusion holds.
+- **`Postgres`** — durable, networked. Requires importing the driver package
+  (`import _ "github.com/kartikbazzad/quacker/postgres"`), which keeps pgx out
+  of builds that don't use it; without it, `Open` fails with a clear
+  "backend not registered" error. Migrations are serialized with a Postgres
+  advisory lock so several nodes booting at once can't race DDL. **Single
+  instance for now**: boot recovery and shutdown assume one engine owns the
+  database. Multi-instance (step leases, cross-node claim locking) is a later
+  phase and is the one place the storage story is not yet cluster-safe.
 
 WAL modes (`Ephemeral`, `File`) run a passive `wal_checkpoint` every 60s
 (`WithCheckpointInterval`) and a truncating checkpoint on `Close`, so a

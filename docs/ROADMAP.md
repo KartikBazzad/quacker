@@ -1,8 +1,9 @@
 # Roadmap
 
-Status: **v0.4 in progress** — v0.3 is shipped (durable execution, DAG
-visualizer, debug logger, perf). Worker labels and OTel tracing are done; the
-Postgres/multi-instance epic remains.
+Status: **v0.4 + v1.1 in progress** — v0.3 is shipped (durable execution, DAG
+visualizer, debug logger, perf). Worker labels and OTel tracing are done, and
+the Postgres backend has landed as single-instance; multi-instance step leases
+remain the last item on the multi-instance story.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -239,10 +240,23 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v1.1 - Database Support
-- Support for PostgreSQL
-- Migration scripts for PostgreSQL
-- Reuse existing connection
+## v1.1 - Database Support (in progress)
+
+- ✅ **PostgreSQL backend**: a dialect seam in `internal/store` (backend
+  registry, `?`→`$n` rebind, per-dialect migrations and DDL) plus a `postgres/`
+  driver package registered by blank import, so pgx is only built when used.
+  Postgres uses `BIGINT` throughout (unix nanos overflow `INTEGER`), identity
+  columns, and a `jsonb` label gate; migrations are serialized with an
+  advisory lock. Env-gated integration tests run in CI against a Postgres
+  service. **Single-instance only** for now — see the next phase.
+- ✅ Migration scripts for PostgreSQL (a per-dialect migration list).
+- **Reuse existing connection**: `WithDB(*sql.DB)` to hand quacker a pool it
+  does not own.
+- **Multi-instance (leases)**: worker id + `lease_expires_at` on steps, a
+  heartbeat, and a leaderless reaper; a global claim advisory lock; `FOR
+  UPDATE` per-run locks in the DAG-mutating transactions; and cron single-fire
+  via a `next_at` CAS in the enqueue transaction. This is what makes several
+  engines safe against one database.
 
 ## v1.2 - Performance Optimizations
 - Optimize for high throughput and low latency

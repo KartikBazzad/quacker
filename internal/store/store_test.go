@@ -36,7 +36,7 @@ func TestMigrateBaselinesLegacyShape(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if want := migrations[len(migrations)-1].version; v != want {
+	if want := sqliteMigrations[len(sqliteMigrations)-1].Version; v != want {
 		t.Fatalf("baseline schema version = %d, want %d", v, want)
 	}
 }

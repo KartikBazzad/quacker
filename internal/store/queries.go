@@ -20,13 +20,13 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 	if len(runs) != len(steps) {
 		return fmt.Errorf("quacker: CreateRuns: %d runs, %d step sets", len(runs), len(steps))
 	}
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for i, run := range runs {
-		res, err := tx.ExecContext(ctx, `INSERT INTO runs
+		res, err := tx.exec(ctx, `INSERT INTO runs
 			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent)
 			VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?)`,
 			run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
@@ -38,7 +38,7 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 			return fmt.Errorf("quacker: insert run: %d rows affected", n)
 		}
 		for _, st := range steps[i] {
-			_, err := tx.ExecContext(ctx, `INSERT INTO steps
+			_, err := tx.exec(ctx, `INSERT INTO steps
 				(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels)
 				VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?)`,
 				st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
@@ -150,12 +150,12 @@ func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, 
 
 // purgeEvents deletes up to batch events older than before.
 func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	r, err := tx.ExecContext(ctx, `DELETE FROM events WHERE seq IN (
+	r, err := tx.exec(ctx, `DELETE FROM events WHERE seq IN (
 		SELECT seq FROM events WHERE created_at > 0 AND created_at < ? LIMIT ?)`, before, batch)
 	if err != nil {
 		return 0, err
@@ -168,7 +168,7 @@ func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64
 // a single transaction, returning how many runs were selected.
 func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
 	var res PurgeResult
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return 0, res, err
 	}
@@ -184,7 +184,7 @@ func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int
 		args = append(args, st)
 	}
 	args = append(args, before, StatusRunning, batch)
-	rows, err := tx.QueryContext(ctx, q, args...)
+	rows, err := tx.query(ctx, q, args...)
 	if err != nil {
 		return 0, res, err
 	}
@@ -208,18 +208,18 @@ func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int
 	idArgs := argsAny(ids)
 	ph := placeholders(len(ids))
 	if !keepLogs {
-		r, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE run_id IN (`+ph+`)`, idArgs...)
+		r, err := tx.exec(ctx, `DELETE FROM logs WHERE run_id IN (`+ph+`)`, idArgs...)
 		if err != nil {
 			return 0, res, err
 		}
 		res.Logs, _ = r.RowsAffected()
 	}
-	if r, err := tx.ExecContext(ctx, `DELETE FROM steps WHERE run_id IN (`+ph+`)`, idArgs...); err != nil {
+	if r, err := tx.exec(ctx, `DELETE FROM steps WHERE run_id IN (`+ph+`)`, idArgs...); err != nil {
 		return 0, res, err
 	} else {
 		res.Steps, _ = r.RowsAffected()
 	}
-	if r, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE id IN (`+ph+`)`, idArgs...); err != nil {
+	if r, err := tx.exec(ctx, `DELETE FROM runs WHERE id IN (`+ph+`)`, idArgs...); err != nil {
 		return 0, res, err
 	} else {
 		res.Runs, _ = r.RowsAffected()
@@ -232,12 +232,12 @@ func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int
 
 // purgeOrphanLogs deletes up to batch log rows whose run no longer exists.
 func (s *Store) purgeOrphanLogs(ctx context.Context, batch int) (int64, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	r, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE seq IN (
+	r, err := tx.exec(ctx, `DELETE FROM logs WHERE seq IN (
 		SELECT seq FROM logs WHERE run_id NOT IN (SELECT id FROM runs) LIMIT ?)`, batch)
 	if err != nil {
 		return 0, err
@@ -267,16 +267,6 @@ const keyGate = `(concurrency_key = '' OR key_limit <= 0 OR
 		WHERE r.concurrency_key = steps.concurrency_key
 		AND r.status = '` + StatusRunning + `') < steps.key_limit)`
 
-// labelGate lets a claim proceed only when every label the step requires is
-// in the engine's worker-label set, passed as a JSON array. A step with no
-// labels is claimable by any engine; a step with labels is claimable only by
-// an engine whose set is a superset. An empty worker set therefore matches
-// only unlabeled steps.
-const labelGate = `NOT EXISTS (
-	SELECT 1 FROM json_each(steps.labels) AS l
-	WHERE l.value NOT IN (SELECT value FROM json_each(?))
-)`
-
 // QueueClaim is one queue's claim budget for ClaimDueMulti.
 type QueueClaim struct {
 	Name  string
@@ -302,7 +292,7 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 // writer connection serializes the whole batch, and each step UPDATE is
 // re-guarded on its still being claimable.
 func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64, workerLabels []string) ([]*Claim, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +316,7 @@ func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int6
 		ids[i] = c.Step.RunID
 	}
 	q := `SELECT ` + runCols + ` FROM runs WHERE id IN (` + placeholders(len(ids)) + `)`
-	rrows, err := tx.QueryContext(ctx, q, argsAny(ids)...)
+	rrows, err := tx.query(ctx, q, argsAny(ids)...)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +354,7 @@ func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int6
 // claimed_at), so the limit is capped at the window's remaining budget. The
 // count is persisted, so the window survives a File-mode restart instead of
 // allowing a fresh-process burst.
-func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now int64, workerLabelsJSON string) ([]*Claim, error) {
+func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int64, workerLabelsJSON string) ([]*Claim, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		return nil, nil
@@ -375,7 +365,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now 
 			rateWindow = int64(time.Second)
 		}
 		var started int64
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE queue=? AND claimed_at >= ?`,
+		if err := tx.queryRow(ctx, `SELECT COUNT(*) FROM steps WHERE queue=? AND claimed_at >= ?`,
 			q.Name, now-rateWindow).Scan(&started); err != nil {
 			return nil, err
 		}
@@ -390,12 +380,12 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now 
 	// Two claim arms: fresh QUEUED work, and due SUSPENDED steps resuming
 	// (a sleep's wake time or a wait's timeout deadline). Event-driven wakes
 	// flip the step to QUEUED and are covered by the first arm.
-	rows, err := tx.QueryContext(ctx, `SELECT `+stepCols+` FROM steps
+	rows, err := tx.query(ctx, `SELECT `+stepCols+` FROM steps
 		WHERE queue = ? AND (
 			(status = ? AND run_at <= ?)
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
 		) AND `+keyGate+`
-		AND `+labelGate+`
+		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
 	if err != nil {
@@ -426,12 +416,12 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now 
 		if resumed {
 			// A resume spends start budget (claimed_at) but is not a new
 			// attempt and does not restamp started_at.
-			res, err = tx.ExecContext(ctx, `UPDATE steps SET
+			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = ''
 				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+keyGate,
 				StatusRunning, now, st.ID, StatusSuspended, now)
 		} else {
-			res, err = tx.ExecContext(ctx, `UPDATE steps SET
+			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
 				WHERE id = ? AND status = ? AND `+keyGate,
@@ -444,7 +434,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now 
 			continue // moved by someone else, or its key saturated mid-batch
 		}
 		if !resumed {
-			if _, err := tx.ExecContext(ctx, `UPDATE runs SET
+			if _, err := tx.exec(ctx, `UPDATE runs SET
 				status = ?, attempts = attempts + 1, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
 				WHERE id = ? AND status = ?`, StatusRunning, now, st.RunID, StatusQueued); err != nil {
 				return nil, err
@@ -488,7 +478,7 @@ type CompleteResult struct {
 // that is already terminal (e.g. cancelled mid-flight) and refuse to
 // resurrect a step that was cancelled or failed by another path.
 func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output []byte, now int64) (CompleteResult, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return CompleteResult{}, err
 	}
@@ -497,18 +487,18 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	// A run that is already terminal (cancelled/failed/interrupted) must not
 	// gain SUCCEEDED steps from executors that raced the transition.
 	var runStatus string
-	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+	if err := tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
 		return CompleteResult{}, err
 	}
 	if IsTerminal(runStatus) {
 		// Converge the step to CANCELLED so it doesn't sit RUNNING forever;
 		// the run's outcome was decided by Cancel/failure, not this task.
-		_, _ = tx.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
+		_, _ = tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
 			StatusCancelled, now, stepID)
 		return CompleteResult{StepDone: false}, tx.Commit()
 	}
 
-	upd, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, output=?, error='', completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
+	upd, err := tx.exec(ctx, `UPDATE steps SET status=?, output=?, error='', completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
 		StatusSucceeded, output, now, stepID)
 	if err != nil {
 		return CompleteResult{}, err
@@ -539,7 +529,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		if !ready {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, run_at=? WHERE id=?`,
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, run_at=? WHERE id=?`,
 			StatusQueued, now, st.ID); err != nil {
 			return CompleteResult{}, err
 		}
@@ -564,7 +554,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 			last = st
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		runStatus, last.Output, runErr, now, runID); err != nil {
 		return CompleteResult{}, err
 	}
@@ -596,18 +586,18 @@ func (s *Store) ParkStep(ctx context.Context, stepID string, errMsg string, next
 // FinalFailStep marks a step FAILED, cancels all remaining steps of the run,
 // and fails the run (v1 policy: a failed step fails the whole run).
 func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg string, now int64) (CompleteResult, error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return CompleteResult{}, err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, error=?, completed_at=? WHERE id=?`,
+	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, error=?, completed_at=? WHERE id=?`,
 		StatusFailed, errMsg, now, stepID); err != nil {
 		return CompleteResult{}, err
 	}
 	res := CompleteResult{StepDone: true}
-	rows, err := tx.QueryContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED') AND id != ? RETURNING id, name`,
+	rows, err := tx.query(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED') AND id != ? RETURNING id, name`,
 		StatusCancelled, now, runID, stepID)
 	if err != nil {
 		return CompleteResult{}, err
@@ -623,7 +613,7 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 	}
 	rows.Close()
 
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		StatusFailed, errMsg, now, runID); err != nil {
 		return CompleteResult{}, err
 	}
@@ -646,14 +636,14 @@ func (s *Store) StepCancelled(ctx context.Context, stepID string, now int64) err
 // their contexts. prevStatus is the run's status before the transition (for
 // event publishing). Returns false if the run was already terminal.
 func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (runningSteps []string, prevStatus string, ok bool, err error) {
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, "", false, err
 	}
 	defer tx.Rollback()
 
 	var status string
-	err = tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
+	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", false, ErrNotFound
 	}
@@ -663,15 +653,15 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 	if IsTerminal(status) {
 		return nil, status, false, nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, completed_at=? WHERE id=?`,
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=? WHERE id=?`,
 		StatusCancelled, now, runID); err != nil {
 		return nil, "", false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
+	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
 		StatusCancelled, now, runID); err != nil {
 		return nil, "", false, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
+	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -858,13 +848,13 @@ func (s *Store) AppendLogs(ctx context.Context, entries []LogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for _, e := range entries {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO logs (run_id, step, at, level, message) VALUES (?,?,?,?,?)`,
+		if _, err := tx.exec(ctx, `INSERT INTO logs (run_id, step, at, level, message) VALUES (?,?,?,?,?)`,
 			e.RunID, e.Step, e.At, e.Level, e.Message); err != nil {
 			return err
 		}
@@ -1044,8 +1034,8 @@ func (s *Store) GetStepOutputs(ctx context.Context, runID string, names []string
 	return out, rows.Err()
 }
 
-func loadStepsTx(ctx context.Context, tx *sql.Tx, runID string) ([]*Step, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
+func loadStepsTx(ctx context.Context, tx *txn, runID string) ([]*Step, error) {
+	rows, err := tx.query(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -1061,7 +1051,7 @@ func loadStepsTx(ctx context.Context, tx *sql.Tx, runID string) ([]*Step, error)
 	return out, rows.Err()
 }
 
-func loadStepsDB(ctx context.Context, db *sql.DB, runID string) ([]*Step, error) {
+func loadStepsDB(ctx context.Context, db *dbConn, runID string) ([]*Step, error) {
 	rows, err := db.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
 	if err != nil {
 		return nil, err
