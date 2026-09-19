@@ -76,9 +76,11 @@ once. A driver must satisfy these:
 - **DDL must match the query layer's column names** (types are the driver's
   choice). `postgres/schema.go` and `mysql/schema.go` are the reference.
 - **Self-referencing subqueries.** Postgres/SQLite accept the correlated
-  `KeyGate` from `driver.CorrelatedKeyGate()`; MySQL does not and uses a
-  derived-table form. If your dialect rejects reading the table being updated,
-  provide a materialized variant like `mysql` does.
+  `KeyGate` from `driver.CorrelatedKeyGate()`; MySQL does not (error 1093) and
+  routes the count through a derived table that the optimizer merges back into
+  a covering index lookup. If your dialect rejects reading the table being
+  updated, wrap the source in a derived table the same way; keep it
+  merge-friendly (no `GROUP BY`) so it does not materialize.
 - **Migrations are split on `;`** and each statement runs separately, so a
   migration script must not contain a semicolon inside a string literal.
 

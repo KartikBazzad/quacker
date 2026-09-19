@@ -333,6 +333,7 @@ translates SQL. See [DRIVERS.md](DRIVERS.md).
 
 ## Backlog
 - Pause and Resume Jobs/workflows
+- Custom storage backends
 
 ## ⚖ Open decisions (input welcome, defaults chosen)
 

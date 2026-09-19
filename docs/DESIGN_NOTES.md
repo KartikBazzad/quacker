@@ -705,7 +705,12 @@ dialect" abstraction would otherwise have hidden:
   12, Postgres migration 4).
 - **`driver.KeyGate`.** MySQL rejects a correlated subquery that reads the
   table being updated (error 1093), so the per-key claim predicate is a hook:
-  Postgres/SQLite use the correlated form, MySQL a materialized derived table.
+  Postgres/SQLite use the correlated form, MySQL routes the count through a
+  derived table. The derived table is only there to satisfy MySQL's parser —
+  `EXPLAIN ANALYZE` shows the optimizer merging it into a covering index lookup
+  on `idx_steps_key`, with no materialization. A count-per-key `GROUP BY`
+  variant was measured as an alternative and rejected: it blocks the merge,
+  materializes the whole RUNNING set, and runs 2–3× slower.
 - **`driver.MigrateLocker`.** `GET_LOCK` is session-scoped, so MySQL acquires
   it for the whole migration run and releases it, instead of the
   transaction-scoped advisory locks Postgres uses.

@@ -91,10 +91,14 @@ func (myBackend) SupportsCheckpoint(driver.Config) bool { return false }
 // node's in-flight work. The lease reaper recovers crashed nodes instead.
 func (myBackend) RecoverOnBoot(driver.Config) bool { return false }
 
-// KeyGate uses a derived table (materialized RUNNING steps) rather than a
-// correlated subquery: MySQL rejects reading the table being updated in a
-// subquery (error 1093), and materializing breaks the self-reference while
-// keeping the same count.
+// KeyGate uses a derived table rather than a directly correlated subquery:
+// MySQL rejects reading the table being updated in a subquery (error 1093), and
+// routing the count through a derived table satisfies the parser. The
+// optimizer then *merges* the derived table into `Covering index lookup on
+// steps using idx_steps_key (concurrency_key=…, status='RUNNING')`, so nothing
+// is materialized in practice — the form is purely to get past the 1093 check.
+// A GROUP BY/count-per-key variant would block the merge, force materialization
+// of the whole RUNNING set, and measure 2-3x slower; keep this shape.
 func (myBackend) KeyGate() string {
 	return `(concurrency_key = '' OR key_limit <= 0 OR
 	(SELECT COUNT(*) FROM (SELECT concurrency_key FROM steps WHERE status = 'RUNNING') AS r
