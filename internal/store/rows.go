@@ -45,6 +45,10 @@ type Run struct {
 	// ParentID is the run this one was enqueued from ("" for a root run).
 	// Lineage is informational: a purged parent leaves a dangling id.
 	ParentID string
+	// ParentStep is the step (name) of ParentID that spawned this run ("" for
+	// a root run or a child enqueued outside a step). Pair it with ParentID to
+	// attach a child run to its spawning step in the run's tree.
+	ParentStep string
 	// TraceParent is the W3C traceparent of the span active at enqueue ("" if
 	// tracing is disabled), used to link the executing span to its producer.
 	TraceParent string
@@ -210,7 +214,7 @@ func decodeList(s string) []string {
 }
 
 const runCols = `id, workflow, kind, status, queue, priority, input, output, error,
-	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent,
+	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, parent_step, trace_parent,
 	COALESCE(unique_key, ''), paused_at, dead_lettered_at, sequence_key, seq, ephemeral`
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
@@ -223,7 +227,7 @@ func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var ephemeral int64
 	err := row.Scan(&r.ID, &r.Workflow, &r.Kind, &r.Status, &r.Queue, &r.Priority,
 		&r.Input, &r.Output, &r.Error, &r.Attempts, &r.MaxAttempts,
-		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID, &r.TraceParent,
+		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID, &r.ParentStep, &r.TraceParent,
 		&r.UniqueKey, &r.PausedAt, &r.DeadLetteredAt, &r.SequenceKey, &r.Seq, &ephemeral)
 	if err != nil {
 		return nil, err

@@ -63,6 +63,7 @@ func (pgBackend) Migrations() []driver.Migration {
 		{Version: 9, SQL: pgMigration9},
 		{Version: 10, SQL: pgMigration10},
 		{Version: 11, SQL: pgMigration11},
+		{Version: 12, SQL: pgMigration12},
 	}
 }
 

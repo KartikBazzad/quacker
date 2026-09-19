@@ -192,3 +192,8 @@ CREATE TABLE IF NOT EXISTS step_keys (
 	CONSTRAINT fk_step_keys_step FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 `
+
+// myMigration9 records the step that spawned a child run.
+const myMigration9 = `
+ALTER TABLE runs ADD COLUMN parent_step VARCHAR(255) NOT NULL DEFAULT '';
+`

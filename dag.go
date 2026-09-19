@@ -39,7 +39,8 @@ type DAG struct {
 
 // DAG returns the step graph of a run with the current state of every node.
 // For a single-task run it is one node with no edges. Returns ErrNotFound for
-// an unknown run.
+// an unknown run. It covers only this run's own steps; use DAGTree to include
+// child runs (spawned with EnqueueChild).
 func (q *Quacker) DAG(ctx context.Context, runID string) (*DAG, error) {
 	ex, err := q.Execution(ctx, runID)
 	if err != nil {

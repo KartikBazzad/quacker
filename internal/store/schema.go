@@ -256,6 +256,12 @@ CREATE TABLE IF NOT EXISTS step_keys (
 CREATE INDEX IF NOT EXISTS idx_step_keys_value ON step_keys (name, value);
 `
 
+// migration20 records the step that spawned a child run, so a run's DAG can
+// include its child runs attached to the spawning step.
+const migration20 = `
+ALTER TABLE runs ADD COLUMN parent_step TEXT NOT NULL DEFAULT '';
+`
+
 // migration18 adds ephemeral runs: persisted while in flight, deleted on
 // terminal and never recovered.
 const migration18 = `
@@ -309,6 +315,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 17, SQL: migration17},
 	{Version: 18, SQL: migration18},
 	{Version: 19, SQL: migration19},
+	{Version: 20, SQL: migration20},
 }
 
 // init validates the built-in migration list's invariant before any Open can

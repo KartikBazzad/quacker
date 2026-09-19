@@ -394,16 +394,17 @@ func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], i
 		return nil, err
 	}
 	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
-		Workflow:  t.name,
-		Kind:      store.KindTask,
-		Input:     inputJSON,
-		Priority:  ec.priority,
-		RunAt:     ec.runAt,
-		ParentID:  parent,
-		UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
-		Conflict:  t.cfg.uniqueMode,
-		Ephemeral: t.cfg.ephemeral,
-		Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+		Workflow:   t.name,
+		Kind:       store.KindTask,
+		Input:      inputJSON,
+		Priority:   ec.priority,
+		RunAt:      ec.runAt,
+		ParentID:   parent,
+		ParentStep: parentStepOf(ctx, parent),
+		UniqueKey:  uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
+		Conflict:   t.cfg.uniqueMode,
+		Ephemeral:  t.cfg.ephemeral,
+		Steps:      []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 	})
 	if err != nil {
 		return nil, err
@@ -444,20 +445,33 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 		steps[i] = engine.StepReq{Name: s.name, Deps: s.deps, Def: s.def}
 	}
 	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
-		Workflow:  wf.name,
-		Kind:      store.KindWorkflow,
-		Input:     inputJSON,
-		Priority:  ec.priority,
-		RunAt:     ec.runAt,
-		ParentID:  parent,
-		UniqueKey: ec.uniqueKey,
-		Ephemeral: wf.steps[0].def.Ephemeral,
-		Steps:     steps,
+		Workflow:   wf.name,
+		Kind:       store.KindWorkflow,
+		Input:      inputJSON,
+		Priority:   ec.priority,
+		RunAt:      ec.runAt,
+		ParentID:   parent,
+		ParentStep: parentStepOf(ctx, parent),
+		UniqueKey:  ec.uniqueKey,
+		Ephemeral:  wf.steps[0].def.Ephemeral,
+		Steps:      steps,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}, nil
+}
+
+// parentStepOf returns the current step's name when enqueuing a child run, or
+// "" for a root run.
+func parentStepOf(ctx context.Context, parent string) string {
+	if parent == "" {
+		return ""
+	}
+	if sc, ok := StepFromContext(ctx); ok {
+		return sc.Step
+	}
+	return ""
 }
 
 // Register makes a task executable without enqueuing a run. Needed when

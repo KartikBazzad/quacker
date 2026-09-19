@@ -23,4 +23,6 @@ website/wiki/
 # examples/eltdag generated DAG output
 /examples/eltdag/dag.json
 /examples/eltdag/dag.svg
+/examples/eltdag/dag-tree.json
+/examples/eltdag/dag-tree.svg
 /examples/eltdag/failed/

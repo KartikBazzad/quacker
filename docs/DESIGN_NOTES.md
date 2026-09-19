@@ -900,6 +900,22 @@ The concurrency design matters more than the batching itself:
 The remaining gap to a bulk completer is per-row queries inside the batch; a
 future change could collapse the step/run updates into set-based statements.
 
+### 41. Child runs are separate runs; the run tree draws the whole family
+
+`EnqueueChild` creates an **independent run** — no implicit join, and a failed
+child does not fail the parent — so the parent's DAG legitimately does not
+contain the child's steps, and `DAG`/`DAGSVG` show only the parent's own steps.
+That is correct but surprising when you expect one picture of an ELT pipeline
+that fans out to child workflows.
+
+v1.10 records the spawning step on the child run (`runs.parent_step`, set from
+`StepFromContext` at `EnqueueChild`/`EnqueueWorkflowChild`) and adds
+**`DAGTree`/`DAGTreeJSON`/`DAGTreeSVG`**: the parent's steps, plus each child
+run's steps namespaced by a short child-run id and attached by an edge from the
+step that spawned them. It recurses (bounded by depth and node count) so a tree
+of child workflows renders in one image. The plain `DAG` is unchanged, so the
+single-run contract holds; `DAGTree` is the opt-in family view.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

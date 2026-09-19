@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -177,4 +178,38 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("wrote %s (%d bytes) and %s (%d bytes)\n", jsonPath, len(js), svgPath, len(svg))
+
+	// The run tree adds the child runs spawned by the "partition" step, each
+	// attached to it. DAGJSON/DAGSVG show only this run's own steps.
+	tjs, err := q.DAGTreeJSON(ctx, h.RunID())
+	if err != nil {
+		log.Fatal(err)
+	}
+	tsvg, err := q.DAGTreeSVG(ctx, h.RunID())
+	if err != nil {
+		log.Fatal(err)
+	}
+	treeJSONPath := *dir + "/dag-tree.json"
+	treeSVGPath := *dir + "/dag-tree.svg"
+	if err := os.WriteFile(treeJSONPath, tjs, 0o644); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile(treeSVGPath, tsvg, 0o644); err != nil {
+		log.Fatal(err)
+	}
+	var tree struct {
+		Nodes []struct {
+			Name string `json:"name"`
+		} `json:"nodes"`
+		Edges []struct{ From, To string } `json:"edges"`
+	}
+	_ = json.Unmarshal(tjs, &tree)
+	children := 0
+	for _, n := range tree.Nodes {
+		if strings.Contains(n.Name, "/job") {
+			children++
+		}
+	}
+	fmt.Printf("wrote %s (%d nodes, %d child steps) and %s\n",
+		treeJSONPath, len(tree.Nodes), children, treeSVGPath)
 }

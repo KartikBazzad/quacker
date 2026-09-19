@@ -100,14 +100,16 @@ type Execution struct {
 
 // RunSummary is a run without payloads, for list views.
 type RunSummary struct {
-	RunID       string    `json:"run_id"`
-	Workflow    string    `json:"workflow"`
-	Kind        Kind      `json:"kind"`
-	Status      Status    `json:"status"`
-	Queue       string    `json:"queue"`
-	Priority    int64     `json:"priority"`
-	Error       string    `json:"error,omitempty"`
-	ParentID    string    `json:"parent_id,omitempty"`
+	RunID    string `json:"run_id"`
+	Workflow string `json:"workflow"`
+	Kind     Kind   `json:"kind"`
+	Status   Status `json:"status"`
+	Queue    string `json:"queue"`
+	Priority int64  `json:"priority"`
+	Error    string `json:"error,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+	// ParentStep is the step (in ParentID) that spawned this run.
+	ParentStep  string    `json:"parent_step,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
@@ -237,7 +239,7 @@ func (q *Quacker) Runs(ctx context.Context, f RunFilter) ([]RunSummary, error) {
 func runSummary(r *store.Run) RunSummary {
 	return RunSummary{
 		RunID: r.ID, Workflow: r.Workflow, Kind: Kind(r.Kind), Status: Status(r.Status),
-		Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID,
+		Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID, ParentStep: r.ParentStep,
 		CreatedAt: unixToTime(r.CreatedAt), StartedAt: unixToTime(r.StartedAt),
 		CompletedAt: unixToTime(r.CompletedAt), DeadLetteredAt: unixToTime(r.DeadLetteredAt),
 		Ephemeral: r.Ephemeral,

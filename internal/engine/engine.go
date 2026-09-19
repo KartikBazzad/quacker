@@ -113,8 +113,10 @@ type EnqueueRequest struct {
 	Priority int64
 	RunAt    time.Time // zero = now
 	// ParentID links this run to the run that enqueued it ("" for a root
-	// run). Lineage is informational.
-	ParentID string
+	// run). ParentStep is the step that spawned it, so a child run can be
+	// attached to its spawning step in the run tree. Lineage is informational.
+	ParentID   string
+	ParentStep string
 	// UniqueKey, when non-empty, makes the run unique per (workflow, key)
 	// among non-terminal runs. Conflict selects the outcome on collision.
 	UniqueKey string
@@ -1019,7 +1021,8 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 	runID := newID(now)
 	run := &store.Run{
 		ID: runID, Workflow: req.Workflow, Kind: req.Kind, Status: store.StatusQueued,
-		Queue: queue, Priority: req.Priority, Input: req.Input, ParentID: req.ParentID,
+		Queue: queue, Priority: req.Priority, Input: req.Input,
+		ParentID: req.ParentID, ParentStep: req.ParentStep,
 		UniqueKey:   req.UniqueKey,
 		MaxAttempts: 1, RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
 	}

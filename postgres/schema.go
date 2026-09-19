@@ -196,3 +196,8 @@ CREATE TABLE IF NOT EXISTS step_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_step_keys_value ON step_keys (name, value);
 `
+
+// pgMigration12 records the step that spawned a child run.
+const pgMigration12 = `
+ALTER TABLE runs ADD COLUMN parent_step TEXT NOT NULL DEFAULT '';
+`
