@@ -56,6 +56,31 @@ const (
 	UniqueReplace
 )
 
+// ConcurrencyStrategy selects what an enqueue does when a key is at capacity.
+type ConcurrencyStrategy int
+
+const (
+	// ConcurrencyHold queues the run and waits for a slot (default).
+	ConcurrencyHold ConcurrencyStrategy = iota
+	// ConcurrencyCancelInProgress cancels running/oldest runs to make room.
+	ConcurrencyCancelInProgress
+	// ConcurrencyCancelNewest cancels the incoming run.
+	ConcurrencyCancelNewest
+	// ConcurrencyCancelQueuedExceptNewest keeps the newest Limit queued runs
+	// and cancels older queued ones.
+	ConcurrencyCancelQueuedExceptNewest
+	// ConcurrencyCancelQueuedExceptOldest keeps the oldest Limit queued runs
+	// and cancels newer queued ones.
+	ConcurrencyCancelQueuedExceptOldest
+)
+
+// KeyPolicy is a run's concurrency-key policy, applied at enqueue.
+type KeyPolicy struct {
+	Key      string
+	Limit    int64
+	Strategy ConcurrencyStrategy
+}
+
 // ReplacedRun is a run cancelled by UniqueReplace. The engine cancels the
 // contexts of RunningSteps and releases the run's local waiter.
 type ReplacedRun struct {
@@ -71,13 +96,13 @@ type ReplacedRun struct {
 // returns the effective run id per input (existing for reuse, new otherwise)
 // and any runs replaced (for the engine to interrupt locally). A concurrent
 // enqueue race surfaces as a wrapped ErrUniqueViolation; the caller retries.
-func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, []ReplacedRun, error) {
+func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*Step, conflicts []UniqueConflict, policies []KeyPolicy) ([]string, []ReplacedRun, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	ids, replaced, err := s.createRunsUniqueTx(ctx, tx, runs, steps, conflicts)
+	ids, replaced, err := s.createRunsUniqueTx(ctx, tx, runs, steps, conflicts, policies)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -88,23 +113,32 @@ func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*St
 // the same conflict resolution and inserts but never commits or rolls back,
 // so the caller's business writes and the enqueued runs are atomic. Used by
 // Quacker.EnqueueTx (Postgres/MySQL only); no waits are registered.
-func (s *Store) CreateRunsTx(ctx context.Context, tx *sql.Tx, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, error) {
-	ids, _, err := s.createRunsUniqueTx(ctx, &txn{Tx: tx, be: s.be}, runs, steps, conflicts)
+func (s *Store) CreateRunsTx(ctx context.Context, tx *sql.Tx, runs []*Run, steps [][]*Step, conflicts []UniqueConflict, policies []KeyPolicy) ([]string, error) {
+	ids, _, err := s.createRunsUniqueTx(ctx, &txn{Tx: tx, be: s.be}, runs, steps, conflicts, policies)
 	return ids, err
 }
 
 // createRunsUniqueTx is the shared body of CreateRunsUnique and CreateRunsTx.
-func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, []ReplacedRun, error) {
+func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step, conflicts []UniqueConflict, policies []KeyPolicy) ([]string, []ReplacedRun, error) {
 	if len(runs) != len(steps) || len(runs) != len(conflicts) {
 		return nil, nil, fmt.Errorf("quacker: CreateRunsUnique: %d runs, %d step sets, %d conflicts", len(runs), len(steps), len(conflicts))
 	}
+	if len(policies) > 0 && len(policies) != len(runs) {
+		return nil, nil, fmt.Errorf("quacker: CreateRunsUnique: %d policies for %d runs", len(policies), len(runs))
+	}
+	policy := func(i int) KeyPolicy {
+		if len(policies) == 0 {
+			return KeyPolicy{}
+		}
+		return policies[i]
+	}
 	ids := make([]string, len(runs))
 	var replaced []ReplacedRun
-	// Reserve insertion-order values for sequenced runs in one shot. Runs
-	// without a sequence key never touch the counter.
+	// Reserve insertion-order values for sequenced runs and keyed runs that may
+	// need cancel-strategy ordering. Runs without either never touch the counter.
 	nSeq := 0
-	for _, run := range runs {
-		if run.SequenceKey != "" {
+	for i, run := range runs {
+		if run.SequenceKey != "" || policy(i).Key != "" {
 			nSeq++
 		}
 	}
@@ -118,7 +152,7 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 	}
 	for i, run := range runs {
 		ids[i] = run.ID
-		if run.SequenceKey != "" {
+		if run.SequenceKey != "" || policy(i).Key != "" {
 			seqNext++
 			run.Seq = seqNext
 			for _, st := range steps[i] {
@@ -152,6 +186,13 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 				return nil, nil, fmt.Errorf("%w: %w", ErrUniqueViolation, err)
 			}
 			return nil, nil, err
+		}
+		if p := policy(i); p.Strategy != ConcurrencyHold && p.Key != "" && p.Limit > 0 {
+			victims, err := s.applyConcurrencyStrategy(ctx, tx, run, p.Limit, p.Strategy, nowUnix())
+			if err != nil {
+				return nil, nil, err
+			}
+			replaced = append(replaced, victims...)
 		}
 	}
 	return ids, replaced, nil
@@ -228,6 +269,126 @@ func cancelRunTx(ctx context.Context, tx *txn, runID string, now int64) error {
 	_, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
 		StatusCancelled, now, runID)
 	return err
+}
+
+// cancelOrDeleteRunTx cancels a run — or deletes it when ephemeral — inside an
+// existing transaction, returning the ids of steps that were RUNNING so the
+// caller can interrupt their contexts.
+func cancelOrDeleteRunTx(ctx context.Context, tx *txn, runID string, now int64) ([]string, error) {
+	var ephemeral int64
+	err := tx.queryRow(ctx, `SELECT ephemeral FROM runs WHERE id=?`, runID).Scan(&ephemeral)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	var running []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		running = append(running, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if ephemeral != 0 {
+		return running, deleteEphemeralRunTx(ctx, tx, runID)
+	}
+	return running, cancelRunTx(ctx, tx, runID, now)
+}
+
+// applyConcurrencyStrategy enforces a run's key policy: when the key is over
+// its limit, it cancels the victims the strategy selects (which may include
+// run itself) and returns them so the engine can interrupt local contexts. It
+// runs inside the enqueue transaction, after run is inserted, so ordering is
+// the persisted seq.
+func (s *Store) applyConcurrencyStrategy(ctx context.Context, tx *txn, run *Run, limit int64, strategy ConcurrencyStrategy, now int64) ([]ReplacedRun, error) {
+	rows, err := tx.query(ctx, `SELECT id, status, seq FROM runs
+		WHERE concurrency_key=? AND status NOT IN (?,?,?,?)
+		ORDER BY seq ASC, created_at ASC`,
+		run.ConcurrencyKey, StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted)
+	if err != nil {
+		return nil, err
+	}
+	type cand struct {
+		id     string
+		status string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		var seq int64
+		if err := rows.Scan(&c.id, &c.status, &seq); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if int64(len(cands)) <= limit {
+		return nil, nil
+	}
+	var victims []string
+	switch strategy {
+	case ConcurrencyCancelNewest:
+		victims = []string{cands[len(cands)-1].id} // the newest, i.e. run
+	case ConcurrencyCancelInProgress:
+		// Cancel running instances first, then oldest, until under the limit.
+		var running, others []cand
+		for _, c := range cands {
+			if c.status == StatusRunning {
+				running = append(running, c)
+			} else {
+				others = append(others, c)
+			}
+		}
+		ordered := append(running, others...)
+		for i := 0; i < len(cands)-int(limit); i++ {
+			victims = append(victims, ordered[i].id)
+		}
+	case ConcurrencyCancelQueuedExceptNewest, ConcurrencyCancelQueuedExceptOldest:
+		var queued []cand
+		for _, c := range cands {
+			if c.status == StatusQueued {
+				queued = append(queued, c)
+			}
+		}
+		if int64(len(queued)) <= limit {
+			break
+		}
+		if strategy == ConcurrencyCancelQueuedExceptNewest {
+			// Keep the newest limit queued; cancel the older overflow.
+			for i := 0; i < len(queued)-int(limit); i++ {
+				victims = append(victims, queued[i].id)
+			}
+		} else {
+			// Keep the oldest limit queued; cancel the newer overflow.
+			for i := int(limit); i < len(queued); i++ {
+				victims = append(victims, queued[i].id)
+			}
+		}
+	}
+	var out []ReplacedRun
+	for _, id := range victims {
+		running, err := cancelOrDeleteRunTx(ctx, tx, id, now)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ReplacedRun{RunID: id, RunningSteps: running})
+	}
+	return out, nil
 }
 
 // insertRunsTx inserts runs and steps into an existing transaction. Shared by

@@ -33,6 +33,7 @@ type taskConfig struct {
 	backoff     Backoff
 	keyFn       func(engine.Codec, json.RawMessage) string
 	keyLimit    int
+	keyStrategy ConcurrencyStrategy
 	uniqueFn    func(engine.Codec, json.RawMessage) string
 	uniqueOn    bool
 	uniqueMode  UniqueConflict
@@ -87,6 +88,14 @@ func WithKey[I any](fn func(I) string) TaskOption {
 			return fn(in)
 		}
 	}
+}
+
+// WithKeyStrategy selects what happens when a run is enqueued while its key is
+// already at WithKeyConcurrency: ConcurrencyHold (default) queues it, while the
+// cancel strategies cancel running or queued same-key runs (or the incoming
+// run) instead. Meaningless without WithKey.
+func WithKeyStrategy(s ConcurrencyStrategy) TaskOption {
+	return func(c *taskConfig) { c.keyStrategy = s }
 }
 
 // WithKeyConcurrency sets how many runs sharing one WithKey may execute
@@ -227,6 +236,7 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	}
 	def.KeyFn = t.cfg.keyFn
 	def.KeyLimit = t.cfg.keyLimit
+	def.KeyStrategy = t.cfg.keyStrategy
 	def.Wrappers = t.cfg.wrap
 	def.Labels = t.cfg.labels
 	def.DeadLetter = t.cfg.deadLetter

@@ -213,6 +213,26 @@ const (
 // already holds the unique key.
 var ErrDuplicateJob = store.ErrDuplicateJob
 
+// ConcurrencyStrategy selects what an enqueue does when a key is at capacity,
+// set per task with WithKeyStrategy.
+type ConcurrencyStrategy = store.ConcurrencyStrategy
+
+const (
+	// ConcurrencyHold queues the run until a key slot frees (default).
+	ConcurrencyHold = store.ConcurrencyHold
+	// ConcurrencyCancelInProgress cancels running (else oldest) same-key runs
+	// to make room for the new one.
+	ConcurrencyCancelInProgress = store.ConcurrencyCancelInProgress
+	// ConcurrencyCancelNewest cancels the incoming run.
+	ConcurrencyCancelNewest = store.ConcurrencyCancelNewest
+	// ConcurrencyCancelQueuedExceptNewest keeps the newest keyLimit queued
+	// same-key runs and cancels older ones.
+	ConcurrencyCancelQueuedExceptNewest = store.ConcurrencyCancelQueuedExceptNewest
+	// ConcurrencyCancelQueuedExceptOldest keeps the oldest keyLimit queued
+	// same-key runs and cancels newer ones.
+	ConcurrencyCancelQueuedExceptOldest = store.ConcurrencyCancelQueuedExceptOldest
+)
+
 // WithUniqueKey sets the run's unique key explicitly, overriding a task's
 // WithUnique. The key is scoped to the task/workflow name, and "" means the
 // run is not unique.

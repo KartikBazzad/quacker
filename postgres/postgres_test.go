@@ -730,6 +730,49 @@ func TestPostgresEphemeralRunGone(t *testing.T) {
 	}
 }
 
+// TestPostgresConcurrencyCancelNewest: the enqueue-transaction strategy
+// applies across engines sharing a database.
+func TestPostgresConcurrencyCancelNewest(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	task := quacker.NewTask("pg.cancelnewest", func(ctx context.Context, in string) (string, error) {
+		started <- in
+		<-release
+		return in, nil
+	}, quacker.WithKey(func(in string) string { return "k" }),
+		quacker.WithKeyConcurrency(1),
+		quacker.WithKeyStrategy(quacker.ConcurrencyCancelNewest))
+	quacker.Register(b, task)
+
+	h1, err := quacker.Enqueue(ctx, a, task, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first run never started")
+	}
+	h2, err := quacker.Enqueue(ctx, a, task, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h2.Result(ctx); !errors.Is(err, quacker.ErrRunCancelled) {
+		t.Fatalf("incoming run: want ErrRunCancelled, got %v", err)
+	}
+	close(release)
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := b.Execution(ctx, h1.RunID())
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

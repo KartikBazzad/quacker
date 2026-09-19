@@ -75,6 +75,8 @@ type TaskDef struct {
 	// KeyLimit is the max simultaneously-running steps sharing one key;
 	// <1 is normalized to 1 at enqueue when a key is present.
 	KeyLimit int
+	// KeyStrategy selects what an enqueue does when the key is at capacity.
+	KeyStrategy store.ConcurrencyStrategy
 	// DeadLetter marks a run dead-lettered when it exhausts retries, so it can
 	// be listed and retried from the dead-letter queue.
 	DeadLetter bool
@@ -722,6 +724,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	runs := make([]*store.Run, len(reqs))
 	steps := make([][]*store.Step, len(reqs))
 	conflicts := make([]store.UniqueConflict, len(reqs))
+	policies := make([]store.KeyPolicy, len(reqs))
 	waiters := make([]*Waiter, len(reqs))
 	infos := make([]EnqueueInfo, len(reqs))
 	var enqueueSpans []trace.Span
@@ -745,6 +748,12 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 		}
 		infos[i] = info
 		conflicts[i] = req.Conflict
+		{
+			def := req.Steps[0].Def
+			policies[i] = store.KeyPolicy{
+				Key: run.ConcurrencyKey, Limit: int64(def.KeyLimit), Strategy: def.KeyStrategy,
+			}
+		}
 		if span != nil {
 			// Record the producer span so the executing step can link to it,
 			// even after a restart or on another process.
@@ -774,7 +783,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	}
 	e.mu.Unlock()
 
-	ids, replaced, err := e.createRuns(ctx, runs, steps, conflicts)
+	ids, replaced, err := e.createRuns(ctx, runs, steps, conflicts, policies)
 	if err != nil {
 		e.mu.Lock()
 		for _, w := range waiters {
@@ -822,14 +831,14 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 // enqueue that wins a key surfaces as ErrUniqueViolation; the retry sees the
 // winner and reuses/errors/replaces per policy. Bounded so a pathological
 // stream of collisions cannot spin.
-func (e *Engine) createRuns(ctx context.Context, runs []*store.Run, steps [][]*store.Step, conflicts []store.UniqueConflict) ([]string, []store.ReplacedRun, error) {
+func (e *Engine) createRuns(ctx context.Context, runs []*store.Run, steps [][]*store.Step, conflicts []store.UniqueConflict, policies []store.KeyPolicy) ([]string, []store.ReplacedRun, error) {
 	var (
 		ids      []string
 		replaced []store.ReplacedRun
 		err      error
 	)
 	for attempt := 0; attempt < 3; attempt++ {
-		ids, replaced, err = e.st.CreateRunsUnique(ctx, runs, steps, conflicts)
+		ids, replaced, err = e.st.CreateRunsUnique(ctx, runs, steps, conflicts, policies)
 		if err == nil {
 			return ids, replaced, nil
 		}
@@ -898,7 +907,9 @@ func (e *Engine) EnqueueOnTx(ctx context.Context, tx *sql.Tx, req *EnqueueReques
 		e.afterEnqueue(ctx, info, herr)
 		return "", herr
 	}
-	if _, err := e.st.CreateRunsTx(ctx, tx, []*store.Run{run}, [][]*store.Step{sts}, []store.UniqueConflict{req.Conflict}); err != nil {
+	def := req.Steps[0].Def
+	policy := store.KeyPolicy{Key: run.ConcurrencyKey, Limit: int64(def.KeyLimit), Strategy: def.KeyStrategy}
+	if _, err := e.st.CreateRunsTx(ctx, tx, []*store.Run{run}, [][]*store.Step{sts}, []store.UniqueConflict{req.Conflict}, []store.KeyPolicy{policy}); err != nil {
 		e.afterEnqueue(ctx, info, err)
 		return "", err
 	}
@@ -922,6 +933,7 @@ func (e *Engine) EnqueueBatchOnTx(ctx context.Context, tx *sql.Tx, reqs []*Enque
 	runs := make([]*store.Run, len(reqs))
 	steps := make([][]*store.Step, len(reqs))
 	conflicts := make([]store.UniqueConflict, len(reqs))
+	policies := make([]store.KeyPolicy, len(reqs))
 	infos := make([]EnqueueInfo, len(reqs))
 	for i, req := range reqs {
 		if req == nil {
@@ -936,9 +948,11 @@ func (e *Engine) EnqueueBatchOnTx(ctx context.Context, tx *sql.Tx, reqs []*Enque
 			e.afterEnqueueReverse(ctx, infos[:i], herr)
 			return nil, herr
 		}
+		def := req.Steps[0].Def
 		runs[i], steps[i], conflicts[i], infos[i] = run, sts, req.Conflict, info
+		policies[i] = store.KeyPolicy{Key: run.ConcurrencyKey, Limit: int64(def.KeyLimit), Strategy: def.KeyStrategy}
 	}
-	ids, err := e.st.CreateRunsTx(ctx, tx, runs, steps, conflicts)
+	ids, err := e.st.CreateRunsTx(ctx, tx, runs, steps, conflicts, policies)
 	if err != nil {
 		e.afterEnqueueReverse(ctx, infos, err)
 		return nil, err
