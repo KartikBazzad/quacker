@@ -504,9 +504,10 @@ overhead at all.
 
 ## Not yet
 
-Distributed workers across processes (the Postgres/multi-instance epic) and
-strict (ordered) per-key concurrency. Worker label routing is available
-within a process and is the building block for cross-process routing.
+Strict (ordered) per-key concurrency, a web UI, and plugin/custom-storage
+extension points (v1.3). Multi-process scaling over Postgres is supported, and
+worker labels, OTel tracing, durable execution, and DAG visualization are all
+shipped.
 
 ## Documentation
 

@@ -8,9 +8,6 @@
 # Example output (examples/dagsvg writes this to its working directory)
 /dag.svg
 
-# WIP website: a separate module/app, kept out of the library's build and CI
-/website/
-
 # macOS Finder metadata
 .DS_Store
 

@@ -1,9 +1,9 @@
 # Roadmap
 
-Status: **v0.4 + v1.1 in progress** — v0.3 is shipped (durable execution, DAG
-visualizer, debug logger, perf). Worker labels, OTel tracing, the Postgres
-backend, and multi-instance step leases are done; the only remaining v1.1 item
-is optional `WithDB` connection reuse.
+Status: **v0.4 + v1.1 shipped** — durable execution, DAG visualizer, debug
+logger, perf, worker labels, OTel tracing, the Postgres backend, and
+multi-instance step leases are all done. Next: **v1.2 performance** (the only
+open v1.1 item is optional `WithDB` connection reuse).
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -210,7 +210,7 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v0.4 — routing & observability (in progress)
+## v0.4 — routing & observability (✅ DONE)
 
 - ✅ **Worker labels**: `quacker.WithLabels(...)` on a task and
   `WithWorkerLabels(...)` on an engine; the scheduler claims a step only when
@@ -223,9 +223,9 @@ Children are ordinary runs and are aged/purged independently.
   **linked** to the enqueue span; the W3C traceparent is persisted on the run
   (migration v9) so the link survives a restart. API-only dependency — the
   caller supplies the SDK/exporter; tracing off is allocation-free.
-- **Postgres / multi-instance**: abstract the store, add worker identity and
-  step leases (boot recovery currently re-queues RUNNING rows, safe for one
-  process only), and cross-node wakeups.
+- ✅ **Postgres / multi-instance**: store dialect seam + `postgres/` driver,
+  worker identity and step leases (heartbeat + reaper), claim/run locks, and
+  cron single-fire — shipped under v1.1 below.
 
 ---
 
@@ -240,7 +240,7 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v1.1 - Database Support (in progress)
+## v1.1 - Database Support (✅ DONE — optional `WithDB` remains)
 
 - ✅ **PostgreSQL backend**: a dialect seam in `internal/store` (backend
   registry, `?`→`$n` rebind, per-dialect migrations and DDL) plus a `postgres/`
@@ -260,9 +260,17 @@ Children are ordinary runs and are aged/purged independently.
 - **Reuse existing connection**: `WithDB(*sql.DB)` to hand quacker a pool it
   does not own. (Optional; the storage constructor already covers most cases.)
 
-## v1.2 - Performance Optimizations
-- Optimize for high throughput and low latency
-- Add support for horizontal scaling
+## v1.2 - Performance Optimizations (in progress)
+
+- **DAG completion without full step scans.** `CompleteStep` loads every step
+  row (including `input`/`output` blobs) to unblock dependents and decide the
+  run is terminal — O(steps) per completion, O(steps²) for a wide DAG. Load
+  only the metadata the decision needs, and fetch the run output with a single
+  ordered query; blobs leave the hot path.
+- **Wide-DAG benchmark** to measure the per-completion cost (and regressions).
+- **Horizontal scaling** shipped via the Postgres multi-instance work (v1.1);
+  optional cross-node `LISTEN/NOTIFY` wakeups remain a follow-up.
+- Optional: `WithDB(*sql.DB)` connection reuse (the last v1.1 item).
 
 
 ## v1.3 - Advanced Features
@@ -275,8 +283,8 @@ Children are ordinary runs and are aged/purged independently.
    channel-backed logger the user consumes; the engine stays HTTP-free.
 2. **External events**: in-process emit/listen shipped (v0.2 P2). Webhook or
    external-event ingestion would change the schema — flag it before it lands.
-3. **Multi-instance**: the Postgres epic needs a store interface plus worker
-   identity and step leases, because boot recovery currently re-queues every
-   RUNNING row — correct for one process, unsafe for a cluster.
+3. **Multi-instance**: shipped — dialect seam, worker leases (heartbeat +
+   reaper), claim/run locks, and cron single-fire. Optional follow-ups:
+   `LISTEN/NOTIFY` wakeups and `WithDB` connection reuse.
 4. **License/tags**: MIT is in place (v0.2 P2); semver tags are pending a git
    remote.
