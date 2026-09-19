@@ -40,7 +40,7 @@ type JournalEntry struct {
 	TimedOut bool
 }
 
-const journalCols = `step_id, idx, kind, key, event, wake_at, deadline, payload, result, err, done, timed_out`
+const journalCols = `step_id, idx, kind, wkey, event, wake_at, deadline, payload, result, err, done, timed_out`
 
 func scanJournalEntry(row interface{ Scan(...any) error }) (*JournalEntry, error) {
 	var e JournalEntry
@@ -73,7 +73,7 @@ func (s *Store) LoadJournal(ctx context.Context, stepID string) ([]*JournalEntry
 // AppendJournal records a new await entry.
 func (s *Store) AppendJournal(ctx context.Context, e *JournalEntry) error {
 	_, err := s.write.ExecContext(ctx, `INSERT INTO step_journal
-		(step_id, idx, kind, key, event, wake_at, deadline, payload, result, err, done, timed_out)
+		(step_id, idx, kind, wkey, event, wake_at, deadline, payload, result, err, done, timed_out)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.StepID, e.Idx, e.Kind, e.Key, e.Event, e.WakeAt, e.Deadline,
 		e.Payload, e.Result, e.Err, e.Done, e.TimedOut)
@@ -131,7 +131,7 @@ func (s *Store) SuspendWithJournal(ctx context.Context, e *JournalEntry, waitKin
 		return ErrStepNotRunning
 	}
 	if _, err := tx.exec(ctx, `INSERT INTO step_journal
-		(step_id, idx, kind, key, event, wake_at, deadline, payload, result, err, done, timed_out)
+		(step_id, idx, kind, wkey, event, wake_at, deadline, payload, result, err, done, timed_out)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.StepID, e.Idx, e.Kind, e.Key, e.Event, e.WakeAt, e.Deadline,
 		e.Payload, e.Result, e.Err, e.Done, e.TimedOut); err != nil {

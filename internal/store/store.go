@@ -33,6 +33,7 @@ const (
 // Store wraps a database. It is safe for concurrent use.
 type Store struct {
 	be      driver.Backend
+	keyGate string  // backend's per-key concurrency predicate, built once
 	write   *dbConn // all mutations go through here
 	read    *dbConn // introspection queries
 	cleanup func() error
@@ -58,6 +59,7 @@ func Open(cfg driver.Config) (*Store, error) {
 	}
 	s := &Store{
 		be:      be,
+		keyGate: be.KeyGate(),
 		write:   &dbConn{DB: write, be: be},
 		read:    &dbConn{DB: read, be: be},
 		cleanup: cleanup,

@@ -269,18 +269,13 @@ type Claim struct {
 	Resumed bool
 }
 
-// keyGate lets a claim proceed only while fewer than key_limit RUNNING
-// steps share the step's concurrency_key. It appears in both the candidate
-// SELECT (so saturated keys don't crowd the LIMIT with unclaimable rows)
-// and the per-step UPDATE (re-checked there against this transaction's own
-// earlier claims, which is what makes a batch of same-key steps safe).
-// The count is database state, not an in-memory semaphore: parked,
-// cancelled, and interrupted steps free their key automatically.
-const keyGate = `(concurrency_key = '' OR key_limit <= 0 OR
-	(SELECT COUNT(*) FROM steps r
-		WHERE r.concurrency_key = steps.concurrency_key
-		AND r.status = '` + StatusRunning + `') < steps.key_limit)`
-
+// The backend's KeyGate lets a claim proceed only while fewer than key_limit
+// RUNNING steps share the step's concurrency_key. It appears in both the
+// candidate SELECT (so saturated keys don't crowd the LIMIT with unclaimable
+// rows) and the per-step UPDATE (re-checked there against this transaction's
+// own earlier claims, which is what makes a batch of same-key steps safe).
+// The count is database state, not an in-memory semaphore: parked, cancelled,
+// and interrupted steps free their key automatically.
 // QueueClaim is one queue's claim budget for ClaimDueMulti.
 type QueueClaim struct {
 	Name  string
@@ -404,7 +399,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 		WHERE queue = ? AND (
 			(status = ? AND run_at <= ?)
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
-		) AND `+keyGate+`
+		) AND `+s.keyGate+`
 		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
@@ -439,14 +434,14 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+keyGate,
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate,
 				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND `+keyGate,
+				WHERE id = ? AND status = ? AND `+s.keyGate,
 				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {

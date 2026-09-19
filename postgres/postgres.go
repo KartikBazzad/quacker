@@ -53,6 +53,7 @@ func (pgBackend) Migrations() []driver.Migration {
 		{Version: 1, SQL: pgSchema},
 		{Version: 2, SQL: pgMigration2},
 		{Version: 3, SQL: pgMigration3},
+		{Version: 4, SQL: pgMigration4},
 	}
 }
 
@@ -94,6 +95,8 @@ func (pgBackend) SupportsCheckpoint(driver.Config) bool { return false }
 // steal a peer node's in-flight work. The lease reaper recovers a crashed
 // node's steps instead.
 func (pgBackend) RecoverOnBoot(driver.Config) bool { return false }
+
+func (pgBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
 
 // LabelGate: labels are stored as JSON text; cast to jsonb and test subset
 // membership with jsonb_array_elements_text.

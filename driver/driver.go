@@ -110,6 +110,12 @@ type Backend interface {
 	SupportsCheckpoint(cfg Config) bool
 	// RecoverOnBoot reports whether boot-time recovery of RUNNING rows applies.
 	RecoverOnBoot(cfg Config) bool
+	// KeyGate is the per-key concurrency predicate (no placeholders) used on
+	// the claim path: it admits a step only while fewer than key_limit RUNNING
+	// steps share its concurrency_key. SQLite/Postgres use the correlated form
+	// from CorrelatedKeyGate; MySQL must use a derived-table form because it
+	// forbids reading the table being updated in a subquery (error 1093).
+	KeyGate() string
 	// LabelGate is the SQL predicate (containing one '?' for the worker-labels
 	// JSON) admitting a step only when its labels are a subset of the worker's.
 	LabelGate() string
@@ -136,6 +142,27 @@ func RegisterBackend(b Backend) { backends[b.Name()] = b }
 func Lookup(name string) (Backend, bool) {
 	b, ok := backends[name]
 	return b, ok
+}
+
+// CorrelatedKeyGate is the default per-key concurrency predicate. It counts
+// RUNNING siblings of the step with the same concurrency_key, referencing the
+// enclosing statement's steps row. The statement must expose `steps` (the
+// candidate SELECT and the claim UPDATE both do).
+func CorrelatedKeyGate() string {
+	return `(concurrency_key = '' OR key_limit <= 0 OR
+	(SELECT COUNT(*) FROM steps r
+		WHERE r.concurrency_key = steps.concurrency_key
+		AND r.status = 'RUNNING') < steps.key_limit)`
+}
+
+// MigrateLocker is an optional Backend extension for drivers whose migration
+// lock is session-scoped (MySQL's GET_LOCK) rather than transaction-scoped.
+// When a driver implements it, migrate acquires the lock for the whole
+// migration run through LockMigration and calls the returned release once at
+// the end (even on error); MigrateLock is then unused. Drivers that do not
+// implement it keep using the per-transaction MigrateLock.
+type MigrateLocker interface {
+	LockMigration(ctx context.Context, db *sql.DB) (release func(), err error)
 }
 
 // OnConflictUpsert builds an ON CONFLICT (conflictCols) DO UPDATE upsert, the

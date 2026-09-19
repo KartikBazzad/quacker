@@ -133,3 +133,10 @@ ALTER TABLE steps ADD COLUMN lease_expires_at BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_steps_lease  ON steps (status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_steps_worker ON steps (worker_id, status);
 `
+
+// pgMigration4 renames step_journal.key to wkey: KEY is a reserved word in
+// MySQL, and the query layer must reference the column unquoted on every
+// dialect.
+const pgMigration4 = `
+ALTER TABLE step_journal RENAME COLUMN key TO wkey;
+`

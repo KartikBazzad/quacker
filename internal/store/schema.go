@@ -218,6 +218,13 @@ CREATE INDEX IF NOT EXISTS idx_steps_run_status ON steps (run_id, status);
 CREATE INDEX IF NOT EXISTS idx_steps_run_name   ON steps (run_id, name);
 `
 
+// migration 12 renames step_journal.key to wkey: KEY is a reserved word in
+// MySQL, and the query layer must reference the column unquoted on every
+// dialect.
+const migration12 = `
+ALTER TABLE step_journal RENAME COLUMN key TO wkey;
+`
+
 var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -230,6 +237,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 9, SQL: migration9},
 	{Version: 10, SQL: migration10},
 	{Version: 11, SQL: migration11},
+	{Version: 12, SQL: migration12},
 }
 
 // init validates the built-in migration list's invariant before any Open can
@@ -266,6 +274,27 @@ func (s *Store) migrate(ctx context.Context) error {
 	if max := ms[len(ms)-1].Version; version > max {
 		return fmt.Errorf("quacker: database schema version %d is newer than this build supports (max %d)", version, max)
 	}
+	if version >= ms[len(ms)-1].Version {
+		return nil
+	}
+	// A session-scoped lock (MySQL) covers the whole run; otherwise each
+	// per-version transaction takes its own lock (Postgres advisory, SQLite
+	// no-op).
+	var release func()
+	sessionLocked := false
+	if ml, ok := s.be.(driver.MigrateLocker); ok {
+		rel, err := ml.LockMigration(ctx, s.write.DB)
+		if err != nil {
+			return fmt.Errorf("quacker: migrate lock: %w", err)
+		}
+		release = rel
+		sessionLocked = true
+		defer func() {
+			if release != nil {
+				release()
+			}
+		}()
+	}
 	for _, m := range ms {
 		if m.Version <= version {
 			continue
@@ -276,9 +305,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		// Serialize concurrent migrations across processes (no-op for SQLite)
 		// so two nodes booting at once can't race DDL.
-		if err := s.be.MigrateLock(ctx, tx.Tx); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("quacker: migrate lock: %w", err)
+		if !sessionLocked {
+			if err := s.be.MigrateLock(ctx, tx.Tx); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("quacker: migrate lock: %w", err)
+			}
 		}
 		for _, stmt := range splitStatements(m.SQL) {
 			if _, err := tx.exec(ctx, stmt); err != nil {

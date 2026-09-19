@@ -42,6 +42,8 @@ func (sqliteBackend) SupportsCheckpoint(cfg driver.Config) bool { return cfg.Mod
 
 func (sqliteBackend) RecoverOnBoot(cfg driver.Config) bool { return cfg.Mode == driver.ModeFile }
 
+func (sqliteBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
+
 func (sqliteBackend) LabelGate() string {
 	return `NOT EXISTS (
 	SELECT 1 FROM json_each(steps.labels) AS l
