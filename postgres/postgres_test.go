@@ -91,6 +91,51 @@ func TestPostgresMigrationsIdempotent(t *testing.T) {
 	}
 }
 
+// TestPostgresWithDB: a caller-owned pool is reused, migrated, and left open
+// (and usable) after the engine closes.
+func TestPostgresWithDB(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	ctx := context.Background()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(4)
+
+	q, err := quacker.Open(
+		quacker.WithStorage(quacker.PostgresWithDB(db)),
+		quacker.WithPollInterval(5*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := quacker.NewTask("pg.reuse", func(ctx context.Context, in string) (string, error) {
+		return "hi " + in, nil
+	})
+	h, err := quacker.Enqueue(ctx, q, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Result(ctx); err != nil || out != "hi x" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	if err := q.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pool outlives the engine: still alive and holding the run.
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("external pool closed by quacker: %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM runs`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("runs=%d err=%v", n, err)
+	}
+}
+
 // TestPostgresTaskAndWorkflow: basic run lifecycle plus a DAG with DepOutput.
 func TestPostgresTaskAndWorkflow(t *testing.T) {
 	dsn := testDSN(t)

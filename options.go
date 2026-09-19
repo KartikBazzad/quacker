@@ -1,6 +1,7 @@
 package quacker
 
 import (
+	"database/sql"
 	"log/slog"
 	"time"
 
@@ -16,6 +17,7 @@ type Storage struct {
 	mode    store.Mode
 	path    string
 	dsn     string
+	db      *sql.DB
 	recover bool
 }
 
@@ -45,6 +47,19 @@ func File(path string) Storage { return Storage{mode: store.ModeFile, path: path
 // owns the database; multi-instance leases are a later phase.
 func Postgres(dsn string) Storage {
 	return Storage{mode: store.ModePostgres, dsn: dsn, recover: true}
+}
+
+// PostgresWithDB persists state to an existing database/sql pool that the
+// caller owns instead of one quacker dials from a DSN. Open it with the pgx
+// stdlib driver, e.g.:
+//
+//	db, _ := sql.Open("pgx", dsn)
+//	q, _ := quacker.Open(quacker.WithStorage(quacker.PostgresWithDB(db)))
+//
+// quacker runs its migrations on the pool but never closes it, so the caller
+// keeps using it after q.Close. Pool sizing and lifetime stay the caller's.
+func PostgresWithDB(db *sql.DB) Storage {
+	return Storage{mode: store.ModePostgres, db: db, recover: true}
 }
 
 // RecoverRunningOnBoot configures startup recovery for File storage: when
@@ -87,7 +102,7 @@ type Option func(*config)
 // WithStorage selects the storage backend (default Ephemeral).
 func WithStorage(s Storage) Option {
 	return func(c *config) {
-		c.storage = store.Config{Mode: s.mode, Path: s.path, DSN: s.dsn, RecoverRunningOnBoot: s.recover}
+		c.storage = store.Config{Mode: s.mode, Path: s.path, DSN: s.dsn, DB: s.db, RecoverRunningOnBoot: s.recover}
 	}
 }
 

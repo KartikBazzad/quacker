@@ -249,7 +249,7 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v1.1 - Database Support (✅ DONE — optional `WithDB` remains)
+## v1.1 - Database Support (✅ DONE)
 
 - ✅ **PostgreSQL backend**: a dialect seam in `internal/store` (backend
   registry, `?`→`$n` rebind, per-dialect migrations and DDL) plus a `postgres/`
@@ -266,10 +266,12 @@ Children are ordinary runs and are aged/purged independently.
   `CompleteStep`/`FinalFailStep`/`CancelRun` take `SELECT … FOR UPDATE` on the
   run; and crons fire once per occurrence via a `next_at` CAS fused with the
   enqueue. A two-engine Postgres test shares one database in CI.
-- **Reuse existing connection**: `WithDB(*sql.DB)` to hand quacker a pool it
-  does not own. (Optional; the storage constructor already covers most cases.)
+- ✅ **Reuse existing connection**: `PostgresWithDB(*sql.DB)` hands quacker a
+  pool it does not own. It runs migrations on the pool but never closes it, so
+  the caller's pool outlives `Close`. SQLite rejects it (its single-writer +
+  reader pool layout is not a caller-owned shape).
 
-## v1.2 - Performance Optimizations (✅ DONE — optional `WithDB` remains)
+## v1.2 - Performance Optimizations (✅ DONE)
 
 - ✅ **DAG completion without full step scans.** `CompleteStep` now reads only
   the direct dependents of the step that finished and their dependencies'
@@ -280,7 +282,7 @@ Children are ordinary runs and are aged/purged independently.
 - ✅ **Wide-DAG benchmark** (`BenchmarkWideDAGComplete`).
 - ✅ **Horizontal scaling** via the Postgres multi-instance work (v1.1);
   optional cross-node `LISTEN/NOTIFY` wakeups remain a follow-up.
-- Optional: `WithDB(*sql.DB)` connection reuse (the last v1.1 item).
+- ✅ `PostgresWithDB(*sql.DB)` connection reuse (the last v1.1 item).
 
 
 ## v1.3 - Advanced Features (✅ DONE)
@@ -326,6 +328,6 @@ in-process plugins are trusted code; no sandboxing.
    external-event ingestion would change the schema — flag it before it lands.
 3. **Multi-instance**: shipped — dialect seam, worker leases (heartbeat +
    reaper), claim/run locks, and cron single-fire. Optional follow-ups:
-   `LISTEN/NOTIFY` wakeups and `WithDB` connection reuse.
+   `LISTEN/NOTIFY` wakeups remain (`WithDB` connection reuse shipped).
 4. **License/tags**: MIT is in place (v0.2 P2); semver tags are pending a git
    remote.

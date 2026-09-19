@@ -111,8 +111,17 @@ func (pgBackend) BlockedDependentsSQL() string {
 }
 
 func (pgBackend) OpenPools(ctx context.Context, cfg store.Config) (w, r *sql.DB, cleanup func() error, err error) {
+	// Reuse a caller-owned pool: Postgres uses one pool for both reads and
+	// writes, so it can be shared directly. Migrations still run against it,
+	// but cleanup must leave it open for the caller.
+	if cfg.DB != nil {
+		if err := cfg.DB.PingContext(ctx); err != nil {
+			return nil, nil, nil, fmt.Errorf("quacker: external postgres pool: %w", err)
+		}
+		return cfg.DB, cfg.DB, nil, nil
+	}
 	if cfg.DSN == "" {
-		return nil, nil, nil, fmt.Errorf("quacker: storage.Postgres requires a DSN")
+		return nil, nil, nil, fmt.Errorf("quacker: storage.Postgres requires a DSN or an *sql.DB")
 	}
 	db, err := sql.Open("pgx", cfg.DSN)
 	if err != nil {

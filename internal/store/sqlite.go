@@ -122,6 +122,9 @@ func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
 // for ModeMemory — a keeper connection that keeps the shared-cache database
 // alive. For ModeFile it takes the kernel file lock first.
 func (b sqliteBackend) OpenPools(ctx context.Context, cfg Config) (w, r *sql.DB, cleanup func() error, err error) {
+	if cfg.DB != nil {
+		return nil, nil, nil, fmt.Errorf("quacker: SQLite storage does not accept an external *sql.DB; use File or Memory")
+	}
 	wdsn, rdsn, tmpPath, derr := cfg.dsn()
 	if derr != nil {
 		return nil, nil, nil, derr

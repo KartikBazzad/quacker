@@ -14,6 +14,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,11 @@ type Config struct {
 	Path string
 	// DSN is the connection string for ModePostgres, ignored otherwise.
 	DSN string
+	// DB, when non-nil, is an existing pool owned by the caller. Dialects with
+	// a single-pool model (Postgres) reuse it instead of dialing DSN, and
+	// cleanup must leave it open. Dialects that require their own pool layout
+	// (SQLite's single writer + reader pool) reject it.
+	DB *sql.DB
 	// RecoverRunningOnBoot (persistent modes only): when true, runs left
 	// RUNNING or INTERRUPTED by a previous process are re-queued on Open; when
 	// false they are marked FAILED. Default true. In a multi-instance Postgres
