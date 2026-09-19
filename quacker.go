@@ -49,6 +49,7 @@ func Open(opts ...Option) (*Quacker, error) {
 	eopts := engine.Options{
 		Store: st, Log: cfg.logger, PollInterval: cfg.poll,
 		Middleware:      cfg.middleware,
+		WorkerLabels:    cfg.workerLabels,
 		LogStorage:      cfg.logStorage,
 		MetricsInterval: cfg.metricsInterval,
 		Retention:       cfg.retention,

@@ -89,7 +89,7 @@ steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
       run_at, created_at, started_at, completed_at,
       concurrency_key, key_limit, claimed_at,
-      resume_at, wait_kind, wait_event)
+      resume_at, wait_kind, wait_event, labels)
 step_journal(step_id→steps, idx, kind, key, event, wake_at, deadline,
              payload, result, err, done, timed_out, PK(step_id, idx))
 crons(id, name UNIQUE, spec, task, input, next_at, created_at)
@@ -110,7 +110,8 @@ adds the durable-execution columns on `steps` and the `step_journal` table
 (entries cascade with their step); migration 6 adds `runs.parent_id` +
 `idx_runs_parent` for child-run lineage (no foreign key — a purged parent may
 leave a dangling id); migration 7 rewrites `steps.depends_on` from
-comma-joined text to a JSON array.
+comma-joined text to a JSON array; migration 8 adds `steps.labels` (JSON
+array) for worker-label routing.
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -164,9 +165,11 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
    extra gates apply inside the same transaction — a
    **per-key gate** (`RUNNING` count sharing the step's `concurrency_key`
    must be below `key_limit`, re-checked per UPDATE so a batch of same-key
-   candidates can't over-claim) and a **rate gate** (when the queue has a
-   rate limit, the batch is capped at the sliding window's remaining budget,
-   counted over `claimed_at`). Saturated steps simply stay QUEUED. Claims
+   candidates can't over-claim), a **rate gate** (when the queue has a rate
+   limit, the batch is capped at the sliding window's remaining budget,
+   counted over `claimed_at`), and a **label gate** (a step is claimable only
+   when its `labels` are a subset of the engine's worker labels, checked with
+   a `json_each` subquery). Saturated steps simply stay QUEUED. Claims
    are issued only by the single scheduler goroutine, so there is no
    cross-goroutine double-claim to defend against; the guarded UPDATE is
    belt-and-braces.
@@ -297,7 +300,7 @@ does not fail the parent. See DESIGN_NOTES §22.
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
   XML-escaping, debug-log capture/close, recovery of suspended steps,
-  batch enqueue and multi-queue claim).
+  batch enqueue, multi-queue claim, and worker-label routing).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

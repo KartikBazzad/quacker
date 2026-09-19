@@ -191,6 +191,13 @@ UPDATE steps SET depends_on = CASE
 END;
 `
 
+// migration 8 adds worker-label routing: a step carries a JSON array of
+// required labels, and an engine only claims a step whose labels are a subset
+// of its own worker labels.
+const migration8 = `
+ALTER TABLE steps ADD COLUMN labels TEXT NOT NULL DEFAULT '[]';
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
@@ -199,6 +206,7 @@ var migrations = []migration{
 	{version: 5, sql: migration5},
 	{version: 6, sql: migration6},
 	{version: 7, sql: migration7},
+	{version: 8, sql: migration8},
 }
 
 // init validates the migration list's invariant before any Open can rely

@@ -39,11 +39,11 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 		}
 		for _, st := range steps[i] {
 			_, err := tx.ExecContext(ctx, `INSERT INTO steps
-				(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit)
-				VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?)`,
-				st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, joinDeps(st.DependsOn), st.Queue, st.Priority,
+				(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels)
+				VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?)`,
+				st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
 				st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
-				st.ConcurrencyKey, st.KeyLimit)
+				st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels))
 			if err != nil {
 				return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
 			}
@@ -267,6 +267,16 @@ const keyGate = `(concurrency_key = '' OR key_limit <= 0 OR
 		WHERE r.concurrency_key = steps.concurrency_key
 		AND r.status = '` + StatusRunning + `') < steps.key_limit)`
 
+// labelGate lets a claim proceed only when every label the step requires is
+// in the engine's worker-label set, passed as a JSON array. A step with no
+// labels is claimable by any engine; a step with labels is claimable only by
+// an engine whose set is a superset. An empty worker set therefore matches
+// only unlabeled steps.
+const labelGate = `NOT EXISTS (
+	SELECT 1 FROM json_each(steps.labels) AS l
+	WHERE l.value NOT IN (SELECT value FROM json_each(?))
+)`
+
 // QueueClaim is one queue's claim budget for ClaimDueMulti.
 type QueueClaim struct {
 	Name  string
@@ -279,10 +289,10 @@ type QueueClaim struct {
 
 // ClaimDue claims up to limit due steps for one queue, moving them and their
 // parent runs to RUNNING. It is ClaimDueMulti with a single queue.
-func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64) ([]*Claim, error) {
+func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64, workerLabels []string) ([]*Claim, error) {
 	return s.ClaimDueMulti(ctx, []QueueClaim{{
 		Name: queue, Limit: limit, RateLimit: rateLimit, RateWindow: rateWindow,
-	}}, now)
+	}}, now, workerLabels)
 }
 
 // ClaimDueMulti claims due steps across several queues in one write
@@ -291,16 +301,17 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 // plus the guarded UPDATE are unchanged. Safe under concurrency: the single
 // writer connection serializes the whole batch, and each step UPDATE is
 // re-guarded on its still being claimable.
-func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64) ([]*Claim, error) {
+func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64, workerLabels []string) ([]*Claim, error) {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
+	workerJSON := encodeList(workerLabels)
 	var claims []*Claim
 	for _, q := range queues {
-		cs, err := s.claimQueueTx(ctx, tx, q, now)
+		cs, err := s.claimQueueTx(ctx, tx, q, now, workerJSON)
 		if err != nil {
 			return nil, err
 		}
@@ -353,7 +364,7 @@ func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int6
 // claimed_at), so the limit is capped at the window's remaining budget. The
 // count is persisted, so the window survives a File-mode restart instead of
 // allowing a fresh-process burst.
-func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now int64) ([]*Claim, error) {
+func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now int64, workerLabelsJSON string) ([]*Claim, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		return nil, nil
@@ -384,8 +395,9 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now 
 			(status = ? AND run_at <= ?)
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
 		) AND `+keyGate+`
+		AND `+labelGate+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
-		q.Name, StatusQueued, now, StatusSuspended, now, limit)
+		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
 	if err != nil {
 		return nil, err
 	}

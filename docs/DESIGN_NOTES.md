@@ -466,6 +466,27 @@ serialize and per-op latency rises with `-cpu` (see BENCHMARKS.md). Batching
 is the lever — amortize N runs over one commit rather than pretending the
 writer parallelizes.
 
+### 27. Worker labels are a subset gate on the claim, not a queue per worker
+
+A task can require labels (`WithLabels("gpu")`) and an engine advertises a set
+(`WithWorkerLabels("gpu","linux")`); the scheduler claims a step only when the
+step's labels are a subset of the engine's. Two consequences are deliberate:
+
+- **Subset, not equality.** An engine with extra labels still runs a task that
+  needs fewer, so a beefier worker isn't wasted. A task with no labels is
+  universal; an engine with no labels runs only unlabeled tasks (the safe
+  default — an untagged worker doesn't accidentally pick up specialized work).
+- **One column, not a queue matrix.** Encoding routing as a queue per
+  worker-class would blow up combinatorially and lose the "any worker that
+  can" semantics. Storing labels as a JSON array on the step and testing
+  membership with a `json_each` subquery in the claim SELECT keeps it to one
+  predicate, evaluated inside the same transaction as the other gates.
+
+This is the in-process half of routing. Cross-process routing (the Postgres
+epic) reuses the same predicate — each node's claim is filtered by its own
+label set — but additionally needs worker identity and leases so a node that
+dies mid-step doesn't strand it.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

@@ -78,6 +78,9 @@ type Step struct {
 	// WaitEvent is the awaited event name for a wait.
 	WaitKind  string
 	WaitEvent string
+	// Labels are the worker labels a step requires; an engine claims it only
+	// when its own worker labels are a superset. Empty means any engine.
+	Labels []string
 }
 
 // Cron is a row in the crons table.
@@ -116,23 +119,25 @@ type EventSub struct {
 
 func nowUnix() int64 { return time.Now().UnixNano() }
 
-// joinDeps encodes step dependencies for the steps.depends_on column, which
-// holds a JSON array (["a","b"]) rather than a delimited string: a step name
-// containing any delimiter cannot corrupt the list.
-func joinDeps(deps []string) string {
-	if len(deps) == 0 {
+// encodeList encodes a string slice for a TEXT column as a JSON array
+// (["a","b"]) rather than a delimited string: a value containing any
+// delimiter cannot corrupt the list. Used for steps.depends_on and
+// steps.labels.
+func encodeList(xs []string) string {
+	if len(xs) == 0 {
 		return "[]"
 	}
-	b, err := json.Marshal(deps)
+	b, err := json.Marshal(xs)
 	if err != nil {
 		return "[]"
 	}
 	return string(b)
 }
 
-// splitDeps decodes steps.depends_on. It still tolerates the legacy
-// comma-joined form as a safety net for databases written before migration 7.
-func splitDeps(s string) []string {
+// decodeList decodes a JSON-array column. It still tolerates the legacy
+// comma-joined form for depends_on as a safety net for databases written
+// before migration 7.
+func decodeList(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "[]" || s == "null" {
 		return nil
@@ -158,7 +163,7 @@ const runCols = `id, workflow, kind, status, queue, priority, input, output, err
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
-	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event`
+	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event, labels`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
@@ -173,15 +178,16 @@ func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 
 func scanStep(row interface{ Scan(...any) error }) (*Step, error) {
 	var s Step
-	var deps string
+	var deps, labels string
 	err := row.Scan(&s.ID, &s.RunID, &s.Name, &s.Task, &s.Ord, &s.Status, &deps, &s.Queue, &s.Priority,
 		&s.Input, &s.Output, &s.Error, &s.Attempts, &s.MaxAttempts, &s.Timeout,
 		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt,
 		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt,
-		&s.ResumeAt, &s.WaitKind, &s.WaitEvent)
+		&s.ResumeAt, &s.WaitKind, &s.WaitEvent, &labels)
 	if err != nil {
 		return nil, err
 	}
-	s.DependsOn = splitDeps(deps)
+	s.DependsOn = decodeList(deps)
+	s.Labels = decodeList(labels)
 	return &s, nil
 }

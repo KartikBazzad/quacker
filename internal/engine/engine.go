@@ -55,6 +55,9 @@ type TaskDef struct {
 	// Wrappers are per-task middlewares, applied inside the engine's global
 	// middleware chain.
 	Wrappers []Middleware
+	// Labels are required worker labels: only an engine whose WorkerLabels are
+	// a superset claims this task's steps. Empty means any engine.
+	Labels []string
 	// KeyFn extracts a concurrency key from the step input; steps sharing
 	// a key are capped at KeyLimit concurrent executions across all queues.
 	// nil means unkeyed.
@@ -147,6 +150,9 @@ type Engine struct {
 	eventSubs    map[string][]*eventSub
 	pendingSubs  map[string][]*eventSub
 	middleware   []Middleware
+	// workerLabels is this engine's label set; it only claims steps whose
+	// required labels are a subset. Empty claims only unlabeled steps.
+	workerLabels []string
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -198,6 +204,9 @@ type Options struct {
 	// Middleware is the engine-wide middleware chain, applied outside every
 	// task's own Wrappers.
 	Middleware []Middleware
+	// WorkerLabels is this engine's label set; it claims only steps whose
+	// task labels are a subset. Empty claims only unlabeled steps.
+	WorkerLabels []string
 	// LogSink is the base task-log destination. When nil and LogStorage is
 	// off, task logs go to the engine logger; when nil and LogStorage is on,
 	// they persist to SQLite only.
@@ -249,6 +258,7 @@ func New(o Options) (*Engine, error) {
 		wake:         make(chan struct{}, 1),
 
 		middleware:      append([]Middleware(nil), o.Middleware...),
+		workerLabels:    append([]string(nil), o.WorkerLabels...),
 		onMetrics:       o.OnMetrics,
 		metricsInterval: o.MetricsInterval,
 		retention:       o.Retention,
@@ -601,7 +611,7 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 			Status: status, DependsOn: sr.Deps, Queue: stepQueue, Priority: req.Priority,
 			Input: req.Input, MaxAttempts: int64(maxAtt), Timeout: def.Timeout,
 			RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
-			ConcurrencyKey: key, KeyLimit: keyLimit,
+			ConcurrencyKey: key, KeyLimit: keyLimit, Labels: def.Labels,
 		})
 	}
 	// run-level max attempts mirrors the first step for introspection.
@@ -697,7 +707,7 @@ func (e *Engine) tick() {
 	if len(reqs) == 0 {
 		return
 	}
-	claims, err := e.st.ClaimDueMulti(e.ctx, reqs, now)
+	claims, err := e.st.ClaimDueMulti(e.ctx, reqs, now, e.workerLabels)
 	if err != nil {
 		if e.ctx.Err() == nil {
 			e.log.Error("quacker: claim failed", "err", err)

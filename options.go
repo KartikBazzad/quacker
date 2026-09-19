@@ -48,6 +48,7 @@ type config struct {
 	poll               time.Duration
 	logger             *slog.Logger
 	middleware         []engine.Middleware
+	workerLabels       []string
 	logSink            func(LogEntry)
 	logStorage         bool
 	metricsFn          func(*Metrics)
@@ -120,6 +121,14 @@ func WithLogger(l *slog.Logger) Option {
 // task's own Wrap middleware. The first registered is outermost.
 func WithMiddleware(mw ...Middleware) Option {
 	return func(c *config) { c.middleware = append(c.middleware, mw...) }
+}
+
+// WithWorkerLabels declares this engine's worker labels. It claims a task's
+// steps only when their WithLabels set is a subset of these; an engine with
+// no labels claims only unlabeled tasks. Use it to route work to the workers
+// that can run it (e.g. "gpu", "linux").
+func WithWorkerLabels(labels ...string) Option {
+	return func(c *config) { c.workerLabels = append(c.workerLabels, labels...) }
 }
 
 // WithTaskLogSink sets the base destination for task log lines, replacing

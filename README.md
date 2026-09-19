@@ -40,6 +40,8 @@ is the wrong amount of infrastructure.
 - **Retries** — attempt counts, exponential/constant backoff with jitter
 - **Timeouts** — per-attempt, via `context`
 - **Queues** — named queues with independent concurrency limits and priorities
+- **Worker labels** — `WithLabels` on a task and `WithWorkerLabels` on an
+  engine route work to the workers that can run it
 - **Per-key concurrency** — `WithKey` serializes (or caps at N) runs sharing
   a key, enforced by counting RUNNING rows at claim time
 - **Rate limiting** — `WithRate(queue, n, per)` caps starts per sliding
@@ -179,6 +181,23 @@ q.SetRateLimit("emails", 100, time.Minute) // adjustable at runtime
 A due step whose key is saturated — or whose queue's window is full — stays
 `QUEUED` until a slot opens; nothing is rejected or dropped. Keys are visible
 in `Execution` snapshots (`Key` on the run and each step).
+
+## Worker labels
+
+```go
+// This task must run on a worker that advertises "gpu":
+train := quacker.NewTask("train-model", fn, quacker.WithLabels("gpu"))
+
+// An engine claims it only if its worker labels are a superset:
+q, _ := quacker.Open(quacker.WithWorkerLabels("gpu", "linux"))
+```
+
+Routing is a subset check: an engine with *extra* labels can still run a task
+that needs fewer. A task with no labels runs on any engine; an engine with no
+labels claims only unlabeled tasks. Runs whose labels no engine advertises
+simply stay `QUEUED` (visible in `Execution`, with `Labels` on the step) until
+a matching worker is opened. Labels are per task and compared at claim time —
+no separate routing table to configure.
 
 ## Middleware
 
@@ -431,8 +450,9 @@ the range. For a lossless-per-subscriber status stream use `Subscribe`.
 ## Not yet
 
 Distributed workers across processes (the Postgres/multi-instance epic),
-strict (ordered) per-key concurrency, worker labels/affinity, a web UI, and
-OpenTelemetry.
+strict (ordered) per-key concurrency, a web UI, and OpenTelemetry. Worker
+label routing is available within a process and is the building block for
+cross-process routing.
 
 ## Documentation
 

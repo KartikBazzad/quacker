@@ -34,6 +34,7 @@ type taskConfig struct {
 	keyFn       func(json.RawMessage) string
 	keyLimit    int
 	wrap        []engine.Middleware
+	labels      []string
 }
 
 // Retries sets how many times a failed attempt is retried (maxAttempts =
@@ -95,6 +96,14 @@ func Wrap(mw ...Middleware) TaskOption {
 	return func(c *taskConfig) { c.wrap = append(c.wrap, mw...) }
 }
 
+// WithLabels requires worker labels for this task: only an engine opened with
+// WithWorkerLabels covering all of them claims its steps (labels are a
+// subset — an engine with extra labels may still run it). Without a matching
+// engine the runs stay QUEUED. No labels means any engine.
+func WithLabels(labels ...string) TaskOption {
+	return func(c *taskConfig) { c.labels = append(c.labels, labels...) }
+}
+
 // Task is a named, typed unit of work. Create with NewTask; the same value
 // is used to enqueue runs, register for restart recovery, and attach crons.
 type Task[I, O any] struct {
@@ -146,5 +155,6 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	def.KeyFn = t.cfg.keyFn
 	def.KeyLimit = t.cfg.keyLimit
 	def.Wrappers = t.cfg.wrap
+	def.Labels = t.cfg.labels
 	return def
 }

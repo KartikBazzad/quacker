@@ -1,9 +1,8 @@
 # Roadmap
 
-Status: **v0.3 shipped** — durable execution (slices A/B/C: substrate +
-durable sleep, durable event waits, child runs), the DAG visualizer, the
-embedded debug logger, and the perf pass are all done. Next: worker labels,
-OTel, and the Postgres/multi-instance epic.
+Status: **v0.4 in progress** — v0.3 is shipped (durable execution, DAG
+visualizer, debug logger, perf). Worker labels are done; OTel and the
+Postgres/multi-instance epic remain.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -207,6 +206,22 @@ Children are ordinary runs and are aged/purged independently.
   (was one per queue); parallel `-cpu` benchmarks added. Measured roughly
   ~58µs/run batched vs per-call enqueue, and the single-writer contention
   curve is visible with `-cpu 1,4,10` (see BENCHMARKS.md).
+
+---
+
+## v0.4 — routing & observability (in progress)
+
+- ✅ **Worker labels**: `quacker.WithLabels(...)` on a task and
+  `WithWorkerLabels(...)` on an engine; the scheduler claims a step only when
+  its labels are a subset of the engine's. Migration v8 adds `steps.labels`,
+  and `ClaimDueMulti` adds a `json_each` subset gate to the claim SELECT.
+  Routes work to capable workers in-process and is the building block for
+  cross-process routing.
+- **OTel**: optional spans for enqueue/execute/emit (API-only dependency;
+  the user supplies the provider).
+- **Postgres / multi-instance**: abstract the store, add worker identity and
+  step leases (boot recovery currently re-queues RUNNING rows, safe for one
+  process only), and cross-node wakeups.
 
 ---
 

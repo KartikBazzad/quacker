@@ -63,6 +63,8 @@ type StepState struct {
 	// claimable again (zero for event-only waits).
 	WaitEvent string    `json:"wait_event,omitempty"`
 	ResumeAt  time.Time `json:"resume_at,omitempty"`
+	// Labels are the worker labels the step requires (empty = any engine).
+	Labels []string `json:"labels,omitempty"`
 }
 
 // Execution is a consistent point-in-time view of a run. Reads never pause
@@ -191,7 +193,7 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 			Input: s.Input, Output: s.Output, Error: s.Error,
 			RunAt: unixToTime(s.RunAt), CreatedAt: unixToTime(s.CreatedAt),
 			StartedAt: unixToTime(s.StartedAt), CompletedAt: unixToTime(s.CompletedAt),
-			WaitEvent: s.WaitEvent, ResumeAt: unixToTime(s.ResumeAt),
+			WaitEvent: s.WaitEvent, ResumeAt: unixToTime(s.ResumeAt), Labels: s.Labels,
 		})
 	}
 	if children, cerr := q.st.ListChildren(ctx, runID); cerr == nil {
