@@ -31,6 +31,9 @@ func TestSleepDurableResumes(t *testing.T) {
 		}
 		return greetOut{Greeting: "woke"}, nil
 	})
+	// Measure from enqueue: the sleep begins when the task first runs, so
+	// timing from after waitSuspended would miss the part already elapsed.
+	start := time.Now()
 	h, err := Enqueue(context.Background(), q, task, greetIn{})
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +44,6 @@ func TestSleepDurableResumes(t *testing.T) {
 		t.Fatal("suspended step has no ResumeAt")
 	}
 
-	start := time.Now()
 	out, err := h.Result(context.Background())
 	if err != nil {
 		t.Fatal(err)
