@@ -36,7 +36,7 @@ func main() {
 		return "email for " + o.ID + ": " + ship.Tracking, nil
 	})
 
-	wf := quacker.NewWorkflow[Order]("fulfill",
+	wf := quacker.NewWorkflow("fulfill",
 		quacker.Step("charge", charge),
 		quacker.Step("ship", ship, "charge"),             // after charge
 		quacker.Step("notify", notify, "charge", "ship"), // after both

@@ -86,6 +86,21 @@ type LogEntry struct {
 	Message string
 }
 
+// Event is a persisted in-process event (a best-effort audit of emits).
+type Event struct {
+	Seq       int64
+	Name      string
+	Payload   []byte
+	CreatedAt int64
+}
+
+// EventSub binds an event name to a task that is enqueued on every emit.
+type EventSub struct {
+	Event     string
+	Task      string
+	CreatedAt int64
+}
+
 func nowUnix() int64 { return time.Now().UnixNano() }
 
 func joinDeps(deps []string) string { return strings.Join(deps, ",") }

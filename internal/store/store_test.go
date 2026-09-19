@@ -164,6 +164,25 @@ func TestMigrationV3Index(t *testing.T) {
 	}
 }
 
+// TestMigrationV4Tables: migration 4 creates the events tables.
+func TestMigrationV4Tables(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, name := range []string{"events", "event_subscriptions"} {
+		var n int
+		if err := s.Read().QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("table %s count = %d, want 1", name, n)
+		}
+	}
+}
+
 // TestPurgeRejectsBadOptions: a non-terminal status or a zero cutoff is
 // refused, so a purge can never touch live work by accident.
 func TestPurgeRejectsBadOptions(t *testing.T) {

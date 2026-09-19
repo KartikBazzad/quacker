@@ -604,7 +604,6 @@ func TestCron(t *testing.T) {
 		fires.Add(1)
 		return greetOut{}, nil
 	})
-	// Note: "@every" intervals are rounded up to 1s by the cron parser.
 	if err := Cron(q, "tick", "@every 1s", task, greetIn{}); err != nil {
 		t.Fatal(err)
 	}

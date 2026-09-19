@@ -125,10 +125,30 @@ const migration3 = `
 CREATE INDEX IF NOT EXISTS idx_runs_purge ON runs (status, completed_at);
 `
 
+// migration 4 adds in-process events and their event→task bindings.
+const migration4 = `
+CREATE TABLE IF NOT EXISTS events (
+	seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+	name       TEXT NOT NULL,
+	payload    BLOB,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_name ON events (name, seq);
+
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+	id         TEXT PRIMARY KEY,
+	event      TEXT NOT NULL,
+	task       TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	UNIQUE(event, task)
+);
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
 	{version: 3, sql: migration3},
+	{version: 4, sql: migration4},
 }
 
 // init validates the migration list's invariant before any Open can rely

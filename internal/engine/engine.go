@@ -103,11 +103,21 @@ type queueState struct {
 }
 
 type cronEntry struct {
+	name  string
 	spec  string
 	task  string
 	sched cronSchedule
 	input json.RawMessage
 	next  time.Time
+}
+
+// eventSub is one event→task binding. A subscription is armed (in
+// e.eventSubs) once its task has a registered definition; until then it sits
+// in e.pendingSubs keyed by task name.
+type eventSub struct {
+	event string
+	task  string
+	def   *TaskDef
 }
 
 // Engine executes runs against a store.
@@ -121,13 +131,19 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu         sync.RWMutex
-	queues     map[string]*queueState
-	tasks      map[string]*TaskDef
-	crons      map[string]*cronEntry
-	waiters    map[string]*Waiter
-	cancels    map[string]context.CancelFunc
-	middleware []Middleware
+	mu      sync.RWMutex
+	queues  map[string]*queueState
+	tasks   map[string]*TaskDef
+	crons   map[string]*cronEntry
+	waiters map[string]*Waiter
+	cancels map[string]context.CancelFunc
+	// pendingCrons holds crons loaded from the store at Start whose target
+	// task is not registered yet; they arm in RegisterTask. pendingSubs does
+	// the same for event subscriptions, keyed by task name.
+	pendingCrons map[string]*cronEntry
+	eventSubs    map[string][]*eventSub
+	pendingSubs  map[string][]*eventSub
+	middleware   []Middleware
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -205,20 +221,23 @@ func New(o Options) (*Engine, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		st:        o.Store,
-		bus:       o.Bus,
-		log:       o.Log,
-		poll:      o.PollInterval,
-		now:       o.Now,
-		ctx:       ctx,
-		cancel:    cancel,
-		queues:    map[string]*queueState{},
-		tasks:     map[string]*TaskDef{},
-		crons:     map[string]*cronEntry{},
-		waiters:   map[string]*Waiter{},
-		cancels:   map[string]context.CancelFunc{},
-		haltSteps: map[string]struct{}{},
-		wake:      make(chan struct{}, 1),
+		st:           o.Store,
+		bus:          o.Bus,
+		log:          o.Log,
+		poll:         o.PollInterval,
+		now:          o.Now,
+		ctx:          ctx,
+		cancel:       cancel,
+		queues:       map[string]*queueState{},
+		tasks:        map[string]*TaskDef{},
+		crons:        map[string]*cronEntry{},
+		pendingCrons: map[string]*cronEntry{},
+		eventSubs:    map[string][]*eventSub{},
+		pendingSubs:  map[string][]*eventSub{},
+		waiters:      map[string]*Waiter{},
+		cancels:      map[string]context.CancelFunc{},
+		haltSteps:    map[string]struct{}{},
+		wake:         make(chan struct{}, 1),
 
 		middleware:      append([]Middleware(nil), o.Middleware...),
 		onMetrics:       o.OnMetrics,
@@ -249,8 +268,13 @@ func New(o Options) (*Engine, error) {
 
 // Start launches the scheduler, cron, and log-flush loops. Queues that exist
 // in the store (e.g. recovered runs after a restart) are registered with
-// default concurrency unless already configured.
+// default concurrency unless already configured. Persisted crons and event
+// subscriptions are loaded into their pending maps; each arms when its target
+// task is later registered, so a File-mode app only needs Register (not a
+// re-Cron/re-On) at startup.
 func (e *Engine) Start() {
+	e.loadPersistedCrons()
+	e.loadPersistedSubs()
 	if queues, err := e.st.KnownQueues(context.Background()); err == nil {
 		for _, q := range queues {
 			e.ensureQueue(q)
@@ -376,11 +400,16 @@ func normQueue(q string) string {
 
 // RegisterTask makes a task executable by name. Registration is idempotent;
 // it overwrites any previous definition. The def is stored as-is (never
-// mutated) so concurrent enqueues of the same task are race-free.
+// mutated) so concurrent enqueues of the same task are race-free. Registering
+// a task also arms any persisted crons and event subscriptions that target it.
 func (e *Engine) RegisterTask(def *TaskDef) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.tasks[def.Name] = def
+	crons := e.takePendingCronsLocked(def.Name)
+	subs := e.takePendingSubsLocked(def.Name)
+	e.mu.Unlock()
+	e.persistArmedCrons(crons)
+	e.logArmedTriggers(def.Name, len(crons), len(subs))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,9 +495,7 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 		if def == nil {
 			return nil, fmt.Errorf("quacker: step %q has no task definition", sr.Name)
 		}
-		e.mu.Lock()
-		e.tasks[def.Name] = def // latest definition wins, like RegisterTask
-		e.mu.Unlock()
+		e.RegisterTask(def) // latest definition wins; also arms matching triggers
 		stepQueue := normQueue(def.Queue)
 		e.ensureQueue(stepQueue)
 		maxAtt := def.MaxAttempts

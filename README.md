@@ -52,8 +52,11 @@ is the wrong amount of infrastructure.
   process's growth in every storage mode
 - **Metrics callback** — `WithMetricsFunc` pushes periodic state snapshots
 - **DAG workflows** — steps with dependencies, upstream outputs via `DepOutput`
-- **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`, `"@every 1s"`)
-  and `quacker.WithDelay`
+- **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`), sub-second
+  `"@every 250ms"`, and `quacker.WithDelay`; crons persist and re-arm on
+  restart
+- **In-process events** — `q.Emit(name, payload)` fans out to tasks bound with
+  `quacker.On(name, task)`, each receiving the payload as input
 - **Cancellation** — instant, propagated to running task contexts
 - **Non-blocking introspection** — `Execution`, `Runs`, `Metrics`, `Logs`,
   `Subscribe` — never pause or slow the workers
@@ -213,6 +216,24 @@ their steps is still `RUNNING` — so a purge cannot race a step recording its
 own cancellation. When logs are purged, an orphan sweep removes logs whose run
 no longer exists.
 
+## Cron & events
+
+```go
+// Standard specs, descriptors, and sub-second @every:
+err := quacker.Cron(q, "nightly", "@every 250ms", report, Report{Day: "yesterday"})
+
+// Event bindings: on emit, each bound task runs with the payload as input.
+err = quacker.On(q, "order.placed", receipt)
+err = quacker.On(q, "order.placed", notify)
+n, err := q.Emit(ctx, "order.placed", OrderPlaced{ID: "o-1", Total: 4200})
+events, _ := q.Events(ctx, 100) // newest-first persisted emit audit
+```
+
+With File storage, crons and event bindings persist: on the next `Open` they
+are loaded and arm as soon as their task is registered, so the app only needs
+`quacker.Register`. A stored fire time still in the future is honored; a
+missed one is recomputed from now (no catch-up burst).
+
 ## Cancellation & shutdown
 
 ```go
@@ -244,13 +265,16 @@ trivial.
 - **Task names are part of the storage format.** Renaming a task orphans its
   in-flight runs.
 - **Re-registering a task name replaces its function.** `Enqueue`,
-  `Register`, and `Cron` all overwrite the registered def for that name;
+  `Register`, `Cron`, and `On` all overwrite the registered def for that name;
   in-flight runs execute the currently registered def at claim time.
-- **Crons are in-memory.** Re-register them at startup
-  (`quacker.Cron(...)`); with File storage, register tasks with
-  `quacker.Register` before work resumed from a previous process can execute.
-  Unregistered tasks are retried every 5s until registered.
-- **`@every` intervals round up to 1 second** (cron parser limitation).
+- **Crons and event bindings persist.** With File storage they are loaded on
+  `Open` and arm automatically the moment their target task is registered —
+  so a restarted app only needs `quacker.Register`, not a re-`Cron`/re-`On`.
+  A stored fire time still in the future is kept; a missed one is skipped
+  (no catch-up burst). Unregistered targets simply stay pending.
+- **Events are best-effort and in-process.** `Emit` persists the event then
+  enqueues one run per bound task; a crash between the two can lose those
+  dispatches. Durable event waits arrive in v0.3.
 - Tasks should honor `ctx` — timeouts and cancellation are cooperative.
 - One engine per process assumes a single writer to a given `File` path —
   enforced by the `.quacker.lock` kernel-lock guard: a second engine on
@@ -273,7 +297,8 @@ labels/affinity, a web UI, OpenTelemetry.
 
  runnable programs live in [`examples/`](examples/):
 [`simple`](examples/simple/main.go) · [`dag`](examples/dag/main.go) ·
-[`cron`](examples/cron/main.go) · [`introspect`](examples/introspect/main.go)
+[`cron`](examples/cron/main.go) · [`events`](examples/events/main.go) ·
+[`introspect`](examples/introspect/main.go)
 
 ## Development
 

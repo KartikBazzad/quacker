@@ -252,6 +252,62 @@ panics so a bad exporter can't take down the engine, and is joined by
 `loopWG.Wait` before the store closes — the same shutdown discipline as the
 scheduler and cron loops.
 
+### 16. Sub-second cron uses a custom schedule, not ConstantDelaySchedule
+
+The roadmap sketch said to build sub-second `@every` with
+`cron.ConstantDelaySchedule{Duration}`. That type is unusable below one
+second: its `Next` computes `t.Add(Delay - t.Nanosecond())`, so whenever the
+current nanosecond field exceeds the delay the result moves *backwards*
+(e.g. at `.800s` with a 500ms delay, `Next` returns a time 300ms in the
+past). `cron.Every` hides this by rounding up to 1s. The engine instead
+parses `"@every <d>"` itself (validating `d > 0`) and schedules it with a
+three-line `everySchedule{d}` whose `Next` is exactly `t.Add(d)`.
+
+The second half of the fix is the loop: the old `cronLoop` ticked every
+200ms, too coarse for sub-second intervals. It now sleeps until the earliest
+armed cron's `next` (capped at 200ms, floored at 1ms), so a 40ms schedule
+fires on time without spinning. The cap preserves the old wakeup character
+when only minute-scale crons exist. Lesson: a library helper can look
+"equivalent" while being structurally wrong for the case you need — read its
+`Next`, don't trust the name.
+
+### 17. Persisted triggers arm on task registration, resuming cadence
+
+Crons were persisted for introspection but never loaded, and event bindings
+did not exist. Both now load on `Start` into **pending** maps (parsed but not
+armed), and `RegisterTask` is the single arming point: it moves every pending
+trigger whose target task just registered into the live maps. This makes
+`Register` the only startup call a File-mode app needs — the documented
+in-memory-crons/re-`Cron` dance is gone. `Enqueue` now routes through
+`RegisterTask` too, so an enqueue that supplies a task definition arms
+matching triggers as well.
+
+Missed-fire policy is **resume cadence, skip missed**: if the stored `next`
+is still in the future it is kept (so a restart doesn't shift a @daily's
+phase), otherwise it is recomputed from now. Catching up every missed slot
+would let a multi-day outage stampede the queue on boot; for schedules, one
+fire after recovery is the useful behavior. `RegisterCron` deletes any
+same-name pending entry before arming, so re-`Cron` at startup replaces
+rather than duplicates.
+
+### 18. Events are best-effort dispatch with a bounded audit log
+
+In-process events are deliberately *not* durable delivery. `Emit` persists
+the event row (for `q.Events` introspection) and then enqueues one run per
+armed binding, each with the payload as input. A crash between the persist
+and the enqueues can lose those dispatches — this is documented rather than
+hidden, and durable at-least-once event waits are the v0.3 `WaitFor` design,
+which needs suspension/cursor machinery this feature does not. Bindings
+themselves are persisted (`event_subscriptions`, unique per event+task) so
+they re-arm like crons, and `Off` deletes both the in-memory and stored
+binding.
+
+Persisted events would otherwise be a fresh unbounded-growth hole of exactly
+the kind retention was built to close, so `PurgeRuns` now also deletes
+`events` older than its cutoff, in batches, and `PurgeResult` reports
+`Events`. Subscriptions are never purged. The alternative — a separate
+event-retention knob — was rejected as more surface for the same outcome.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

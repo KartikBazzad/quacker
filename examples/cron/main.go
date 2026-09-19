@@ -26,8 +26,8 @@ func main() {
 		return "report for " + r.Day, nil
 	})
 
-	// Standard 5-field specs and @descriptors both work. Note: "@every"
-	// intervals round up to 1 second.
+	// Standard 5-field specs and @descriptors both work; "@every" supports
+	// sub-second intervals (e.g. "@every 250ms").
 	if err := quacker.Cron(q, "nightly", "@every 2s", report, Report{Day: "yesterday"}); err != nil {
 		log.Fatal(err)
 	}

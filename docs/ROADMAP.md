@@ -1,7 +1,7 @@
 # Roadmap
 
-Status: **v0.2 in progress** — P0 (hardening) and P1 (concurrency control +
-operations) are shipped; P2 (triggers & ergonomics) is next.
+Status: **v0.2 shipped** — all three tiers (P0 hardening, P1 control +
+operations, P2 triggers & ergonomics) are done. v0.3 is next.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -10,13 +10,15 @@ operations) are shipped; P2 (triggers & ergonomics) is next.
   hygiene.
 - v0.2 P1 shipped: per-key concurrency, rate limiting, middleware,
   retention/purge, metrics callback, log-sink ownership.
+- v0.2 P2 shipped: sub-second `@every`, persistent cron/event arming,
+  in-process events, CI + MIT license.
 
 Each iteration below is independently shippable; priorities are the
 recommended order. Items marked ⚖ are decision points — see the end.
 
 ---
 
-## v0.2 — hardening & control (in progress: P0 + P1 ✅, P2 next)
+## v0.2 — hardening & control (✅ DONE: P0 + P1 + P2)
 
 Goal: make v0.1 safe to run long-lived and multi-instance, and close the
 biggest feature gaps vs Hatchet for single-process users.
@@ -105,14 +107,37 @@ Acceptance: middleware ordering/panic/retry tests; purge cutoff, batching,
 `RUNNING`-guard, keep-logs + orphan-sweep, and auto-retention tests; metrics
 interval, panic-recovery, and stop-on-close tests. All pass under `-race`.
 
-### P2 — triggers & ergonomics
+### P2 — triggers & ergonomics (✅ DONE)
 
 | Item | Design sketch |
 |---|---|
-| Sub-second `@every` | Parse `@every <d>` ourselves and construct `cron.ConstantDelaySchedule(d)` directly — bypasses the parser's 1s floor. |
-| Persistent cron arming | On `Start()`, load `crons` rows; when the app later `Register`s the target task, arm the schedule automatically. File-mode apps then only need `Register`, not re-`Cron`. |
-| In-process events | `q.Emit(ctx, "order.placed", payload)`; tasks subscribe via `quacker.On("order.placed", task)` — stored in a table (needs migrations), fan-out on emit. |
-| CI + license | GitHub Actions (fmt, vet, test, `-race` on mac/linux), MIT LICENSE, semver tags. |
+| ✅ Sub-second `@every` | `@every <d>` is parsed by the engine itself and scheduled with a tiny fixed-delay `Schedule`, bypassing the parser's 1s floor. |
+| ✅ Persistent cron arming | `Start()` loads `crons` rows into a pending set; each arms automatically when the app `Register`s its target task. File-mode apps need only `Register`, not re-`Cron`. |
+| ✅ In-process events | `q.Emit(ctx, "order.placed", payload)` persists the event and fans out to tasks bound via `quacker.On("order.placed", task)` (schema v4). |
+| ✅ CI + license | GitHub Actions (gofmt, vet, test, `-race` on ubuntu + macos via `go-version-file`), MIT LICENSE. |
+
+As built (deviating from the sketch where it was weaker):
+the sketch said to construct `cron.ConstantDelaySchedule(d)` for sub-second
+intervals, but its `Next` subtracts `t.Nanosecond()` and computes wrong (even
+backwards) next times below one second — the engine defines its own
+fixed-delay schedule instead, and `cronLoop` now sleeps until the earliest
+armed cron (capped at 200ms) rather than ticking on a fixed interval, so
+sub-second schedules fire accurately without a busy loop. Persistent arming
+uses resume-cadence semantics: a stored next time still in the future is
+kept, a missed one is recomputed from now (skip missed, no catch-up burst).
+Event delivery is **best-effort and in-process**: the event is persisted for
+audit (`q.Events`) and then one run is enqueued per binding, each receiving
+the payload as input; durable at-least-once event waits are deliberately left
+to v0.3. Migration v4 adds `events` and `event_subscriptions`; event bindings
+re-arm on `Register` exactly like crons. To keep the new events table from
+becoming an unbounded-growth hole, `q.Purge`/`WithRetention` now age events
+out with the same cutoff (`PurgeResult.Events`).
+
+Acceptance: sub-second cron fires repeatedly; a cron persisted by one process
+fires after a reopen with only `Register`; emit dispatches to every bound
+task with the payload, unbound emits still persist, `Off` unbinds; persisted
+bindings re-arm; retention purges events. All pass under `-race`.
+Semver tags remain pending a git remote (none is configured).
 
 ---
 

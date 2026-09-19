@@ -64,11 +64,14 @@ type PurgeOptions struct {
 	BatchSize int
 }
 
-// PurgeResult reports how many rows a purge removed.
+// PurgeResult reports how many rows a purge removed. Events are aged with
+// the same cutoff so the events table cannot grow without bound; event
+// subscriptions are never purged.
 type PurgeResult struct {
-	Runs  int64
-	Steps int64
-	Logs  int64
+	Runs   int64
+	Steps  int64
+	Logs   int64
+	Events int64
 }
 
 // PurgeRuns deletes terminal runs older than opts.Before, in batches, along
@@ -119,7 +122,36 @@ func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, 
 			}
 		}
 	}
+	// Events age out with the same cutoff: they are best-effort audit, so
+	// leaving them behind would recreate the unbounded-growth problem that
+	// retention exists to solve.
+	for {
+		n, err := s.purgeEvents(ctx, opts.Before, batch)
+		if err != nil {
+			return res, err
+		}
+		res.Events += n
+		if n < int64(batch) {
+			break
+		}
+	}
 	return res, nil
+}
+
+// purgeEvents deletes up to batch events older than before.
+func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64, error) {
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, `DELETE FROM events WHERE seq IN (
+		SELECT seq FROM events WHERE created_at > 0 AND created_at < ? LIMIT ?)`, before, batch)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := r.RowsAffected()
+	return n, tx.Commit()
 }
 
 // purgeRunBatch deletes one batch of eligible runs (and their steps/logs) in
@@ -789,6 +821,94 @@ func (s *Store) UpsertCron(ctx context.Context, c *Cron) error {
 func (s *Store) DeleteCron(ctx context.Context, name string) error {
 	_, err := s.write.ExecContext(ctx, `DELETE FROM crons WHERE name=?`, name)
 	return err
+}
+
+// ListCrons returns every persisted cron trigger, for re-arming on Start.
+func (s *Store) ListCrons(ctx context.Context) ([]*Cron, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT name, spec, task, input, next_at, created_at FROM crons ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Cron
+	for rows.Next() {
+		var c Cron
+		if err := rows.Scan(&c.Name, &c.Spec, &c.Task, &c.Input, &c.NextAt, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Events.
+
+// AppendEvent persists one emitted event.
+func (s *Store) AppendEvent(ctx context.Context, e *Event) error {
+	_, err := s.write.ExecContext(ctx,
+		`INSERT INTO events (name, payload, created_at) VALUES (?,?,?)`,
+		e.Name, e.Payload, e.CreatedAt)
+	return err
+}
+
+// ListEvents returns up to limit most recent events, newest first.
+func (s *Store) ListEvents(ctx context.Context, limit int) ([]*Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT seq, name, payload, created_at FROM events ORDER BY seq DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.Seq, &e.Name, &e.Payload, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
+// UpsertEventSub persists an event→task binding (idempotent per pair).
+func (s *Store) UpsertEventSub(ctx context.Context, sub *EventSub) error {
+	id := sub.Event + "/" + sub.Task
+	_, err := s.write.ExecContext(ctx, `INSERT INTO event_subscriptions (id, event, task, created_at)
+		VALUES (?,?,?,?)
+		ON CONFLICT(event, task) DO UPDATE SET created_at=excluded.created_at`,
+		id, sub.Event, sub.Task, sub.CreatedAt)
+	return err
+}
+
+// DeleteEventSub removes an event→task binding.
+func (s *Store) DeleteEventSub(ctx context.Context, event, task string) error {
+	_, err := s.write.ExecContext(ctx,
+		`DELETE FROM event_subscriptions WHERE event=? AND task=?`, event, task)
+	return err
+}
+
+// ListEventSubs returns every persisted binding, for re-arming on Start.
+func (s *Store) ListEventSubs(ctx context.Context) ([]*EventSub, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT event, task, created_at FROM event_subscriptions ORDER BY event, task`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*EventSub
+	for rows.Next() {
+		var s EventSub
+		if err := rows.Scan(&s.Event, &s.Task, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &s)
+	}
+	return out, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,8 @@ How quacker works inside one process. For user-facing docs see the
 │  scheduler loop (50ms tick  │──▶│  1 writer connection             │
 │  + wake channel)            │   │  4 read-only connections         │
 │  per-queue worker pools     │   │  keeper pool (memory mode)       │
-│  retries · DAG · cron       │   │  runs / steps / crons / logs     │
+│  retries · DAG              │   │  runs / steps / crons / logs     │
+│  cron + events triggers     │   │  events / event_subscriptions    │
 │  middleware chain           │   │  schema_migrations               │
 │  cancel · graceful close    │   └──────────────────────────────────┘
 │  metrics + retention loops  │
@@ -89,6 +90,8 @@ steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       run_at, created_at, started_at, completed_at,
       concurrency_key, key_limit, claimed_at)
 crons(id, name UNIQUE, spec, task, input, next_at, created_at)
+events(seq AUTOINCREMENT, name, payload, created_at)
+event_subscriptions(id PK, event, task, created_at, UNIQUE(event, task))
 logs(seq AUTOINCREMENT, run_id, step, at, level, message)
 schema_migrations(version PRIMARY KEY, applied_at)
 ```
@@ -97,7 +100,9 @@ Schema changes ship as an ordered migration list; `migrate` applies each
 pending entry in one transaction together with its `schema_migrations`
 version row. Migration 1 is all `CREATE TABLE IF NOT EXISTS`, so a v0.1
 File database (tables present, no version row) baselines at version 1.
-Migration 3 adds `idx_runs_purge (status, completed_at)` for retention.
+Migration 3 adds `idx_runs_purge (status, completed_at)` for retention;
+migration 4 adds `events` (best-effort emit audit) and
+`event_subscriptions` (event→task bindings, unique per pair).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -204,15 +209,36 @@ retry attempts.
   (`WithMetricsFunc`/`WithMetricsInterval`) and the retention purge
   (`WithRetention`), both joined before the store closes.
 
+## Triggers (cron & events)
+
+Cron and event bindings are persisted and share one arming model. `Start`
+loads `crons` and `event_subscriptions` into **pending** maps; nothing is
+armed until `RegisterTask` sees the target task, at which point it moves the
+matching entries into the live maps (crons resume cadence: keep a future
+`next`, recompute a missed one). `Enqueue` routes through `RegisterTask`, so
+supplying a def arms its triggers too.
+
+- **Cron**: `cronLoop` sleeps until the earliest armed `next` (capped 200ms,
+  floored 1ms) rather than a fixed tick. `@every <d>` uses an engine-local
+  fixed-delay schedule because `cron.ConstantDelaySchedule.Next` is wrong
+  below one second.
+- **Events**: `Emit` writes an `events` row, then enqueues one run per armed
+  binding for the name, passing the payload as input. Delivery is
+  best-effort in-process; `q.Events` reads the audit rows and
+  `WithRetention`/`q.Purge` ages them out with the same cutoff.
+
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
   panics, timeouts, concurrency caps, priority order, DAG ordering and
   failure, cancel, delayed runs, cron, logs, filters, middleware
-  ordering/panic/retry, log-sink routing, metrics push, purge/retention).
+  ordering/panic/retry, log-sink routing, metrics push, purge/retention,
+  sub-second and persistent cron, event emit/On/Off/arming).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
-  keep-logs + orphan sweep, batching) and the migration-v3 index live in
-  `internal/store`.
+  keep-logs + orphan sweep, batching), the migration-v3 index, and the
+  migration-v4 event tables live in `internal/store`.
+- CI runs gofmt/vet/test/`-race` on ubuntu and macos
+  (`.github/workflows/ci.yml`); the repo is MIT-licensed.
 - `TestIntrospectionUnderLoad`: 8 readers hammer snapshots while 200 runs
   execute — the non-blocking guarantee, run under `-race`.
 - File-mode recovery tests: drain-timeout close → requeue (or fail) →
