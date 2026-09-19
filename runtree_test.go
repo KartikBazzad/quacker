@@ -68,7 +68,9 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 		t.Fatalf("child steps in tree = %d, want 3 (nodes: %v)", childSteps, nodeNames(tree))
 	}
 
-	// Each child is attached to the spawning step "fan".
+	// Each child is attached to the spawning step "fan", both as an edge and
+	// as a dependency (so the level layout places it after fan, not in the
+	// root column).
 	spawnEdges := 0
 	for _, e := range tree.Edges {
 		if e.From == "fan" && strings.HasSuffix(e.To, "/job") {
@@ -77,6 +79,13 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 	}
 	if spawnEdges != 3 {
 		t.Fatalf("spawn edges from fan = %d, want 3 (edges: %v)", spawnEdges, tree.Edges)
+	}
+	for _, n := range tree.Nodes {
+		if strings.HasSuffix(n.Name, "/job") {
+			if len(n.Deps) != 1 || n.Deps[0] != "fan" {
+				t.Fatalf("child node %s deps = %v, want [fan]", n.Name, n.Deps)
+			}
+		}
 	}
 
 	// The plain DAG (one run) does NOT include the children.

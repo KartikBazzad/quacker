@@ -47,8 +47,11 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 				node.Deps = append(node.Deps, dd)
 				out.Edges = append(out.Edges, DAGEdge{From: dd, To: name})
 			}
-			// A child run's root steps attach to the step that spawned it.
+			// A child run's root steps attach to the step that spawned it. The
+			// spawner goes into Deps too, so the level layout places the child
+			// after its spawner rather than in the root column.
 			if len(s.Deps) == 0 && from != "" {
+				node.Deps = append(node.Deps, from)
 				out.Edges = append(out.Edges, DAGEdge{From: from, To: name})
 			}
 			out.Nodes = append(out.Nodes, node)
