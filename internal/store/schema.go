@@ -198,6 +198,12 @@ const migration8 = `
 ALTER TABLE steps ADD COLUMN labels TEXT NOT NULL DEFAULT '[]';
 `
 
+// migration 9 stores the W3C traceparent of the span active at enqueue, so a
+// step executed later (possibly after a restart) can link to its producer.
+const migration9 = `
+ALTER TABLE runs ADD COLUMN trace_parent TEXT NOT NULL DEFAULT '';
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
@@ -207,6 +213,7 @@ var migrations = []migration{
 	{version: 6, sql: migration6},
 	{version: 7, sql: migration7},
 	{version: 8, sql: migration8},
+	{version: 9, sql: migration9},
 }
 
 // init validates the migration list's invariant before any Open can rely

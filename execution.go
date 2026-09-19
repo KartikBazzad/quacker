@@ -83,7 +83,10 @@ type Execution struct {
 	Error       string          `json:"error,omitempty"`
 	// Key mirrors the first step's concurrency key (per-step keys in
 	// workflows may differ).
-	Key         string      `json:"key,omitempty"`
+	Key string `json:"key,omitempty"`
+	// TraceParent is the W3C traceparent captured at enqueue ("" without
+	// tracing), for correlating this run with your traces.
+	TraceParent string      `json:"trace_parent,omitempty"`
 	RunAt       time.Time   `json:"run_at"`
 	CreatedAt   time.Time   `json:"created_at"`
 	StartedAt   time.Time   `json:"started_at,omitempty"`
@@ -182,7 +185,8 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 		RunID: run.ID, Workflow: run.Workflow, Kind: Kind(run.Kind), Status: Status(run.Status),
 		Queue: run.Queue, Priority: run.Priority, Attempts: int(run.Attempts), MaxAttempts: int(run.MaxAttempts),
 		Input: run.Input, Output: run.Output, Error: run.Error, Key: run.ConcurrencyKey,
-		RunAt: unixToTime(run.RunAt), CreatedAt: unixToTime(run.CreatedAt),
+		TraceParent: run.TraceParent,
+		RunAt:       unixToTime(run.RunAt), CreatedAt: unixToTime(run.CreatedAt),
 		StartedAt: unixToTime(run.StartedAt), CompletedAt: unixToTime(run.CompletedAt),
 		Steps: make([]StepState, 0, len(steps)),
 	}

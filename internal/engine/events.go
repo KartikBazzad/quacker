@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/kartikbazzad/quacker/internal/store"
 )
 
@@ -79,7 +81,9 @@ func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage)
 	if ctx == nil {
 		ctx = e.ctx
 	}
+	ctx, span := e.startSpan(ctx, "quacker.emit", attribute.String("quacker.event", name))
 	woken, err := e.st.DeliverEvent(ctx, name, payload, e.now().UnixNano())
+	endSpan(span, err)
 	if err != nil {
 		return 0, err
 	}

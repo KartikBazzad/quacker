@@ -27,10 +27,10 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 	defer tx.Rollback()
 	for i, run := range runs {
 		res, err := tx.ExecContext(ctx, `INSERT INTO runs
-			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
-			VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?)`,
+			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent)
+			VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?)`,
 			run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-			run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID)
+			run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.TraceParent)
 		if err != nil {
 			return fmt.Errorf("quacker: insert run: %w", err)
 		}

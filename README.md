@@ -74,6 +74,8 @@ is the wrong amount of infrastructure.
   `Logs`, `Subscribe` — never pause or slow the workers
 - **Debug log stream** — `q.DebugLogs()` yields engine activity (claims,
   retries, suspensions, completions) in-process, without serving HTTP
+- **OpenTelemetry tracing** — `WithTracerProvider` emits spans for enqueue,
+  step execution (linked to enqueue; survives restarts), and emit
 - **Graceful shutdown** — drains in-flight work, marks stragglers, optional
   recovery on restart (File storage)
 
@@ -426,6 +428,28 @@ The stream is bounded and drops records when the consumer falls behind — it
 never blocks the engine or grows unbounded — and it closes on `Close`, ending
 the range. For a lossless-per-subscriber status stream use `Subscribe`.
 
+## Tracing (OpenTelemetry)
+
+```go
+q, _ := quacker.Open(quacker.WithTracerProvider(tp)) // your SDK provider
+```
+
+The engine emits three spans:
+
+- **`quacker.enqueue`** per run — parented to *your* context, so it nests
+  under the HTTP handler / job that enqueued.
+- **`quacker.step`** per execution — a new root **linked** to the enqueue span
+  (the standard async shape: the producer is long gone). It carries
+  `run_id`, `step`, `task`, `attempt`, and `queue`, and runs under the task
+  context so your task/middleware can create child spans.
+- **`quacker.emit`** per event.
+
+The span active at enqueue is serialized as a W3C `traceparent` and persisted
+on the run (visible as `Execution().TraceParent`), so the step link survives a
+restart or a different process. The library imports only the OTel **API** —
+bring your own SDK/exporter; without `WithTracerProvider` there is no tracing
+overhead at all.
+
 ## Notes & semantics
 
 - **Task names are part of the storage format.** Renaming a task orphans its
@@ -449,10 +473,9 @@ the range. For a lossless-per-subscriber status stream use `Subscribe`.
 
 ## Not yet
 
-Distributed workers across processes (the Postgres/multi-instance epic),
-strict (ordered) per-key concurrency, a web UI, and OpenTelemetry. Worker
-label routing is available within a process and is the building block for
-cross-process routing.
+Distributed workers across processes (the Postgres/multi-instance epic) and
+strict (ordered) per-key concurrency. Worker label routing is available
+within a process and is the building block for cross-process routing.
 
 ## Documentation
 

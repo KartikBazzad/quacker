@@ -34,6 +34,9 @@ type Run struct {
 	// ParentID is the run this one was enqueued from ("" for a root run).
 	// Lineage is informational: a purged parent leaves a dangling id.
 	ParentID string
+	// TraceParent is the W3C traceparent of the span active at enqueue ("" if
+	// tracing is disabled), used to link the executing span to its producer.
+	TraceParent string
 }
 
 // Step is a row in the steps table. A single-task run has exactly one step.
@@ -159,7 +162,7 @@ func decodeList(s string) []string {
 }
 
 const runCols = `id, workflow, kind, status, queue, priority, input, output, error,
-	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id`
+	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent`
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
@@ -169,7 +172,7 @@ func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.Workflow, &r.Kind, &r.Status, &r.Queue, &r.Priority,
 		&r.Input, &r.Output, &r.Error, &r.Attempts, &r.MaxAttempts,
-		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID)
+		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID, &r.TraceParent)
 	if err != nil {
 		return nil, err
 	}

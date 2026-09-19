@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/kartikbazzad/quacker/internal/engine"
 	"github.com/kartikbazzad/quacker/internal/store"
 )
@@ -54,6 +56,7 @@ type config struct {
 	metricsFn          func(*Metrics)
 	metricsInterval    time.Duration
 	retention          *engine.RetentionPolicy
+	tracerProvider     trace.TracerProvider
 }
 
 type rateConfig struct {
@@ -115,6 +118,16 @@ func WithCheckpointInterval(d time.Duration) Option {
 // WithLogger sets the engine logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option {
 	return func(c *config) { c.logger = l }
+}
+
+// WithTracerProvider enables OpenTelemetry tracing: a span per enqueue, one
+// per step execution (a new root linked to the enqueue span, the standard
+// async shape), and one per emit. The library imports only the OTel API —
+// pass the provider from your SDK/exporter setup, or omit this to disable
+// tracing entirely (no overhead). When enabled, the W3C traceparent active at
+// enqueue is persisted on the run, so execution links back across restarts.
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(c *config) { c.tracerProvider = tp }
 }
 
 // WithMiddleware registers engine-wide middleware, applied outside every

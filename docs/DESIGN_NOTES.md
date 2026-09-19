@@ -487,6 +487,31 @@ epic) reuses the same predicate — each node's claim is filtered by its own
 label set — but additionally needs worker identity and leases so a node that
 dies mid-step doesn't strand it.
 
+### 28. Tracing is an async link, not a parent, and the propagator is explicit
+
+The engine emits OTel spans only when a `TracerProvider` is supplied (the
+library imports just the `otel` API; the SDK/exporter is the caller's). Three
+choices matter:
+
+- **The step span is a new root that *links* to the enqueue span** rather than
+  being parented to it. Enqueue and execution are separated by an arbitrary
+  delay, possibly another process or a previous boot; parenting would produce
+  a misleading multi-minute "span" covering the wait. Links are the standard
+  async-trace shape and keep the causal edge without the fake duration.
+- **The producer traceparent is persisted on the run** (migration 9). An
+  in-memory map would lose the link on restart and leak entries; persisting
+  one string column makes the link durable and inspectable
+  (`Execution().TraceParent`).
+- **The W3C `TraceContext` propagator is used directly, not
+  `otel.GetTextMapPropagator()`.** The global propagator defaults to a no-op,
+  so the first cut silently produced empty traceparents and no links — a bug
+  the tracing test caught immediately. Using the concrete propagator makes the
+  stored format self-contained regardless of global setup.
+
+When tracing is off, `Engine.tracing` is false and every helper returns
+before touching attributes, so the disabled path allocates nothing on the
+claim/enqueue hot paths.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

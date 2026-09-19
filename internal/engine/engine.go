@@ -16,6 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/kartikbazzad/quacker/internal/bus"
 	"github.com/kartikbazzad/quacker/internal/store"
 )
@@ -153,6 +156,10 @@ type Engine struct {
 	// workerLabels is this engine's label set; it only claims steps whose
 	// required labels are a subset. Empty claims only unlabeled steps.
 	workerLabels []string
+	// tracer/tracing are set only when a TracerProvider was supplied; tracing
+	// false keeps the disabled path allocation-free.
+	tracer  trace.Tracer
+	tracing bool
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -207,6 +214,10 @@ type Options struct {
 	// WorkerLabels is this engine's label set; it claims only steps whose
 	// task labels are a subset. Empty claims only unlabeled steps.
 	WorkerLabels []string
+	// TracerProvider, when set, enables OpenTelemetry spans for enqueue, step
+	// execution, and emit. The library depends only on the OTel API; the
+	// caller supplies the SDK/provider.
+	TracerProvider trace.TracerProvider
 	// LogSink is the base task-log destination. When nil and LogStorage is
 	// off, task logs go to the engine logger; when nil and LogStorage is on,
 	// they persist to SQLite only.
@@ -287,6 +298,11 @@ func New(o Options) (*Engine, error) {
 	// up without HTTP, and records the app logs via DebugLogger() share it.
 	e.debugCh = make(chan DebugRecord, debugBuffer)
 	e.log = slog.New(&fanoutHandler{a: o.Log.Handler(), b: &debugHandler{send: e.debugSend}})
+
+	if o.TracerProvider != nil {
+		e.tracer = o.TracerProvider.Tracer(tracerName)
+		e.tracing = true
+	}
 	return e, nil
 }
 
@@ -516,13 +532,32 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	runs := make([]*store.Run, len(reqs))
 	steps := make([][]*store.Step, len(reqs))
 	waiters := make([]*Waiter, len(reqs))
+	var enqueueSpans []trace.Span
+	defer func() {
+		for _, s := range enqueueSpans {
+			endSpan(s, nil)
+		}
+	}()
 	for i, req := range reqs {
 		if req == nil {
 			return nil, errors.New("quacker: nil enqueue request")
 		}
+		spanCtx, span := e.startSpan(ctx, "quacker.enqueue")
 		run, sts, err := e.buildRun(req, now)
 		if err != nil {
 			return nil, err
+		}
+		if span != nil {
+			// Record the producer span so the executing step can link to it,
+			// even after a restart or on another process.
+			run.TraceParent = injectTraceParent(spanCtx)
+			span.SetAttributes(
+				attribute.String("quacker.workflow", run.Workflow),
+				attribute.String("quacker.kind", run.Kind),
+				attribute.String("quacker.queue", run.Queue),
+				attribute.String("quacker.run_id", run.ID),
+			)
+			enqueueSpans = append(enqueueSpans, span)
 		}
 		runs[i], steps[i], waiters[i] = run, sts, newWaiter(run.ID)
 	}
@@ -810,6 +845,11 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	if jerr != nil {
 		e.log.Error("quacker: load journal", "run", st.RunID, "step", st.Name, "err", jerr)
 	}
+	// Start the step's span (a new root linked to the enqueue span, since the
+	// producer is long gone). It is attached to the task context so user code
+	// and middleware can create child spans.
+	taskCtx, stepSpan := e.startStepSpan(taskCtx, st, c.Run, taskName)
+	defer func() { endSpan(stepSpan, err) }()
 	stepCtx := withStepContext(taskCtx, c, depOutputs, e.logSend, journal, e)
 	handler := e.wrapHandler(def)
 	var suspend *suspendSignal

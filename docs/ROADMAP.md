@@ -1,8 +1,8 @@
 # Roadmap
 
 Status: **v0.4 in progress** — v0.3 is shipped (durable execution, DAG
-visualizer, debug logger, perf). Worker labels are done; OTel and the
-Postgres/multi-instance epic remain.
+visualizer, debug logger, perf). Worker labels and OTel tracing are done; the
+Postgres/multi-instance epic remains.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -217,8 +217,11 @@ Children are ordinary runs and are aged/purged independently.
   and `ClaimDueMulti` adds a `json_each` subset gate to the claim SELECT.
   Routes work to capable workers in-process and is the building block for
   cross-process routing.
-- **OTel**: optional spans for enqueue/execute/emit (API-only dependency;
-  the user supplies the provider).
+- ✅ **OTel tracing**: `WithTracerProvider` emits `quacker.enqueue`,
+  `quacker.step`, and `quacker.emit` spans. The step span is a new root
+  **linked** to the enqueue span; the W3C traceparent is persisted on the run
+  (migration v9) so the link survives a restart. API-only dependency — the
+  caller supplies the SDK/exporter; tracing off is allocation-free.
 - **Postgres / multi-instance**: abstract the store, add worker identity and
   step leases (boot recovery currently re-queues RUNNING rows, safe for one
   process only), and cross-node wakeups.

@@ -53,6 +53,7 @@ func Open(opts ...Option) (*Quacker, error) {
 		LogStorage:      cfg.logStorage,
 		MetricsInterval: cfg.metricsInterval,
 		Retention:       cfg.retention,
+		TracerProvider:  cfg.tracerProvider,
 	}
 	if cfg.logSink != nil {
 		fn := cfg.logSink

@@ -84,7 +84,7 @@ growth whenever readers are momentarily idle — plus a best-effort
 ```
 runs(id, workflow, kind, status, queue, priority, input, output, error,
      attempts, max_attempts, run_at, created_at, started_at, completed_at,
-     concurrency_key, parent_id)
+     concurrency_key, parent_id, trace_parent)
 steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
       run_at, created_at, started_at, completed_at,
@@ -111,7 +111,8 @@ adds the durable-execution columns on `steps` and the `step_journal` table
 `idx_runs_parent` for child-run lineage (no foreign key — a purged parent may
 leave a dangling id); migration 7 rewrites `steps.depends_on` from
 comma-joined text to a JSON array; migration 8 adds `steps.labels` (JSON
-array) for worker-label routing.
+array) for worker-label routing; migration 9 adds `runs.trace_parent` (the
+W3C traceparent captured at enqueue).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -230,6 +231,11 @@ retry attempts.
   distinct from task logs): the engine's own records plus anything via
   `q.DebugLogger()`, drop-on-full and closed at `Close`, so the engine can be
   observed without serving HTTP.
+- When a `TracerProvider` is supplied, the engine emits OTel spans for
+  enqueue, step execution, and emit. The step span is a new root *linked* to
+  the enqueue span; the enqueue span's W3C traceparent is stored on the run so
+  the link survives a restart. The library imports only the OTel API and skips
+  all span work when tracing is off.
 - `loopWG` also owns two optional loops: the metrics push
   (`WithMetricsFunc`/`WithMetricsInterval`) and the retention purge
   (`WithRetention`), both joined before the store closes.
@@ -300,7 +306,8 @@ does not fail the parent. See DESIGN_NOTES §22.
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
   XML-escaping, debug-log capture/close, recovery of suspended steps,
-  batch enqueue, multi-queue claim, and worker-label routing).
+  batch enqueue, multi-queue claim, worker-label routing, and OTel spans
+  including the cross-restart link).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path
