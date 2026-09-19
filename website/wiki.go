@@ -19,6 +19,8 @@ import (
 // its URL slug).
 var wikiName = map[string]string{
 	"index":           "Home",
+	"features":        "Features",
+	"use-cases":       "Use-Cases",
 	"getting-started": "Getting-Started",
 	"tasks":           "Tasks",
 	"workflows":       "Workflows",
@@ -26,12 +28,15 @@ var wikiName = map[string]string{
 	"concurrency":     "Concurrency",
 	"triggers":        "Triggers",
 	"operations":      "Operations",
+	"plugins":         "Plugins",
+	"storage-drivers": "Storage-Drivers",
 	"api":             "API-Reference",
 	"examples":        "Examples",
 	"architecture":    "Architecture",
 	"design-notes":    "Design-Notes",
 	"benchmarks":      "Benchmarks",
 	"roadmap":         "Roadmap",
+	"stability":       "Stability",
 }
 
 const repoURL = "https://github.com/KartikBazzad/quacker"
@@ -49,6 +54,9 @@ func (b *builder) buildWiki() error {
 	}
 	for _, p := range pages {
 		name := wikiName[p.slug]
+		if name == "" { // a content/docs page with no explicit wiki name
+			name = strings.ReplaceAll(p.title, " ", "-")
+		}
 		switch {
 		case p.content != "":
 			src, err := os.ReadFile(filepath.Join("content", p.content))
@@ -109,6 +117,8 @@ var mdToWiki = map[string]string{
 	"DESIGN_NOTES.md": "Design-Notes",
 	"BENCHMARKS.md":   "Benchmarks",
 	"ROADMAP.md":      "Roadmap",
+	"STABILITY.md":    "Stability",
+	"DRIVERS.md":      "Storage-Drivers",
 }
 
 // wikiTransform adapts repo markdown for the wiki: internal links to wiki
@@ -158,6 +168,8 @@ out, _ := h.Result(ctx)   // waits for the run, decodes Out
 
 | | |
 |---|---|
+| [[Features]] | The full capability surface |
+| [[Use-Cases]] | Background jobs, async APIs, pipelines, multi-instance |
 | [[Getting-Started]] | Install, storage modes, first run, shutdown |
 | [[Tasks]] | Retries, timeouts, queues, priorities, keys, labels |
 | [[Workflows]] | DAG steps, dependency outputs, live DAG introspection |
@@ -165,10 +177,12 @@ out, _ := h.Result(ctx)   // waits for the run, decodes Out
 | [[Concurrency]] | Queue limits, per-key gates, rate windows, worker labels |
 | [[Triggers]] | Cron, events, child runs |
 | [[Operations]] | Middleware, logs, retention, metrics, OTel, introspection |
+| [[Plugins]] | Lifecycle hooks and the payload codec |
+| [[Storage-Drivers]] | SQLite, Postgres, MySQL, and the driver contract |
 | [[API-Reference]] | Every exported symbol (generated from source) |
 | [[Examples]] | Runnable programs in the repo |
 
-Internals: [[Architecture]] · [[Design-Notes]] · [[Benchmarks]] · [[Roadmap]]
+Internals: [[Architecture]] · [[Design-Notes]] · [[Benchmarks]] · [[Roadmap]] · [[Stability]]
 
 Also available as a rendered site — see ` + "`website/`" + ` in the repo.
 `)

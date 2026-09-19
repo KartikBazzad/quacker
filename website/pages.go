@@ -17,6 +17,9 @@ type pageDef struct {
 var pages = []pageDef{
 	{slug: "index", title: "quacker", nav: "Home", group: "Start", src: renderHome},
 
+	{slug: "features", title: "Features", nav: "Features", group: "Overview", src: markdownPage, content: "features.md"},
+	{slug: "use-cases", title: "Use cases", nav: "Use cases", group: "Overview", src: markdownPage, content: "use-cases.md"},
+
 	{slug: "getting-started", title: "Getting started", nav: "Getting started", group: "Guides", src: markdownPage, content: "getting-started.md"},
 	{slug: "tasks", title: "Tasks", nav: "Tasks", group: "Guides", src: markdownPage, content: "tasks.md"},
 	{slug: "workflows", title: "Workflows & DAGs", nav: "Workflows", group: "Guides", src: markdownPage, content: "workflows.md"},

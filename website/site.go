@@ -151,6 +151,8 @@ out, _ := h.Result(ctx)   // waits for the run, decodes Out</code></pre>
 
 <h2>Where next</h2>
 <ul>
+<li><a href="features.html">Features</a> — the full capability surface, from retries to storage drivers</li>
+<li><a href="use-cases.html">Use cases</a> — background jobs, async APIs, pipelines, multi-instance</li>
 <li><a href="getting-started.html">Getting started</a> — install, open options, first run</li>
 <li><a href="durable.html">Durable execution</a> — sleeps, event waits, exactly-once side effects</li>
 <li><a href="api.html">API reference</a> — every exported symbol</li>
