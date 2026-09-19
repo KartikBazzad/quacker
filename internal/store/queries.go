@@ -245,11 +245,11 @@ func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) er
 // is not unique so the unique index ignores it.
 func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
 	res, err := tx.exec(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent, unique_key, sequence_key, seq)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?)`,
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent, unique_key, sequence_key, seq, ephemeral)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?,?)`,
 		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
 		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.TraceParent,
-		nullableString(run.UniqueKey), run.SequenceKey, run.Seq)
+		nullableString(run.UniqueKey), run.SequenceKey, run.Seq, boolInt(run.Ephemeral))
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}
@@ -275,6 +275,27 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func boolInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// deleteEphemeralRunTx removes an ephemeral run and its steps (the journal
+// cascades) and logs. Callers invoke it in the terminal transition's
+// transaction.
+func deleteEphemeralRunTx(ctx context.Context, tx *txn, runID string) error {
+	if _, err := tx.exec(ctx, `DELETE FROM logs WHERE run_id=?`, runID); err != nil {
+		return err
+	}
+	if _, err := tx.exec(ctx, `DELETE FROM steps WHERE run_id=?`, runID); err != nil {
+		return err
+	}
+	_, err := tx.exec(ctx, `DELETE FROM runs WHERE id=?`, runID)
+	return err
 }
 
 // ErrNonTerminalPurge is returned when a purge is asked to delete a
@@ -892,7 +913,8 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	// A run that is already terminal (cancelled/failed/interrupted) must not
 	// gain SUCCEEDED steps from executors that raced the transition.
 	var runStatus string
-	if err := tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+	var ephemeral int64
+	if err := tx.queryRow(ctx, `SELECT status, ephemeral FROM runs WHERE id=?`, runID).Scan(&runStatus, &ephemeral); err != nil {
 		return CompleteResult{}, err
 	}
 	if IsTerminal(runStatus) {
@@ -958,6 +980,13 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		return CompleteResult{}, err
 	}
 	res.RunTerminal, res.RunStatus, res.RunError, res.RunOutput = true, runStatus, runErr, lastOut
+	if ephemeral != 0 {
+		// Ephemeral runs leave no history: delete the finished run in the same
+		// transaction that recorded it terminal.
+		if err := deleteEphemeralRunTx(ctx, tx, runID); err != nil {
+			return CompleteResult{}, err
+		}
+	}
 	return res, tx.Commit()
 }
 
@@ -1077,6 +1106,10 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
 		return CompleteResult{}, err
 	}
+	var ephemeral int64
+	if err := tx.queryRow(ctx, `SELECT ephemeral FROM runs WHERE id=?`, runID).Scan(&ephemeral); err != nil {
+		return CompleteResult{}, err
+	}
 
 	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, error=?, completed_at=? WHERE id=?`,
 		StatusFailed, errMsg, now, stepID); err != nil {
@@ -1118,7 +1151,7 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 
 	runSet := `status=?, error=?, completed_at=?, unique_key=NULL`
 	runArgs := []any{StatusFailed, errMsg, now}
-	if deadLetter {
+	if deadLetter && ephemeral == 0 { // ephemeral runs are never dead-lettered
 		runSet += `, dead_lettered_at=?`
 		runArgs = append(runArgs, now)
 	}
@@ -1129,6 +1162,11 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		return CompleteResult{}, err
 	}
 	res.RunTerminal, res.RunStatus, res.RunError = true, StatusFailed, errMsg
+	if ephemeral != 0 {
+		if err := deleteEphemeralRunTx(ctx, tx, runID); err != nil {
+			return CompleteResult{}, err
+		}
+	}
 	return res, tx.Commit()
 }
 
@@ -1158,7 +1196,8 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 	}
 
 	var status string
-	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
+	var ephemeral int64
+	err = tx.queryRow(ctx, `SELECT status, ephemeral FROM runs WHERE id=?`, runID).Scan(&status, &ephemeral)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", false, ErrNotFound
 	}
@@ -1168,22 +1207,30 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 	if IsTerminal(status) {
 		return nil, status, false, nil
 	}
-	if err := cancelRunTx(ctx, tx, runID, now); err != nil {
-		return nil, "", false, err
-	}
+	// Collect running steps before any deletion so their contexts are
+	// interrupted.
 	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
 	if err != nil {
 		return nil, "", false, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, "", false, err
 		}
 		runningSteps = append(runningSteps, id)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, "", false, err
+	}
+	rows.Close()
+	if ephemeral != 0 {
+		if err := deleteEphemeralRunTx(ctx, tx, runID); err != nil {
+			return nil, "", false, err
+		}
+	} else if err := cancelRunTx(ctx, tx, runID, now); err != nil {
 		return nil, "", false, err
 	}
 	return runningSteps, status, true, tx.Commit()

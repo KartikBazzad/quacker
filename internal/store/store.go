@@ -129,15 +129,44 @@ func (s *Store) SupportsExternalTx() bool { return s.be.Name() != "sqlite" }
 // another worker is still executing is left alone.
 func (s *Store) InterruptAll(ctx context.Context, workerID string, now int64) error {
 	if workerID == "" {
-		if _, err := s.write.ExecContext(ctx,
-			`UPDATE steps SET status=?, completed_at=? WHERE status=?`,
+		tx, err := s.beginTx(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		// Ephemeral runs leave no history: delete those in flight rather than
+		// marking them INTERRUPTED.
+		if rows, err := tx.query(ctx, `SELECT id FROM runs WHERE status=? AND ephemeral=1`, StatusRunning); err != nil {
+			return err
+		} else {
+			var ids []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return err
+				}
+				ids = append(ids, id)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			for _, id := range ids {
+				if err := deleteEphemeralRunTx(ctx, tx, id); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE status=?`,
 			StatusInterrupted, now, StatusRunning); err != nil {
 			return err
 		}
-		_, err := s.write.ExecContext(ctx,
-			`UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE status=?`,
-			StatusInterrupted, now, StatusRunning)
-		return err
+		if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE status=?`,
+			StatusInterrupted, now, StatusRunning); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 
 	tx, err := s.beginTx(ctx)
@@ -145,17 +174,26 @@ func (s *Store) InterruptAll(ctx context.Context, workerID string, now int64) er
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.query(ctx, `SELECT DISTINCT run_id FROM steps WHERE status=? AND worker_id=?`,
-		StatusRunning, workerID)
+	rows, err := tx.query(ctx, `SELECT DISTINCT s.run_id, r.ephemeral
+		FROM steps s JOIN runs r ON r.id = s.run_id
+		WHERE s.status=? AND s.worker_id=?`, StatusRunning, workerID)
 	if err != nil {
 		return err
 	}
 	var runIDs []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var ephemeral int64
+		if err := rows.Scan(&id, &ephemeral); err != nil {
 			rows.Close()
 			return err
+		}
+		if ephemeral != 0 {
+			if err := deleteEphemeralRunTx(ctx, tx, id); err != nil {
+				rows.Close()
+				return err
+			}
+			continue
 		}
 		runIDs = append(runIDs, id)
 	}

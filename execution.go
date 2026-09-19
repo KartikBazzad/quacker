@@ -113,6 +113,8 @@ type RunSummary struct {
 	CompletedAt time.Time `json:"completed_at,omitempty"`
 	// DeadLetteredAt is set when the run was dead-lettered (zero otherwise).
 	DeadLetteredAt time.Time `json:"dead_lettered_at,omitempty"`
+	// Ephemeral is true for a run that is deleted on terminal.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 // RunFilter selects runs for Runs.
@@ -238,6 +240,7 @@ func runSummary(r *store.Run) RunSummary {
 		Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID,
 		CreatedAt: unixToTime(r.CreatedAt), StartedAt: unixToTime(r.StartedAt),
 		CompletedAt: unixToTime(r.CompletedAt), DeadLetteredAt: unixToTime(r.DeadLetteredAt),
+		Ephemeral: r.Ephemeral,
 	}
 }
 

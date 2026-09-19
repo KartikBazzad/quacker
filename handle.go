@@ -38,6 +38,9 @@ var (
 	// ErrNotDeadLetter is returned by RetryDeadLetter/DismissDeadLetter for a
 	// run that is not dead-lettered.
 	ErrNotDeadLetter = store.ErrNotDeadLetter
+	// ErrRunGone is returned by Result for an ephemeral run that was deleted
+	// before its result could be observed.
+	ErrRunGone = engine.ErrRunGone
 )
 
 // RunHandle tracks an enqueued run.

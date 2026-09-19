@@ -276,6 +276,7 @@ func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], 
 			RunAt:     ec.runAt,
 			UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), b),
 			Conflict:  t.cfg.uniqueMode,
+			Ephemeral: t.cfg.ephemeral,
 			Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 		}
 	}
@@ -318,6 +319,7 @@ func EnqueueTx[I any, O any](ctx context.Context, tx *sql.Tx, q *Quacker, t *Tas
 		RunAt:     ec.runAt,
 		UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
 		Conflict:  t.cfg.uniqueMode,
+		Ephemeral: t.cfg.ephemeral,
 		Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 	})
 }
@@ -343,6 +345,7 @@ func EnqueueBatchTx[I any, O any](ctx context.Context, tx *sql.Tx, q *Quacker, t
 			RunAt:     ec.runAt,
 			UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), b),
 			Conflict:  t.cfg.uniqueMode,
+			Ephemeral: t.cfg.ephemeral,
 			Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 		}
 	}
@@ -379,6 +382,7 @@ func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], i
 		ParentID:  parent,
 		UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
 		Conflict:  t.cfg.uniqueMode,
+		Ephemeral: t.cfg.ephemeral,
 		Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 	})
 	if err != nil {
@@ -427,6 +431,7 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 		RunAt:     ec.runAt,
 		ParentID:  parent,
 		UniqueKey: ec.uniqueKey,
+		Ephemeral: wf.steps[0].def.Ephemeral,
 		Steps:     steps,
 	})
 	if err != nil {

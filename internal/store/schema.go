@@ -242,6 +242,12 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 );
 `
 
+// migration18 adds ephemeral runs: persisted while in flight, deleted on
+// terminal and never recovered.
+const migration18 = `
+ALTER TABLE runs ADD COLUMN ephemeral BIGINT NOT NULL DEFAULT 0;
+`
+
 // migration17 adds sequences: a per-run sequence key and insertion-order
 // value (denormalized to steps) plus the counter that allocates it.
 const migration17 = `
@@ -287,6 +293,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 15, SQL: migration15},
 	{Version: 16, SQL: migration16},
 	{Version: 17, SQL: migration17},
+	{Version: 18, SQL: migration18},
 }
 
 // init validates the built-in migration list's invariant before any Open can
@@ -402,6 +409,31 @@ func (s *Store) recoverInterrupted(ctx context.Context, keep bool) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	// Ephemeral runs are never recovered: this process owns the file, so any
+	// left by a previous process are discarded.
+	if rows, err := tx.query(ctx, `SELECT id FROM runs WHERE ephemeral=1`); err != nil {
+		return err
+	} else {
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if err := deleteEphemeralRunTx(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+	}
 
 	now := nowUnix()
 	for _, table := range []string{"steps", "runs"} {

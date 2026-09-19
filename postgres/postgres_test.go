@@ -681,6 +681,55 @@ func TestPostgresSequenceOrder(t *testing.T) {
 	}
 }
 
+// TestPostgresEphemeralRunGone: a reused ephemeral run executed by another
+// engine is deleted before its result can be observed, so the observer's
+// handle returns ErrRunGone.
+func TestPostgresEphemeralRunGone(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn, quacker.WithWorkerLabels("observer"))
+	b := openQ(t, dsn, quacker.WithWorkerLabels("worker-b"))
+	ctx := context.Background()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	task := quacker.NewTask("pg.eph", func(ctx context.Context, in string) (string, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return in, nil
+	}, quacker.WithEphemeral(),
+		quacker.WithUnique(func(in string) string { return in }),
+		quacker.WithLabels("worker-b"))
+
+	h1, err := quacker.Enqueue(ctx, b, task, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run never started on b")
+	}
+	// a cannot claim (label mismatch), so this reuses the live run and gets a
+	// poll waiter.
+	h2, err := quacker.Enqueue(ctx, a, task, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2.RunID() != h1.RunID() {
+		t.Fatalf("expected reuse: %s vs %s", h2.RunID(), h1.RunID())
+	}
+	close(release)
+	if _, err := h2.Result(ctx); !errors.Is(err, quacker.ErrRunGone) {
+		t.Fatalf("want ErrRunGone, got %v", err)
+	}
+	// The executing engine's own waiter still has the output.
+	if out, err := h1.Result(ctx); err != nil || out != "k" {
+		t.Fatalf("executor result = %q err=%v", out, err)
+	}
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

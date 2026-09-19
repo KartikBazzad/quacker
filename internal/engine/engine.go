@@ -36,6 +36,9 @@ var (
 	// ErrExternalTxUnsupported is returned by EnqueueOnTx for storage that
 	// cannot share a caller-owned transaction (SQLite).
 	ErrExternalTxUnsupported = errors.New("quacker: storage does not support enqueue on a caller transaction (Postgres/MySQL only)")
+	// ErrRunGone is returned when an ephemeral run was deleted before its
+	// result could be observed (e.g. a reused run executed by another engine).
+	ErrRunGone = errors.New("quacker: ephemeral run already finished and was discarded")
 )
 
 // DefaultQueueConcurrency is the concurrency assigned to queues that were
@@ -78,6 +81,8 @@ type TaskDef struct {
 	// SequenceFn extracts a sequence key; runs sharing a key execute strictly
 	// one-at-a-time in insertion order. nil means unsequenced.
 	SequenceFn func(c Codec, input json.RawMessage) string
+	// Ephemeral deletes a run on terminal and skips boot recovery.
+	Ephemeral bool
 }
 
 // StepReq is one step of an enqueue request.
@@ -102,6 +107,8 @@ type EnqueueRequest struct {
 	// among non-terminal runs. Conflict selects the outcome on collision.
 	UniqueKey string
 	Conflict  store.UniqueConflict
+	// Ephemeral deletes the run on terminal and skips boot recovery.
+	Ephemeral bool
 	Steps     []StepReq
 }
 
@@ -843,6 +850,12 @@ func (e *Engine) newPollWaiter(runID string) *Waiter {
 		defer t.Stop()
 		for {
 			r, err := e.st.GetRun(e.ctx, runID)
+			if errors.Is(err, store.ErrNotFound) {
+				// The run is gone (an ephemeral run deleted on terminal before
+				// we polled it).
+				w.finish("", nil, ErrRunGone)
+				return
+			}
 			if err == nil && store.IsTerminal(r.Status) {
 				w.finish(r.Status, json.RawMessage(r.Output), runErr(runID, r.Status, r.Error))
 				return
@@ -1014,6 +1027,7 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 	run.MaxAttempts = steps[0].MaxAttempts
 	run.ConcurrencyKey = steps[0].ConcurrencyKey
 	run.SequenceKey = steps[0].SequenceKey
+	run.Ephemeral = req.Ephemeral
 	return run, steps, nil
 }
 

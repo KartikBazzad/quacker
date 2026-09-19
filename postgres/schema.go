@@ -179,3 +179,8 @@ CREATE TABLE IF NOT EXISTS counters (
 );
 INSERT INTO counters (name, next) VALUES ('run', 0) ON CONFLICT (name) DO NOTHING;
 `
+
+// pgMigration10 adds ephemeral runs.
+const pgMigration10 = `
+ALTER TABLE runs ADD COLUMN ephemeral BIGINT NOT NULL DEFAULT 0;
+`

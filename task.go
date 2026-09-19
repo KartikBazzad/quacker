@@ -37,6 +37,7 @@ type taskConfig struct {
 	uniqueOn    bool
 	uniqueMode  UniqueConflict
 	deadLetter  bool
+	ephemeral   bool
 	sequenceFn  func(engine.Codec, json.RawMessage) string
 	sequenceOn  bool
 	wrap        []engine.Middleware
@@ -144,6 +145,15 @@ func WithSequence[I any](fn func(I) string) TaskOption {
 	}
 }
 
+// WithEphemeral makes runs of this task ephemeral: persisted while in flight
+// (so claiming, retries, and introspection work) but deleted when they reach a
+// terminal state and discarded on restart rather than recovered. No history
+// remains; a cross-engine Result returns ErrRunGone if the run was deleted
+// before it could be observed.
+func WithEphemeral() TaskOption {
+	return func(c *taskConfig) { c.ephemeral = true }
+}
+
 // WithDeadLetter marks a run dead-lettered when it exhausts its retries, so it
 // appears in DeadLetters and can be retried with RetryDeadLetter. Runs of a
 // task without it that fail are ordinary FAILED runs.
@@ -221,5 +231,6 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	def.Labels = t.cfg.labels
 	def.DeadLetter = t.cfg.deadLetter
 	def.SequenceFn = t.cfg.sequenceFn
+	def.Ephemeral = t.cfg.ephemeral
 	return def
 }

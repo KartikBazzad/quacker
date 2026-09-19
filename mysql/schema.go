@@ -174,3 +174,8 @@ CREATE TABLE IF NOT EXISTS counters (
 ) ENGINE=InnoDB;
 INSERT IGNORE INTO counters (name, next) VALUES ('run', 0);
 `
+
+// myMigration7 adds ephemeral runs.
+const myMigration7 = `
+ALTER TABLE runs ADD COLUMN ephemeral BIGINT NOT NULL DEFAULT 0;
+`
