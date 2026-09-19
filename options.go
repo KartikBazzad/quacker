@@ -98,6 +98,7 @@ type config struct {
 	leaseTTL           time.Duration
 	plugins            []engine.Hooks
 	codec              engine.Codec
+	payloadKey         []byte
 	logSink            func(LogEntry)
 	logStorage         bool
 	metricsFn          func(*Metrics)

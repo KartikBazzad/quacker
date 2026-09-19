@@ -43,6 +43,16 @@ func Open(opts ...Option) (*Quacker, error) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
+	if cfg.payloadKey != nil {
+		if cfg.codec != nil {
+			return nil, errors.New("quacker: WithPayloadKey and WithCodec are mutually exclusive")
+		}
+		enc, err := NewEncryptedJSONCodec(cfg.payloadKey)
+		if err != nil {
+			return nil, err
+		}
+		cfg.codec = enc
+	}
 	cfg.storage.CheckpointInterval = cfg.checkpointInterval
 	st, err := store.Open(cfg.storage)
 	if err != nil {
