@@ -1,8 +1,11 @@
 # Roadmap
 
-Status: **v1.3 shipped** — v0.4/v1.1/v1.2 are shipped, and v1.3 adds
-lifecycle-hook plugins and a pluggable payload codec. Custom storage backends
-are a deliberate non-goal (storage stays first-party SQLite + Postgres).
+Status: **v1.0–v1.3 shipped** — durable execution, DAG visualizer, debug
+logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
+perf pass, lifecycle-hook plugins, and a pluggable payload codec are all done.
+Custom storage backends are a deliberate non-goal (storage stays first-party
+SQLite + Postgres). The v1.0 stability gates (semver policy, chaos, fuzzing,
+pkg.go.dev examples) are complete; release tags wait on a git remote.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -228,14 +231,21 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v1.0 — stability
+## v1.0 — stability (✅ DONE — release tags pending a remote)
 
-- API freeze + semver discipline.
-- Chaos suite for File mode: injected process kills at every write site,
-  verifying recovery re-queues exactly-once-ish (at-least-once, no lost
-  terminal states).
-- Fuzzing for the DAG validator and cron parsing.
-- Docs site / pkg.go.dev examples baked into `example_test.go`.
+- ✅ **API freeze + semver discipline** documented in
+  [STABILITY.md](STABILITY.md): the public surface, storage-format
+  compatibility, and the extension points. Release tags can't be published
+  until a git remote exists.
+- ✅ **Chaos suite for File mode** (`chaos_test.go`): a child process enqueues a
+  workload, is SIGKILLed mid-execution, and the parent reopens the database and
+  asserts every run recovers to SUCCEEDED (at-least-once, no lost terminal
+  states). Best-effort random kill points per iteration rather than an
+  exhaustive hook at every write site — a deliberate simplification.
+- ✅ **Fuzzing** for the DAG validator and the cron parser
+  (`internal/engine/fuzz_test.go`), including the `@every` sub-second path.
+- ✅ **pkg.go.dev examples** in `example_test.go` (basic task, workflow +
+  `DepOutput`, durable sleep/`RunOnce`, plugin), plus the docs site.
 
 ---
 

@@ -576,7 +576,8 @@ shipped.
 - [Architecture](docs/ARCHITECTURE.md) — how the engine, store, and event bus fit together
 - [Design notes](docs/DESIGN_NOTES.md) — key decisions and lessons from the build
 - [Benchmarks](docs/BENCHMARKS.md) — numbers, methodology, how to reproduce
-- [Roadmap](docs/ROADMAP.md) — shipped versions, v0.3 visibility/perf, follow-on epics
+- [Roadmap](docs/ROADMAP.md) — shipped versions and follow-on epics
+- [Stability & versioning](docs/STABILITY.md) — API/storage compatibility and the extension points
 
 ## Examples
 

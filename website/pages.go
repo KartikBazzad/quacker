@@ -33,6 +33,7 @@ var pages = []pageDef{
 	{slug: "design-notes", title: "Design notes", nav: "Design notes", group: "Internals", src: docsPage, docs: "DESIGN_NOTES.md"},
 	{slug: "benchmarks", title: "Benchmarks", nav: "Benchmarks", group: "Internals", src: docsPage, docs: "BENCHMARKS.md"},
 	{slug: "roadmap", title: "Roadmap", nav: "Roadmap", group: "Internals", src: docsPage, docs: "ROADMAP.md"},
+	{slug: "stability", title: "Stability & versioning", nav: "Stability", group: "Internals", src: docsPage, docs: "STABILITY.md"},
 }
 
 // navGroup is one sidebar section.
