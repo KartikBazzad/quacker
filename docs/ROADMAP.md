@@ -1,9 +1,9 @@
 # Roadmap
 
-Status: **v0.3 in progress** — v0.2 is fully shipped; the durable-execution
-substrate, durable sleep (slice A) and durable event waits (slice B) are
-done. Next: child runs; then worker labels, OTel, and the Postgres/
-multi-instance epic.
+Status: **v0.3 in progress** — v0.2 is fully shipped; durable execution is
+complete (slices A/B/C: substrate + durable sleep, durable event waits, child
+runs). Remaining v0.3: embedded debug logger, DAG visualizer, perf. Then
+worker labels, OTel, and the Postgres/multi-instance epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -183,10 +183,15 @@ where an emit between "append entry" and "set SUSPENDED" would be lost.
 `q.Emit` now does both: durable `WaitFor` wakeups (atomic) and `On`-binding
 fan-out; it returns the number of binding runs enqueued.
 
-### Slice C — child runs
+### Slice C — child runs (✅ DONE)
 
-- **Child runs**: enqueue from inside a task with `runs.parent_id` for
-  lineage; `Execution` exposes children. Lineage only — no implicit join.
+Migration v6 adds `runs.parent_id` + an index. `EnqueueChild` /
+`EnqueueWorkflowChild` enqueue a child of the run currently executing
+(`RunIDFromContext`), and `Execution.Children`, `RunSummary.ParentID`, and
+`RunFilter.ParentID` expose the lineage. As built: lineage only — no implicit
+join, a failed child does not fail the parent, and there is no foreign key,
+so a purged parent leaves its children with a dangling id (documented).
+Children are ordinary runs and are aged/purged independently.
 - **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to a channel, which can be consumed by the user.
   - "We dont want the quacker to serve http. so a method can return debug logs"
 - **DAG Visualizer**: `q.DAGJSON()` returns a JSON representation of the DAG, which can be consumed by the user.

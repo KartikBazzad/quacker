@@ -84,6 +84,9 @@ type Execution struct {
 	StartedAt   time.Time   `json:"started_at,omitempty"`
 	CompletedAt time.Time   `json:"completed_at,omitempty"`
 	Steps       []StepState `json:"steps"`
+	// Children are runs enqueued from inside this run (via EnqueueChild),
+	// oldest first. They run independently; the parent does not wait for them.
+	Children []RunSummary `json:"children,omitempty"`
 }
 
 // RunSummary is a run without payloads, for list views.
@@ -95,6 +98,7 @@ type RunSummary struct {
 	Queue       string    `json:"queue"`
 	Priority    int64     `json:"priority"`
 	Error       string    `json:"error,omitempty"`
+	ParentID    string    `json:"parent_id,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
@@ -105,6 +109,8 @@ type RunFilter struct {
 	Status   Status
 	Queue    string
 	Workflow string
+	// ParentID limits the result to a run's children.
+	ParentID string
 	Limit    int
 	Offset   int
 }
@@ -185,13 +191,23 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 			WaitEvent: s.WaitEvent, ResumeAt: unixToTime(s.ResumeAt),
 		})
 	}
+	if children, cerr := q.st.ListChildren(ctx, runID); cerr == nil {
+		for _, c := range children {
+			ex.Children = append(ex.Children, RunSummary{
+				RunID: c.ID, Workflow: c.Workflow, Kind: Kind(c.Kind), Status: Status(c.Status),
+				Queue: c.Queue, Priority: c.Priority, Error: c.Error, ParentID: c.ParentID,
+				CreatedAt: unixToTime(c.CreatedAt), StartedAt: unixToTime(c.StartedAt),
+				CompletedAt: unixToTime(c.CompletedAt),
+			})
+		}
+	}
 	return ex, nil
 }
 
 // Runs lists runs matching the filter, newest first.
 func (q *Quacker) Runs(ctx context.Context, f RunFilter) ([]RunSummary, error) {
 	rs, err := q.st.ListRuns(ctx, store.Filter{
-		Status: string(f.Status), Queue: f.Queue, Workflow: f.Workflow,
+		Status: string(f.Status), Queue: f.Queue, Workflow: f.Workflow, ParentID: f.ParentID,
 		Limit: f.Limit, Offset: f.Offset,
 	})
 	if err != nil {
@@ -201,7 +217,7 @@ func (q *Quacker) Runs(ctx context.Context, f RunFilter) ([]RunSummary, error) {
 	for _, r := range rs {
 		out = append(out, RunSummary{
 			RunID: r.ID, Workflow: r.Workflow, Kind: Kind(r.Kind), Status: Status(r.Status),
-			Queue: r.Queue, Priority: r.Priority, Error: r.Error,
+			Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID,
 			CreatedAt: unixToTime(r.CreatedAt), StartedAt: unixToTime(r.StartedAt),
 			CompletedAt: unixToTime(r.CompletedAt),
 		})

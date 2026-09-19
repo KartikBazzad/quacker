@@ -172,12 +172,21 @@ CREATE TABLE IF NOT EXISTS step_journal (
 CREATE INDEX IF NOT EXISTS idx_journal_wait ON step_journal (kind, done, event);
 `
 
+// migration 6 adds child-run lineage: a run enqueued from inside another run
+// records its parent. No foreign key (lineage is informational, and a purged
+// parent may leave a dangling id).
+const migration6 = `
+ALTER TABLE runs ADD COLUMN parent_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_id, created_at);
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
 	{version: 3, sql: migration3},
 	{version: 4, sql: migration4},
 	{version: 5, sql: migration5},
+	{version: 6, sql: migration6},
 }
 
 // init validates the migration list's invariant before any Open can rely

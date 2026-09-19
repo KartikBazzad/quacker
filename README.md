@@ -52,6 +52,8 @@ is the wrong amount of infrastructure.
   process's growth in every storage mode
 - **Metrics callback** — `WithMetricsFunc` pushes periodic state snapshots
 - **DAG workflows** — steps with dependencies, upstream outputs via `DepOutput`
+- **Child runs** — `quacker.EnqueueChild` from inside a task records lineage;
+  `Execution` exposes a run's children
 - **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`), sub-second
   `"@every 250ms"`, and `quacker.WithDelay`; crons persist and re-arm on
   restart
@@ -237,6 +239,28 @@ are loaded and arm as soon as their task is registered, so the app only needs
 `quacker.Register`. A stored fire time still in the future is honored; a
 missed one is recomputed from now (no catch-up burst).
 
+## Child runs
+
+```go
+parent := quacker.NewTask("import", func(ctx context.Context, batch Batch) (Summary, error) {
+    for _, row := range batch.Rows {
+        // Recorded as a child of this run; runs independently.
+        if _, err := quacker.EnqueueChild(ctx, q, processRow, row); err != nil {
+            return Summary{}, err
+        }
+    }
+    return Summary{Queued: len(batch.Rows)}, nil
+})
+
+snap, _ := q.Execution(ctx, parentRunID) // snap.Children lists them
+```
+
+Children are ordinary runs with `ParentID` set. There is no implicit join —
+the parent can finish while its children run — and a failed child does not
+fail the parent. `RunFilter{ParentID: ...}` lists a run's children, and
+lineage is informational: purging a parent leaves its children (with a
+dangling `ParentID`) intact.
+
 ## Durable execution
 
 ```go
@@ -354,7 +378,7 @@ labels/affinity, a web UI, OpenTelemetry.
  runnable programs live in [`examples/`](examples/):
 [`simple`](examples/simple/main.go) · [`dag`](examples/dag/main.go) ·
 [`cron`](examples/cron/main.go) · [`events`](examples/events/main.go) ·
-[`durable`](examples/durable/main.go) ·
+[`durable`](examples/durable/main.go) · [`children`](examples/children/main.go) ·
 [`introspect`](examples/introspect/main.go)
 
 ## Development

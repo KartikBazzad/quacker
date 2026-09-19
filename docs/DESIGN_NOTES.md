@@ -386,6 +386,25 @@ right things in one transaction on the single writer:
 The same principle as the parent-run failure path (§4): decide and record in
 one transaction, and let later actors observe the committed result.
 
+### 22. Child runs are lineage, deliberately without a foreign key or a join
+
+`EnqueueChild` sets `runs.parent_id` from the executing step's context. Two
+choices are deliberate:
+
+- **No foreign key.** `parent_id REFERENCES runs(id)` would couple a run's
+  lifetime to its parent's, so purging a parent would either cascade-delete
+  children (losing live work) or fail on the constraint. Retention ages runs
+  by completion time independently, so lineage is informational and a purged
+  parent can leave a dangling id. `Execution.Children` simply queries by
+  `parent_id`.
+- **No implicit join.** A parent does not block on its children; the two run
+  on the same engine with independent retries, timeouts, and terminal states.
+  That keeps child runs composable with everything else (a child can itself
+  suspend, fan out, or wait on events), and a failed child leaves the parent
+  successful. A join, if wanted later, is expressible on top of the durable
+  substrate — a parent can `WaitFor` a completion event, or poll descendants
+  — rather than being baked into the enqueue path.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

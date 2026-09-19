@@ -84,7 +84,7 @@ growth whenever readers are momentarily idle — plus a best-effort
 ```
 runs(id, workflow, kind, status, queue, priority, input, output, error,
      attempts, max_attempts, run_at, created_at, started_at, completed_at,
-     concurrency_key)
+     concurrency_key, parent_id)
 steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
       run_at, created_at, started_at, completed_at,
@@ -107,7 +107,9 @@ Migration 3 adds `idx_runs_purge (status, completed_at)` for retention;
 migration 4 adds `events` (best-effort emit audit) and
 `event_subscriptions` (event→task bindings, unique per pair); migration 5
 adds the durable-execution columns on `steps` and the `step_journal` table
-(entries cascade with their step).
+(entries cascade with their step); migration 6 adds `runs.parent_id` +
+`idx_runs_parent` for child-run lineage (no foreign key — a purged parent may
+leave a dangling id).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -267,6 +269,14 @@ step failure. The contract — code before an await re-executes, and don't
 `recover()` over a helper (tasks or middleware) — is documented in
 DESIGN_NOTES §19–20.
 
+## Child runs
+
+`EnqueueChild` reads the executing run from the step context and sets the new
+run's `parent_id`; `Execution` loads a run's children by that column. There is
+no foreign key and no implicit join — children are ordinary runs with
+independent retries, timeouts, suspension, and retention, and a failed child
+does not fail the parent. See DESIGN_NOTES §22.
+
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
@@ -276,7 +286,7 @@ DESIGN_NOTES §19–20.
   sub-second and persistent cron, event emit/On/Off/arming, durable sleep and
   RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
-  subscription semantics).
+  subscription semantics, child-run lineage/independence).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

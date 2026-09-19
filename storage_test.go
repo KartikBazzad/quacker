@@ -28,7 +28,7 @@ func TestSchemaMigrationsBaseline(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if want := 5; v != want {
+	if want := 6; v != want {
 		t.Fatalf("schema version = %d, want %d", v, want)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -50,7 +50,7 @@ func TestSchemaMigrationsBaseline(t *testing.T) {
 		`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if want := 5; v != want {
+	if want := 6; v != want {
 		t.Fatalf("after reopen schema version = %d, want %d", v, want)
 	}
 }

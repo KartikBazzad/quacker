@@ -18,10 +18,10 @@ func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?)`,
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?)`,
 		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey)
+		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID)
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}
@@ -668,6 +668,7 @@ type Filter struct {
 	Status   string
 	Queue    string
 	Workflow string
+	ParentID string
 	Limit    int
 	Offset   int
 }
@@ -683,6 +684,9 @@ func (s *Store) ListRuns(ctx context.Context, f Filter) ([]*Run, error) {
 	if f.Workflow != "" {
 		where, args = append(where, "workflow=?"), append(args, f.Workflow)
 	}
+	if f.ParentID != "" {
+		where, args = append(where, "parent_id=?"), append(args, f.ParentID)
+	}
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
@@ -693,6 +697,25 @@ func (s *Store) ListRuns(ctx context.Context, f Filter) ([]*Run, error) {
 	args = append(args, limit, f.Offset)
 	rows, err := s.read.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE `+strings.Join(where, " AND ")+
 		` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListChildren returns the runs enqueued from parentID, oldest first.
+func (s *Store) ListChildren(ctx context.Context, parentID string) ([]*Run, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT `+runCols+` FROM runs WHERE parent_id=? ORDER BY created_at`, parentID)
 	if err != nil {
 		return nil, err
 	}

@@ -15,6 +15,7 @@ package quacker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -151,6 +152,22 @@ func WithPriority(p int64) EnqueueOption {
 
 // Enqueue enqueues one run of task with input.
 func Enqueue[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	return enqueueTask(ctx, q, t, input, "", opts...)
+}
+
+// EnqueueChild enqueues one run of task as a child of the run currently
+// executing (from RunIDFromContext). It is only valid inside a task or
+// workflow step; the child runs independently (no implicit join), and
+// Execution exposes it under Children.
+func EnqueueChild[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	parent := RunIDFromContext(ctx)
+	if parent == "" {
+		return nil, errors.New("quacker: EnqueueChild requires a task context")
+	}
+	return enqueueTask(ctx, q, t, input, parent, opts...)
+}
+
+func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input I, parent string, opts ...EnqueueOption) (*RunHandle[O], error) {
 	ec := enqueueConfig{}
 	for _, opt := range opts {
 		opt(&ec)
@@ -165,6 +182,7 @@ func Enqueue[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input
 		Input:    inputJSON,
 		Priority: ec.priority,
 		RunAt:    ec.runAt,
+		ParentID: parent,
 		Steps:    []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 	})
 	if err != nil {
@@ -179,6 +197,20 @@ func Enqueue[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input
 //
 //	h, err := quacker.EnqueueWorkflow[Shipment](ctx, q, wf, order)
 func EnqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow[I], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	return enqueueWorkflow[O](ctx, q, wf, input, "", opts...)
+}
+
+// EnqueueWorkflowChild enqueues a workflow run as a child of the currently
+// executing run. Only valid inside a task or workflow step.
+func EnqueueWorkflowChild[O any, I any](ctx context.Context, q *Quacker, wf *Workflow[I], input I, opts ...EnqueueOption) (*RunHandle[O], error) {
+	parent := RunIDFromContext(ctx)
+	if parent == "" {
+		return nil, errors.New("quacker: EnqueueWorkflowChild requires a task context")
+	}
+	return enqueueWorkflow[O](ctx, q, wf, input, parent, opts...)
+}
+
+func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow[I], input I, parent string, opts ...EnqueueOption) (*RunHandle[O], error) {
 	ec := enqueueConfig{}
 	for _, opt := range opts {
 		opt(&ec)
@@ -197,6 +229,7 @@ func EnqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 		Input:    inputJSON,
 		Priority: ec.priority,
 		RunAt:    ec.runAt,
+		ParentID: parent,
 		Steps:    steps,
 	})
 	if err != nil {

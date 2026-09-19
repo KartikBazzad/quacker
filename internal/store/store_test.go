@@ -256,6 +256,39 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	}
 }
 
+// TestMigrationV6ParentAndListChildren: migration 6 adds parent_id, and
+// ListChildren/ListRuns(parent) find a run's children.
+func TestMigrationV6ParentAndListChildren(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	mk := func(id, parent string) {
+		run := &Run{ID: id, Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1, ParentID: parent}
+		step := &Step{ID: id + "/s", RunID: id, Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+		if err := s.CreateRun(ctx, run, []*Step{step}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("p", "")
+	mk("c1", "p")
+	mk("c2", "p")
+	kids, err := s.ListChildren(ctx, "p")
+	if err != nil || len(kids) != 2 {
+		t.Fatalf("children = %+v err=%v, want 2", kids, err)
+	}
+	if kids[0].ParentID != "p" {
+		t.Fatalf("child parent = %q, want p", kids[0].ParentID)
+	}
+	rs, err := s.ListRuns(ctx, Filter{ParentID: "p"})
+	if err != nil || len(rs) != 2 {
+		t.Fatalf("filtered runs = %+v err=%v, want 2", rs, err)
+	}
+}
+
 // TestDeliverEventWakesWaitersAndRespectsTimeout: DeliverEvent wakes undone
 // waits and sets them QUEUED, but never resurrects one already timed out.
 func TestDeliverEventWakesWaitersAndRespectsTimeout(t *testing.T) {

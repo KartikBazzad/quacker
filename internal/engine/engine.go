@@ -79,6 +79,9 @@ type EnqueueRequest struct {
 	Queue    string
 	Priority int64
 	RunAt    time.Time // zero = now
+	// ParentID links this run to the run that enqueued it ("" for a root
+	// run). Lineage is informational.
+	ParentID string
 	Steps    []StepReq
 }
 
@@ -486,7 +489,7 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 
 	run := &store.Run{
 		ID: runID, Workflow: req.Workflow, Kind: req.Kind, Status: store.StatusQueued,
-		Queue: queue, Priority: req.Priority, Input: req.Input,
+		Queue: queue, Priority: req.Priority, Input: req.Input, ParentID: req.ParentID,
 		MaxAttempts: 1, RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
 	}
 	var steps []*store.Step
