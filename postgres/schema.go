@@ -120,6 +120,12 @@ CREATE TABLE IF NOT EXISTS step_journal (
 CREATE INDEX IF NOT EXISTS idx_journal_wait ON step_journal (kind, done, event);
 `
 
+// pgMigration3 adds indexes for the DAG completion hot path.
+const pgMigration3 = `
+CREATE INDEX IF NOT EXISTS idx_steps_run_status ON steps (run_id, status);
+CREATE INDEX IF NOT EXISTS idx_steps_run_name   ON steps (run_id, name);
+`
+
 // pgMigration2 adds multi-instance step leases.
 const pgMigration2 = `
 ALTER TABLE steps ADD COLUMN worker_id TEXT NOT NULL DEFAULT '';

@@ -1,9 +1,10 @@
 # Roadmap
 
-Status: **v0.4 + v1.1 shipped** — durable execution, DAG visualizer, debug
-logger, perf, worker labels, OTel tracing, the Postgres backend, and
-multi-instance step leases are all done. Next: **v1.2 performance** (the only
-open v1.1 item is optional `WithDB` connection reuse).
+Status: **v0.4, v1.1, v1.2 shipped** — durable execution, DAG visualizer,
+debug logger, worker labels, OTel tracing, the Postgres backend with
+multi-instance leases, and the perf pass (batch enqueue, multi-queue claims,
+DAG-completion fast path) are all done. Next: **v1.3 advanced features**
+(plugin system, custom storage backends); optional `WithDB` remains.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -260,15 +261,16 @@ Children are ordinary runs and are aged/purged independently.
 - **Reuse existing connection**: `WithDB(*sql.DB)` to hand quacker a pool it
   does not own. (Optional; the storage constructor already covers most cases.)
 
-## v1.2 - Performance Optimizations (in progress)
+## v1.2 - Performance Optimizations (✅ DONE — optional `WithDB` remains)
 
-- **DAG completion without full step scans.** `CompleteStep` loads every step
-  row (including `input`/`output` blobs) to unblock dependents and decide the
-  run is terminal — O(steps) per completion, O(steps²) for a wide DAG. Load
-  only the metadata the decision needs, and fetch the run output with a single
-  ordered query; blobs leave the hot path.
-- **Wide-DAG benchmark** to measure the per-completion cost (and regressions).
-- **Horizontal scaling** shipped via the Postgres multi-instance work (v1.1);
+- ✅ **DAG completion without full step scans.** `CompleteStep` now reads only
+  the direct dependents of the step that finished and their dependencies'
+  statuses (indexed by `(run_id, status)` and `(run_id, name)`), and probes
+  for remaining work with a `LIMIT 1` existence check — no full-row load and no
+  input/output blobs on the hot path. A chain of 800 steps dropped from ~2.57s
+  to ~0.24s per run (~10×; BENCHMARKS.md).
+- ✅ **Wide-DAG benchmark** (`BenchmarkWideDAGComplete`).
+- ✅ **Horizontal scaling** via the Postgres multi-instance work (v1.1);
   optional cross-node `LISTEN/NOTIFY` wakeups remain a follow-up.
 - Optional: `WithDB(*sql.DB)` connection reuse (the last v1.1 item).
 

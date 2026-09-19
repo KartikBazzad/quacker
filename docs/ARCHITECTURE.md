@@ -229,10 +229,12 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
    loaded before the task runs and exposed via `DepOutput`. Task logs go
    through a `slog` handler onto a buffered channel.
 4. **Record outcome** (all transitions in one write transaction):
-   - success → `CompleteStep`: step SUCCEEDED, then unblock newly ready
-     dependents, then — computed from the full step set inside the same
-     transaction — if no step remains QUEUED/RUNNING/BLOCKED, the run goes
-     terminal with the output of the last-ordered step.
+   - success → `CompleteStep`: step SUCCEEDED, then unblock the **direct
+     dependents** of that step and check — with a `LIMIT 1` existence probe,
+     not a full scan — whether any step remains active; if not, the run goes
+     terminal with the output of the last-ordered step. Indexes
+     `(run_id, status)` and `(run_id, name)` keep this off the full-step path
+     (DESIGN_NOTES §31).
    - retryable failure → step back to `QUEUED` with `run_at = now + backoff`.
    - exhausted failure → `FinalFailStep`: step FAILED, siblings CANCELLED,
      run FAILED (one transaction, guarded against overwriting a run that is

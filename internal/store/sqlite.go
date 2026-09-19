@@ -47,6 +47,12 @@ func (sqliteBackend) LabelGate() string {
 )`
 }
 
+func (sqliteBackend) BlockedDependentsSQL() string {
+	return `SELECT id, name, depends_on FROM steps
+		WHERE run_id=? AND status=?
+		  AND EXISTS (SELECT 1 FROM json_each(steps.depends_on) AS d WHERE d.value=?)`
+}
+
 var memSerial atomic.Int64
 
 // unique gives each in-memory database a distinct name so two quacker

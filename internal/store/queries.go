@@ -531,20 +531,121 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		return CompleteResult{StepDone: false}, tx.Commit()
 	}
 
-	steps, err := loadStepsTx(ctx, tx, runID)
-	if err != nil {
+	var stepName string
+	if err := tx.queryRow(ctx, `SELECT name FROM steps WHERE id=?`, stepID).Scan(&stepName); err != nil {
 		return CompleteResult{}, err
 	}
 	res := CompleteResult{StepDone: true, RunStatus: StatusRunning}
 
-	// Unblock newly-ready dependents.
-	for _, st := range steps {
-		if st.Status != StatusBlocked {
-			continue
+	// Unblock the direct dependents of the step that just finished. Only those
+	// BLOCKED steps are read (indexed by run_id,status, filtered to those that
+	// depend on stepName), and only their dependencies' statuses are fetched
+	// (indexed by run_id,name) — never the whole run or input/output blobs.
+	if err := s.unblockReadyTx(ctx, tx, runID, stepName, now, &res); err != nil {
+		return CompleteResult{}, err
+	}
+
+	// Terminal check: is any step still active? EXISTS stops at the first
+	// active row (indexed by run_id,status); only the final completion scans
+	// the run to find none.
+	var one int
+	switch err := tx.queryRow(ctx, `SELECT 1 FROM steps WHERE run_id=? AND status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED') LIMIT 1`, runID).Scan(&one); {
+	case err == nil:
+		return res, tx.Commit() // still active
+	case errors.Is(err, sql.ErrNoRows):
+		// terminal, fall through
+	default:
+		return CompleteResult{}, err
+	}
+
+	runStatus, runErr := StatusSucceeded, ""
+	var failedErr sql.NullString
+	switch err := tx.queryRow(ctx, `SELECT error FROM steps WHERE run_id=? AND status=? LIMIT 1`, runID, StatusFailed).Scan(&failedErr); {
+	case err == nil:
+		runStatus, runErr = StatusFailed, failedErr.String
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return CompleteResult{}, err
+	}
+	var lastOut []byte
+	if err := tx.queryRow(ctx, `SELECT output FROM steps WHERE run_id=? ORDER BY ord DESC LIMIT 1`, runID).Scan(&lastOut); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return CompleteResult{}, err
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+		runStatus, lastOut, runErr, now, runID); err != nil {
+		return CompleteResult{}, err
+	}
+	res.RunTerminal, res.RunStatus, res.RunError, res.RunOutput = true, runStatus, runErr, lastOut
+	return res, tx.Commit()
+}
+
+// unblockReadyTx queues the BLOCKED steps of runID whose dependencies have all
+// succeeded, appending their names to res.ReadySteps. It reads only BLOCKED
+// steps (indexed by run_id,status) and their dependencies' statuses (indexed
+// by run_id,name) — never the whole run and never input/output blobs.
+func (s *Store) unblockReadyTx(ctx context.Context, tx *txn, runID, completedName string, now int64, res *CompleteResult) error {
+	rows, err := tx.query(ctx, s.be.BlockedDependentsSQL(), runID, StatusBlocked, completedName)
+	if err != nil {
+		return err
+	}
+	type blockedStep struct {
+		id   string
+		name string
+		deps []string
+	}
+	var blocked []blockedStep
+	depSet := map[string]struct{}{}
+	for rows.Next() {
+		var id, name, deps string
+		if err := rows.Scan(&id, &name, &deps); err != nil {
+			rows.Close()
+			return err
 		}
+		b := blockedStep{id: id, name: name, deps: decodeList(deps)}
+		blocked = append(blocked, b)
+		for _, d := range b.deps {
+			depSet[d] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(blocked) == 0 {
+		return nil
+	}
+
+	status := make(map[string]string, len(depSet))
+	if len(depSet) > 0 {
+		names := make([]string, 0, len(depSet))
+		for n := range depSet {
+			names = append(names, n)
+		}
+		drows, err := tx.query(ctx, `SELECT name, status FROM steps WHERE run_id=? AND name IN (`+placeholders(len(names))+`)`,
+			append([]any{runID}, argsAny(names)...)...)
+		if err != nil {
+			return err
+		}
+		for drows.Next() {
+			var n, st string
+			if err := drows.Scan(&n, &st); err != nil {
+				drows.Close()
+				return err
+			}
+			status[n] = st
+		}
+		if err := drows.Err(); err != nil {
+			drows.Close()
+			return err
+		}
+		drows.Close()
+	}
+
+	for _, b := range blocked {
 		ready := true
-		for _, dep := range st.DependsOn {
-			if statusOf(steps, dep) != StatusSucceeded {
+		for _, d := range b.deps {
+			if status[d] != StatusSucceeded {
 				ready = false
 				break
 			}
@@ -552,37 +653,13 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		if !ready {
 			continue
 		}
-		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, run_at=? WHERE id=?`,
-			StatusQueued, now, st.ID); err != nil {
-			return CompleteResult{}, err
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, run_at=? WHERE id=? AND status=?`,
+			StatusQueued, now, b.id, StatusBlocked); err != nil {
+			return err
 		}
-		st.Status = StatusQueued
-		res.ReadySteps = append(res.ReadySteps, st.Name)
+		res.ReadySteps = append(res.ReadySteps, b.name)
 	}
-
-	// Terminal check.
-	if anyActive(steps) {
-		return res, tx.Commit()
-	}
-	runStatus, runErr := StatusSucceeded, ""
-	for _, st := range steps {
-		if st.Status == StatusFailed {
-			runStatus, runErr = StatusFailed, st.Error
-			break
-		}
-	}
-	last := steps[0]
-	for _, st := range steps[1:] {
-		if st.Ord > last.Ord {
-			last = st
-		}
-	}
-	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
-		runStatus, last.Output, runErr, now, runID); err != nil {
-		return CompleteResult{}, err
-	}
-	res.RunTerminal, res.RunStatus, res.RunError, res.RunOutput = true, runStatus, runErr, last.Output
-	return res, tx.Commit()
+	return nil
 }
 
 // RetryStep returns a failed attempt to the queue with a future run_at.
@@ -1089,23 +1166,6 @@ func (s *Store) GetStepOutputs(ctx context.Context, runID string, names []string
 	return out, rows.Err()
 }
 
-func loadStepsTx(ctx context.Context, tx *txn, runID string) ([]*Step, error) {
-	rows, err := tx.query(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*Step
-	for rows.Next() {
-		st, err := scanStep(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	return out, rows.Err()
-}
-
 func loadStepsDB(ctx context.Context, db *dbConn, runID string) ([]*Step, error) {
 	rows, err := db.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
 	if err != nil {
@@ -1121,25 +1181,6 @@ func loadStepsDB(ctx context.Context, db *dbConn, runID string) ([]*Step, error)
 		out = append(out, st)
 	}
 	return out, rows.Err()
-}
-
-func statusOf(steps []*Step, name string) string {
-	for _, s := range steps {
-		if s.Name == name {
-			return s.Status
-		}
-	}
-	return StatusFailed // missing dependency fails the gate (validated at enqueue anyway)
-}
-
-func anyActive(steps []*Step) bool {
-	for _, s := range steps {
-		switch s.Status {
-		case StatusQueued, StatusRunning, StatusBlocked, StatusSuspended:
-			return true
-		}
-	}
-	return false
 }
 
 func placeholders(n int) string {

@@ -43,6 +43,12 @@ type Backend interface {
 	// LabelGate is the SQL predicate (containing one '?' for the worker-labels
 	// JSON) admitting a step only when its labels are a subset of the worker's.
 	LabelGate() string
+	// BlockedDependentsSQL returns a statement ('?' placeholders: runID,
+	// blockedStatus, dependency name) selecting the BLOCKED steps of a run
+	// that depend on the named step, returning id, name, depends_on. It lets
+	// completion inspect only the direct dependents of the step that finished
+	// rather than every blocked step in the run.
+	BlockedDependentsSQL() string
 }
 
 var backends = map[string]Backend{}

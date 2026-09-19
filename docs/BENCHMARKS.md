@@ -58,12 +58,32 @@ producers serialize on the writer. That is the intended trade — embeddable
 and dependency-free over write parallelism — and the reason `EnqueueBatch`
 exists for fan-out.
 
+## DAG completion (v1.2)
+
+Finishing a step advances its DAG: unblock newly-ready dependents, then
+terminate the run once no step is active. The original `CompleteStep` loaded
+every step row — including `input`/`output` blobs — on each completion, making
+a wide DAG O(steps²). It now reads only the direct dependents of the step that
+finished plus their dependencies' statuses (indexes `(run_id, status)` and
+`(run_id, name)`), and checks for remaining work with a `LIMIT 1` existence
+probe. `BenchmarkWideDAGComplete` (a chain where each completion unblocks the
+next) went from:
+
+```
+n=800   before ~2.57 s/run        (full-row scan per completion)
+n=800   after  ~0.24 s/run        (~10x)
+```
+
+with completion cost now roughly flat per step instead of growing with the run
+size.
+
 ## Reproduce
 
 ```sh
 go test -run XXX -bench . -benchtime 3000x ./...
 go test -run XXX -bench 'BenchmarkEnqueueParallel' -benchtime 3000x -cpu 1,4,10 .
 go test -run XXX -bench 'BenchmarkCreateRunsBatch' -benchtime 3000x ./internal/store/
+go test -run XXX -bench 'BenchmarkWideDAGComplete' -benchtime 200x ./internal/store/
 ```
 
 Drop `-benchtime` for quicker runs; raise it for stable numbers. Run with

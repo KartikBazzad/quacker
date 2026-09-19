@@ -215,6 +215,15 @@ CREATE INDEX IF NOT EXISTS idx_steps_lease  ON steps (status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_steps_worker ON steps (worker_id, status);
 `
 
+// migration 11 adds indexes for the DAG completion hot path: (run_id, status)
+// so the terminal check stops at the first active step and BLOCKED steps are
+// read directly, and (run_id, name) so dependency statuses are looked up
+// without scanning the run.
+const migration11 = `
+CREATE INDEX IF NOT EXISTS idx_steps_run_status ON steps (run_id, status);
+CREATE INDEX IF NOT EXISTS idx_steps_run_name   ON steps (run_id, name);
+`
+
 var sqliteMigrations = []Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -226,6 +235,7 @@ var sqliteMigrations = []Migration{
 	{Version: 8, SQL: migration8},
 	{Version: 9, SQL: migration9},
 	{Version: 10, SQL: migration10},
+	{Version: 11, SQL: migration11},
 }
 
 // init validates each migration list's invariant before any Open can rely on

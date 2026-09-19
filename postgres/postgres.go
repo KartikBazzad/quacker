@@ -52,6 +52,7 @@ func (pgBackend) Migrations() []store.Migration {
 	return []store.Migration{
 		{Version: 1, SQL: pgSchema},
 		{Version: 2, SQL: pgMigration2},
+		{Version: 3, SQL: pgMigration3},
 	}
 }
 
@@ -101,6 +102,12 @@ func (pgBackend) LabelGate() string {
 	SELECT 1 FROM jsonb_array_elements_text(steps.labels::jsonb) AS l(value)
 	WHERE l.value NOT IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))
 )`
+}
+
+func (pgBackend) BlockedDependentsSQL() string {
+	return `SELECT id, name, depends_on FROM steps
+		WHERE run_id=? AND status=?
+		  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(steps.depends_on::jsonb) AS d(value) WHERE d.value=?)`
 }
 
 func (pgBackend) OpenPools(ctx context.Context, cfg store.Config) (w, r *sql.DB, cleanup func() error, err error) {

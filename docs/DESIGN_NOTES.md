@@ -581,6 +581,42 @@ only the closing worker's RUNNING steps and converges the runs it leaves with
 no active step, so a graceful restart of one node never interrupts another's
 in-flight work.
 
+### 31. DAG completion reads only the dependents of the step that finished
+
+`CompleteStep` advanced the DAG by loading *every* step row of the run — via
+`stepCols`, so each row carried its `input` and `output` blobs — then scanning
+in Go for BLOCKED steps whose deps had all succeeded and for any remaining
+active step. That is O(steps) per completion and O(steps²) for a wide DAG; a
+chain of 800 steps took ~2.6s to finish.
+
+The fix is to do in SQL exactly what the decision needs:
+
+- read only the **direct dependents** of the step that just finished
+  (`BlockedDependentsSQL`, a dialect snippet over `depends_on`), not every
+  blocked step;
+- look up only those dependents' **dependencies' statuses**;
+- probe for remaining work with `SELECT 1 … LIMIT 1` rather than counting rows;
+- fetch the run output with one `ORDER BY ord DESC LIMIT 1` only when the run
+  actually terminates.
+
+Two indexes make it stick: `(run_id, status)` so BLOCKED steps and the
+terminal probe are found directly, and `(run_id, name)` so dependency statuses
+are point lookups. The 800-step chain fell to ~0.24s (~10×).
+
+Two lessons from getting there:
+
+- **The first attempt was worse, not better.** Expressing the unblock as one
+  `UPDATE … WHERE NOT EXISTS (json_each(depends_on) …)` looked elegant but on
+  SQLite the correlated subquery was re-evaluated per candidate row and turned
+  an O(steps) scan into something closer to O(steps³) — 28s for the same 800
+  steps. Portable-looking SQL still has to be checked against the query
+  planner on each dialect.
+- **Benchmark methodology bit twice.** A shared store across benchmark
+  iterations accumulates rows from every iteration, so per-op cost drifts up
+  with `b.N` and looks like an algorithmic problem that isn't there; the
+  benchmark now uses a fresh store per iteration with setup outside the timer.
+  Measure the thing you changed, in isolation.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned
