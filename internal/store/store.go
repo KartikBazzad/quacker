@@ -115,6 +115,11 @@ func (s *Store) beginTx(ctx context.Context) (*txn, error) {
 // leases (Postgres), as opposed to single-process SQLite.
 func (s *Store) SupportsLeases() bool { return s.be.SupportsLeases() }
 
+// SupportsExternalTx reports whether the backend can enqueue on a caller-owned
+// *sql.Tx. SQLite cannot: quacker owns its single writer connection and the
+// file lock, so a caller transaction on the same file is not safe.
+func (s *Store) SupportsExternalTx() bool { return s.be.Name() != "sqlite" }
+
 // InterruptAll marks in-flight work INTERRUPTED (shutdown sweep). With an
 // empty workerID (single-process SQLite) every RUNNING row is swept. With a
 // workerID (leases mode) only that worker's RUNNING steps are swept, and the

@@ -6,6 +6,7 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,9 @@ var (
 	ErrClosed = errors.New("quacker: engine is closed")
 	// ErrUnknownTask is returned by RegisterCron for an unregistered task.
 	ErrUnknownTask = errors.New("quacker: unknown task")
+	// ErrExternalTxUnsupported is returned by EnqueueOnTx for storage that
+	// cannot share a caller-owned transaction (SQLite).
+	ErrExternalTxUnsupported = errors.New("quacker: storage does not support enqueue on a caller transaction (Postgres/MySQL only)")
 )
 
 // DefaultQueueConcurrency is the concurrency assigned to queues that were
@@ -816,6 +820,82 @@ func (e *Engine) newPollWaiter(runID string) *Waiter {
 		}
 	}()
 	return w
+}
+
+// SupportsExternalTx reports whether this engine can enqueue on a caller-owned
+// *sql.Tx (Postgres/MySQL, not SQLite).
+func (e *Engine) SupportsExternalTx() bool { return e.st.SupportsExternalTx() }
+
+// EnqueueOnTx inserts one run on a caller-owned transaction and returns its
+// id. It registers no waiter and never commits: the caller owns the
+// transaction, so the insert is atomic with the caller's business writes and
+// the run can execute on any engine after commit. Postgres/MySQL only.
+func (e *Engine) EnqueueOnTx(ctx context.Context, tx *sql.Tx, req *EnqueueRequest) (string, error) {
+	if !e.st.SupportsExternalTx() {
+		return "", ErrExternalTxUnsupported
+	}
+	if req == nil {
+		return "", errors.New("quacker: nil enqueue request")
+	}
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	run, sts, err := e.buildRun(req, e.now())
+	if err != nil {
+		return "", err
+	}
+	info := EnqueueInfo{Workflow: run.Workflow, Kind: run.Kind, Queue: run.Queue, Priority: run.Priority}
+	if _, herr := e.beforeEnqueue(ctx, info); herr != nil {
+		e.afterEnqueue(ctx, info, herr)
+		return "", herr
+	}
+	if _, err := e.st.CreateRunsTx(ctx, tx, []*store.Run{run}, [][]*store.Step{sts}, []store.UniqueConflict{req.Conflict}); err != nil {
+		e.afterEnqueue(ctx, info, err)
+		return "", err
+	}
+	e.afterEnqueue(ctx, info, nil)
+	return run.ID, nil
+}
+
+// EnqueueBatchOnTx is EnqueueOnTx for several requests, inserted on the same
+// caller transaction. It returns the new run ids in order.
+func (e *Engine) EnqueueBatchOnTx(ctx context.Context, tx *sql.Tx, reqs []*EnqueueRequest) ([]string, error) {
+	if !e.st.SupportsExternalTx() {
+		return nil, ErrExternalTxUnsupported
+	}
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	now := e.now()
+	runs := make([]*store.Run, len(reqs))
+	steps := make([][]*store.Step, len(reqs))
+	conflicts := make([]store.UniqueConflict, len(reqs))
+	infos := make([]EnqueueInfo, len(reqs))
+	for i, req := range reqs {
+		if req == nil {
+			return nil, errors.New("quacker: nil enqueue request")
+		}
+		run, sts, err := e.buildRun(req, now)
+		if err != nil {
+			return nil, err
+		}
+		info := EnqueueInfo{Workflow: run.Workflow, Kind: run.Kind, Queue: run.Queue, Priority: run.Priority}
+		if _, herr := e.beforeEnqueue(ctx, info); herr != nil {
+			e.afterEnqueueReverse(ctx, infos[:i], herr)
+			return nil, herr
+		}
+		runs[i], steps[i], conflicts[i], infos[i] = run, sts, req.Conflict, info
+	}
+	ids, err := e.st.CreateRunsTx(ctx, tx, runs, steps, conflicts)
+	if err != nil {
+		e.afterEnqueueReverse(ctx, infos, err)
+		return nil, err
+	}
+	e.afterEnqueueReverse(ctx, infos, nil)
+	return ids, nil
 }
 
 // afterEnqueueReverse fires AfterEnqueue for each info in reverse

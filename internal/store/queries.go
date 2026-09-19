@@ -72,14 +72,32 @@ type ReplacedRun struct {
 // and any runs replaced (for the engine to interrupt locally). A concurrent
 // enqueue race surfaces as a wrapped ErrUniqueViolation; the caller retries.
 func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, []ReplacedRun, error) {
-	if len(runs) != len(steps) || len(runs) != len(conflicts) {
-		return nil, nil, fmt.Errorf("quacker: CreateRunsUnique: %d runs, %d step sets, %d conflicts", len(runs), len(steps), len(conflicts))
-	}
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
+	ids, replaced, err := s.createRunsUniqueTx(ctx, tx, runs, steps, conflicts)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ids, replaced, tx.Commit()
+}
+
+// CreateRunsTx is CreateRunsUnique on a caller-owned transaction: it performs
+// the same conflict resolution and inserts but never commits or rolls back,
+// so the caller's business writes and the enqueued runs are atomic. Used by
+// Quacker.EnqueueTx (Postgres/MySQL only); no waits are registered.
+func (s *Store) CreateRunsTx(ctx context.Context, tx *sql.Tx, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, error) {
+	ids, _, err := s.createRunsUniqueTx(ctx, &txn{Tx: tx, be: s.be}, runs, steps, conflicts)
+	return ids, err
+}
+
+// createRunsUniqueTx is the shared body of CreateRunsUnique and CreateRunsTx.
+func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, []ReplacedRun, error) {
+	if len(runs) != len(steps) || len(runs) != len(conflicts) {
+		return nil, nil, fmt.Errorf("quacker: CreateRunsUnique: %d runs, %d step sets, %d conflicts", len(runs), len(steps), len(conflicts))
+	}
 	ids := make([]string, len(runs))
 	var replaced []ReplacedRun
 	for i, run := range runs {
@@ -112,7 +130,7 @@ func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*St
 			return nil, nil, err
 		}
 	}
-	return ids, replaced, tx.Commit()
+	return ids, replaced, nil
 }
 
 // liveRunByUnique returns the id of a non-terminal run holding (workflow, key),

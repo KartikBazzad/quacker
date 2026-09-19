@@ -14,6 +14,7 @@ package quacker
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -277,6 +278,65 @@ func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], 
 		out[i] = &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}
 	}
 	return out, nil
+}
+
+// ErrExternalTxUnsupported is returned by EnqueueTx/EnqueueBatchTx on storage
+// that cannot share a caller transaction (SQLite).
+var ErrExternalTxUnsupported = engine.ErrExternalTxUnsupported
+
+// EnqueueTx inserts one run of task on the caller's *sql.Tx and returns its id
+// without a handle. It never commits: the caller's Commit makes the run and
+// any business writes in the same transaction visible atomically, which is the
+// outbox/idempotency pattern. The run may execute on any engine once committed,
+// so wait via Execution rather than a handle. The caller's tx must target the
+// same Postgres/MySQL database as the engine; SQLite returns
+// ErrExternalTxUnsupported.
+func EnqueueTx[I any, O any](ctx context.Context, tx *sql.Tx, q *Quacker, t *Task[I, O], input I, opts ...EnqueueOption) (string, error) {
+	ec := enqueueConfig{}
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	inputJSON, err := q.eng.Codec().Marshal(input)
+	if err != nil {
+		return "", err
+	}
+	return q.eng.EnqueueOnTx(ctx, tx, &engine.EnqueueRequest{
+		Workflow:  t.name,
+		Kind:      store.KindTask,
+		Input:     inputJSON,
+		Priority:  ec.priority,
+		RunAt:     ec.runAt,
+		UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
+		Conflict:  t.cfg.uniqueMode,
+		Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+	})
+}
+
+// EnqueueBatchTx is EnqueueTx for several inputs on the caller's *sql.Tx. It
+// returns the new run ids in input order.
+func EnqueueBatchTx[I any, O any](ctx context.Context, tx *sql.Tx, q *Quacker, t *Task[I, O], inputs []I, opts ...EnqueueOption) ([]string, error) {
+	ec := enqueueConfig{}
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	reqs := make([]*engine.EnqueueRequest, len(inputs))
+	for i, in := range inputs {
+		b, err := q.eng.Codec().Marshal(in)
+		if err != nil {
+			return nil, err
+		}
+		reqs[i] = &engine.EnqueueRequest{
+			Workflow:  t.name,
+			Kind:      store.KindTask,
+			Input:     b,
+			Priority:  ec.priority,
+			RunAt:     ec.runAt,
+			UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), b),
+			Conflict:  t.cfg.uniqueMode,
+			Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+		}
+	}
+	return q.eng.EnqueueBatchOnTx(ctx, tx, reqs)
 }
 
 // EnqueueChild enqueues one run of task as a child of the run currently

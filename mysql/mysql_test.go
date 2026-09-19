@@ -468,6 +468,60 @@ func TestMySQLUniqueRaceCrossEngine(t *testing.T) {
 	}
 }
 
+func TestMySQLEnqueueTx(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	q := openQ(t, dsn)
+	ctx := context.Background()
+	task := quacker.NewTask("my.tx", func(ctx context.Context, in string) (string, error) { return in, nil })
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS biz`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE biz (id VARCHAR(32) PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO biz (id) VALUES ('a')`); err != nil {
+		t.Fatal(err)
+	}
+	id, err := quacker.EnqueueTx(ctx, tx, q, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, id)
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := quacker.EnqueueTx(ctx, tx2, q, task, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Execution(ctx, id2); !errors.Is(err, quacker.ErrNotFound) {
+		t.Fatalf("rolled-back run is visible: %v", err)
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)

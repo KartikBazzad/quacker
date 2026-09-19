@@ -535,6 +535,71 @@ func TestPostgresQueuePause(t *testing.T) {
 	}
 }
 
+// TestPostgresEnqueueTx: a run inserted on the caller's transaction commits
+// atomically with a business write, and a rollback leaves no run.
+func TestPostgresEnqueueTx(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	q := openQ(t, dsn)
+	ctx := context.Background()
+	task := quacker.NewTask("pg.tx", func(ctx context.Context, in string) (string, error) { return in, nil })
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS biz`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE biz (id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit: business row and run land together.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO biz (id) VALUES ('a')`); err != nil {
+		t.Fatal(err)
+	}
+	id, err := quacker.EnqueueTx(ctx, tx, q, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, id)
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+
+	// Rollback: neither the business row nor the run exists.
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx2.Exec(`INSERT INTO biz (id) VALUES ('b')`); err != nil {
+		t.Fatal(err)
+	}
+	id2, err := quacker.EnqueueTx(ctx, tx2, q, task, "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Execution(ctx, id2); !errors.Is(err, quacker.ErrNotFound) {
+		t.Fatalf("rolled-back run is visible: %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM biz WHERE id='b'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rolled-back business row count = %d err=%v", n, err)
+	}
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {
