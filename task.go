@@ -227,9 +227,10 @@ type Task[I, O any] struct {
 // capped at 30s, with 10% jitter.
 var defaultBackoff = Exponential(500 * time.Millisecond)
 
-// NewTask creates a task named name. Names must be unique per process and
-// are persisted with run state, so they are part of the storage format:
-// renaming a task orphans its in-flight runs.
+// NewTask creates a task named name. The name is the task's identity (see ID)
+// and must be unique per process; it is persisted with run state, so it is part
+// of the storage format — renaming a task orphans its in-flight runs, and
+// registering two different functions under one name silently keeps the last.
 func NewTask[I, O any](name string, fn func(ctx context.Context, in I) (O, error), opts ...TaskOption) *Task[I, O] {
 	cfg := taskConfig{maxAttempts: 1, backoff: defaultBackoff}
 	for _, opt := range opts {
@@ -240,6 +241,18 @@ func NewTask[I, O any](name string, fn func(ctx context.Context, in I) (O, error
 
 // Name returns the task's registered name.
 func (t *Task[I, O]) Name() string { return t.name }
+
+// ID returns the task's stable identity — its name, which is also what is
+// persisted with each run and used by Register, Cron, and On. Use it wherever
+// you would otherwise repeat the name as a string (a step name, a workflow
+// dependency), so the name is defined once and cannot be misspelled:
+//
+//	charge := quacker.NewTask("charge", chargeFn)
+//	wf := quacker.NewWorkflow[Order]("fulfill",
+//	    quacker.Step("charge", charge),
+//	    quacker.Step("ship", ship, charge.ID()), // not the literal "charge"
+//	)
+func (t *Task[I, O]) ID() string { return t.name }
 
 // toDef adapts the typed task to the engine's JSON-based definition.
 func (t *Task[I, O]) toDef() *engine.TaskDef {

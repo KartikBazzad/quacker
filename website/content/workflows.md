@@ -75,3 +75,23 @@ dashboards; `DAGSVG` renders an embeddable picture (see
 - Workflow input fans out to every step — keep it small; pass bulk data by
   reference (ids, keys) rather than embedding it.
 - Retries and timeouts are per task, not per workflow.
+
+## Define the name once
+
+`Task.ID()` returns the task's identity (its name). Use it for the step name
+and for dependencies instead of repeating a string literal that can drift or be
+misspelled:
+
+```go
+charge := quacker.NewTask("charge", chargeFn)
+ship := quacker.NewTask("ship", shipFn)
+
+wf := quacker.NewWorkflow[Order]("fulfill",
+    quacker.Step(charge.ID(), charge),
+    quacker.Step(ship.ID(), ship, charge.ID()), // not the literal "charge"
+)
+```
+
+The step name is the string that `DepOutput`, node labels, and dependencies
+use; naming the step `charge.ID()` keeps the task and its step in sync. (If you
+name a step differently, reference it by that step name.)
