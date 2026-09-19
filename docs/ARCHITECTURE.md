@@ -240,15 +240,24 @@ supplying a def arms its triggers too.
 
 ## Durable execution
 
-`SleepDurable`/`RunOnce` (and the coming `WaitFor`) implement journaled
-replay. `step_journal` holds one row per durable call in call order. On each
+`SleepDurable`/`RunOnce`/`WaitFor` implement journaled replay.
+`step_journal` holds one row per durable call in call order. On each
 invocation the executor loads the journal into the step context; a cursor
 replays entries by index, validating `kind` (and key/event) as it goes. A
-satisfied entry returns; an unsatisfied one is appended and the task unwinds
+satisfied entry returns; an unsatisfied one is recorded and the task unwinds
 via an internal `suspendSignal` panic, which the executor recognizes and
-records as `SUSPENDED` with `resume_at` (a sleep's wake or a wait's timeout;
-0 = event-only). Because `SUSPENDED` is not `RUNNING`, the step holds no queue
-or per-key slot, and the DB-count key gate frees it automatically.
+publishes as `SUSPENDED`. The helper records the suspension itself
+(`SuspendWithJournal`) atomically with the journal entry, so a visible wait
+entry always means a suspended step — this closes an emit-vs-suspend race.
+`resume_at` is a sleep's wake or a wait's timeout (0 = event-only). Because
+`SUSPENDED` is not `RUNNING`, the step holds no queue or per-key slot, and the
+DB-count key gate frees it automatically.
+
+`Emit` calls `DeliverEvent`, one transaction that inserts the event and flips
+every undone matching wait to done with the payload before setting those steps
+QUEUED; timeouts claim their entry with a conditional
+`UPDATE ... WHERE done=0`, so an emit that commits first wins and a
+post-timeout emit is inert.
 
 `RunOnce` never suspends: it appends an undone entry, runs `fn`, and on
 success memoizes the result. On `fn` error it leaves the entry undone so a
@@ -266,7 +275,8 @@ DESIGN_NOTES §19–20.
   ordering/panic/retry, log-sink routing, metrics push, purge/retention,
   sub-second and persistent cron, event emit/On/Off/arming, durable sleep and
   RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
-  restart-mid-sleep).
+  restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
+  subscription semantics).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

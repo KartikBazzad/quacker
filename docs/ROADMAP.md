@@ -1,9 +1,9 @@
 # Roadmap
 
 Status: **v0.3 in progress** — v0.2 is fully shipped; the durable-execution
-substrate and durable sleep (slice A) are done. Next: durable event waits,
-then child runs; then worker labels, OTel, and the Postgres/multi-instance
-epic.
+substrate, durable sleep (slice A) and durable event waits (slice B) are
+done. Next: child runs; then worker labels, OTel, and the Postgres/
+multi-instance epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -167,15 +167,21 @@ journal's kind/key/event instead of resuming with wrong data.
 - ✅ `SleepDurable`.
 - ✅ `RunOnce` (required for replay-safe side effects).
 
-### Slice B — durable event waits (next)
+### Slice B — durable event waits (✅ DONE)
 
-- `WaitFor[T](ctx, "payment.received", timeout)`: `Emit` atomically inserts
-  the event and appends its payload to every undone matching wait entry (in
-  one writer transaction), then wakes them; timeout writes `timed_out=1,
-  done=1` before returning `ErrWaitTimeout`, and delivery only touches
-  `done=0` entries so a late emit cannot resurrect a consumed wait. Waits are
-  subscription-style (an event emitted before the wait registers does not
-  count).
+`WaitFor[T](ctx, "payment.received", timeout)` appends a wait entry and
+suspends (resume_at = deadline, or 0 for event-only). `Emit` runs
+`DeliverEvent`: one transaction inserts the event and flips every undone
+matching wait to done with the payload, then sets those steps QUEUED. Timeout
+writes `timed_out=1, done=1` conditionally and returns `ErrWaitTimeout`;
+delivery only touches `done=0` entries, so a late emit cannot resurrect a
+consumed wait. Waits are subscription-style — an event emitted before the
+wait registers does not count. As built, the suspension transition and the
+journal insert are one transaction (`SuspendWithJournal`), closing the race
+where an emit between "append entry" and "set SUSPENDED" would be lost.
+
+`q.Emit` now does both: durable `WaitFor` wakeups (atomic) and `On`-binding
+fan-out; it returns the number of binding runs enqueued.
 
 ### Slice C — child runs
 

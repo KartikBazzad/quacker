@@ -752,12 +752,9 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		out, err = handler(stepCtx, st.Input)
 	}()
 	if suspend != nil {
-		snow := e.now()
-		if serr := e.st.SuspendStep(bg, st.ID, suspend.waitKind, suspend.event, suspend.resumeAt, snow.UnixNano()); serr != nil {
-			e.log.Error("quacker: record suspend", "run", st.RunID, "step", st.Name, "err", serr)
-			return
-		}
-		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSuspended, "", snow.UnixNano())
+		// The helper already recorded SUSPENDED atomically with its journal
+		// entry; just publish the transition.
+		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSuspended, "", e.now().UnixNano())
 		return
 	}
 

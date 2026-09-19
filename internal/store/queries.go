@@ -874,14 +874,6 @@ func (s *Store) ListCrons(ctx context.Context) ([]*Cron, error) {
 // ---------------------------------------------------------------------------
 // Events.
 
-// AppendEvent persists one emitted event.
-func (s *Store) AppendEvent(ctx context.Context, e *Event) error {
-	_, err := s.write.ExecContext(ctx,
-		`INSERT INTO events (name, payload, created_at) VALUES (?,?,?)`,
-		e.Name, e.Payload, e.CreatedAt)
-	return err
-}
-
 // ListEvents returns up to limit most recent events, newest first.
 func (s *Store) ListEvents(ctx context.Context, limit int) ([]*Event, error) {
 	if limit <= 0 {

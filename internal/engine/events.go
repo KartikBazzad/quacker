@@ -66,10 +66,12 @@ func (e *Engine) RemoveEvent(event, task string) error {
 	return e.st.DeleteEventSub(context.Background(), event, task)
 }
 
-// Emit persists an event and dispatches it to every armed binding for its
-// name, one run each. Delivery is best-effort in-process: the row is written
-// first, but a crash before the enqueues below loses those dispatches.
-// Unbound events still persist. It returns how many runs were enqueued.
+// Emit records an event and dispatches it: it persists the event and wakes
+// every armed durable WaitFor on that event atomically, then enqueues one run
+// per armed On binding. The enqueue half is best-effort in-process: a crash
+// after the atomic wake but before the enqueues loses those run bindings
+// (unbound events and event waits still deliver). It returns how many On
+// binding runs were enqueued.
 func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage) (int, error) {
 	if name == "" {
 		return 0, errors.New("quacker: event name required")
@@ -77,10 +79,12 @@ func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage)
 	if ctx == nil {
 		ctx = e.ctx
 	}
-	if err := e.st.AppendEvent(ctx, &store.Event{
-		Name: name, Payload: payload, CreatedAt: e.now().UnixNano(),
-	}); err != nil {
+	woken, err := e.st.DeliverEvent(ctx, name, payload, e.now().UnixNano())
+	if err != nil {
 		return 0, err
+	}
+	if woken > 0 {
+		e.wakeScheduler()
 	}
 	e.mu.RLock()
 	subs := append([]*eventSub(nil), e.eventSubs[name]...)

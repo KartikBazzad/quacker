@@ -252,16 +252,31 @@ task := quacker.NewTask("orders.fulfill", func(ctx context.Context, id string) (
     if err := quacker.SleepDurable(ctx, 2*time.Hour); err != nil { // no worker slot held
         return "", err
     }
-    return ship(receipt), nil
+
+    // Suspend until an event arrives (or time out). Wait is durable and
+    // subscription-style: only events emitted after it registers count.
+    var payment Payment
+    payment, err = quacker.WaitFor[Payment](ctx, "payment.received", 24*time.Hour)
+    if err != nil {
+        return "", err // quacker.ErrWaitTimeout on timeout
+    }
+    return ship(receipt, payment), nil
 })
 ```
 
-`SleepDurable` marks the step `SUSPENDED`: it releases its queue and per-key
-slots and is not charged an attempt. When the wake time passes the step is
-claimed again and the task is re-invoked **from the top**, at which point the
-sleep returns immediately. With File storage this survives a restart; the
-per-attempt timeout covers active execution only, not the sleep.
-`Execution().Steps[i].Status` shows `SUSPENDED` with a `ResumeAt`.
+`q.Emit(ctx, "payment.received", payment)` wakes every waiting run with the
+payload in one transaction; it also still triggers `On`-bound tasks.
+
+`SleepDurable` and `WaitFor` mark the step `SUSPENDED`: they release the
+queue and per-key slots and are not charged an attempt. When a sleep's wake
+time passes — or the awaited event is emitted — the step is claimed again and
+the task is re-invoked **from the top**, at which point the await returns
+immediately. With File storage this survives a restart; the per-attempt
+timeout covers active execution only, not suspended time.
+`Execution().Steps[i].Status` shows `SUSPENDED` with `WaitEvent`/`ResumeAt`.
+Delivery is durable: `Emit` records the event and wakes every waiter in one
+transaction, and a wait that has timed out is never resurrected by a later
+emit.
 
 Two rules make this safe:
 

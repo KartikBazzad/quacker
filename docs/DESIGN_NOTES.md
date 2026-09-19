@@ -361,6 +361,31 @@ not catch same-kind identical-parameter reordering (semantically inert) or
 changed-code-same-shape, which is `StepVersion` territory: a versioning
 protocol, not a guard, and deferred with the limitation documented.
 
+### 21. Event-wait delivery is atomic, and cancellation of a wait is one transaction
+
+Two races had to be closed for `WaitFor`, and both come down to writing the
+right things in one transaction on the single writer:
+
+- **Suspend-vs-deliver.** The first cut appended the wait entry and *then*
+  suspended the step. An `Emit` landing between those two writes would set
+  the entry done, but the executor would then suspend the step with
+  `resume_at=0` (event-only), so nothing would ever claim it — the event was
+  lost. `SuspendWithJournal` now sets the step SUSPENDED and inserts the
+  journal entry in one transaction, so a visible wait entry always means a
+  suspended step. `Emit` (`DeliverEvent`) likewise inserts the event and
+  wakes every matching undone wait in one transaction.
+- **Timeout-vs-deliver.** A timeout is not just "wake and check": if an emit
+  commits first, the timeout must lose. `TimeoutWait` does a conditional
+  `UPDATE ... SET timed_out=1, done=1 WHERE ... AND done=0`; `rows affected
+  == 0` means the emit won, so `WaitFor` re-reads the entry and returns the
+  payload. `DeliverEvent` only touches `done=0` entries, so a post-timeout
+  emit is a no-op on that wait. Without this, a late emit could flip a
+  consumed wait back to delivered, and a retry would replay the payload
+  instead of the timeout — cross-attempt misalignment.
+
+The same principle as the parent-run failure path (§4): decide and record in
+one transaction, and let later actors observe the committed result.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

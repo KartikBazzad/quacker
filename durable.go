@@ -13,6 +13,10 @@ import (
 // resuming with wrong data.
 var ErrJournalMisaligned = engine.ErrJournalMisaligned
 
+// ErrWaitTimeout is returned by WaitFor when its timeout elapses before the
+// awaited event arrives.
+var ErrWaitTimeout = engine.ErrWaitTimeout
+
 // SleepDurable suspends the running step for at least d, durably. It does not
 // consume an attempt or hold a queue or per-key slot while sleeping, and it
 // survives a process restart (File storage): when the wake time passes the
@@ -35,4 +39,17 @@ func SleepDurable(ctx context.Context, d time.Duration) error {
 // task or workflow step.
 func RunOnce[T any](ctx context.Context, key string, fn func() (T, error)) (T, error) {
 	return engine.RunOnce(ctx, key, fn)
+}
+
+// WaitFor suspends the running step until an event named event is emitted
+// (via Quacker.Emit), then decodes the event's payload into T. A timeout > 0
+// bounds the wait and returns ErrWaitTimeout; timeout <= 0 waits indefinitely.
+//
+// Delivery is durable: when an event is emitted the engine records it and
+// wakes every waiting step in one transaction, so a wait survives a restart.
+// Only events emitted after the wait registers count — an event emitted
+// earlier does not satisfy a later WaitFor. Emitting also triggers any On
+// bindings as usual. Only valid inside a task or workflow step.
+func WaitFor[T any](ctx context.Context, event string, timeout time.Duration) (T, error) {
+	return engine.WaitFor[T](ctx, event, timeout)
 }

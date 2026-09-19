@@ -256,6 +256,56 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	}
 }
 
+// TestDeliverEventWakesWaitersAndRespectsTimeout: DeliverEvent wakes undone
+// waits and sets them QUEUED, but never resurrects one already timed out.
+func TestDeliverEventWakesWaitersAndRespectsTimeout(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	mk := func(id string) {
+		run := &Run{ID: "run-" + id, Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+		step := &Step{ID: "run-" + id + "/s", RunID: "run-" + id, Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+		if err := s.CreateRun(ctx, run, []*Step{step}); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := s.ClaimDue(ctx, "q", 1, now, 0, 0); err != nil || len(c) != 1 {
+			t.Fatalf("claim %s: %+v err=%v", id, c, err)
+		}
+	}
+	mk("a") // will be woken
+	mk("b") // will have timed out
+	if err := s.SuspendWithJournal(ctx, &JournalEntry{StepID: "run-a/s", Idx: 0, Kind: JournalWait, Event: "e"}, "wait", "e", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SuspendWithJournal(ctx, &JournalEntry{StepID: "run-b/s", Idx: 0, Kind: JournalWait, Event: "e", Deadline: now - 1}, "wait", "e", now-1, now); err != nil {
+		t.Fatal(err)
+	}
+	if won, err := s.TimeoutWait(ctx, "run-b/s", 0); err != nil || !won {
+		t.Fatalf("TimeoutWait = %v err=%v, want true", won, err)
+	}
+	n, err := s.DeliverEvent(ctx, "e", []byte(`"p"`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("woken = %d, want 1 (the timed-out wait must not resurrect)", n)
+	}
+	var statusA, statusB string
+	if err := s.Read().QueryRow(`SELECT status FROM steps WHERE id='run-a/s'`).Scan(&statusA); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Read().QueryRow(`SELECT status FROM steps WHERE id='run-b/s'`).Scan(&statusB); err != nil {
+		t.Fatal(err)
+	}
+	if statusA != StatusQueued || statusB != StatusSuspended {
+		t.Fatalf("statuses = %q/%q, want QUEUED/SUSPENDED", statusA, statusB)
+	}
+}
+
 // TestPurgeRejectsBadOptions: a non-terminal status or a zero cutoff is
 // refused, so a purge can never touch live work by accident.
 func TestPurgeRejectsBadOptions(t *testing.T) {
