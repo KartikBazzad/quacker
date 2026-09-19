@@ -62,6 +62,11 @@ driver.
   `GET_LOCK` is released at session end, not transaction end, so the driver
   acquires it for the whole migration run and releases it explicitly.
   Drivers that don't implement it keep the per-transaction `MigrateLock`.
+- **`driver.UniqueViolationer`** — reports whether an error is a unique
+  constraint violation, so unique-job inserts can detect a collision
+  (`driver.IsUniqueViolation` wraps it with a text-match fallback). SQLite
+  matches the constraint message, Postgres SQLSTATE `23505`, MySQL error
+  `1062`. A driver that omits it still works via the fallback.
 
 ## Portability rules
 

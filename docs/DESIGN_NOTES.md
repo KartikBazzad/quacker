@@ -724,6 +724,42 @@ per-run lock, and same-table `LIMIT` subqueries were wrapped in derived tables.
 The extension story is now: plugins (§32) and the codec (§33) for behavior,
 and `driver.Backend` for the database.
 
+### 35. Job control: unique jobs, snooze, queue pause, run pause
+
+v1.5 added four job-control primitives. The load-bearing decisions:
+
+- **Unique jobs keep the key on the row, not in a side table.** A nullable
+  `runs.unique_key` plus a unique index on `(workflow, unique_key)` is the whole
+  mechanism: unique indexes ignore NULLs on all three dialects, so non-unique
+  runs never collide, and nulling the column on every terminal transition frees
+  the key. The store resolves the conflict inside the insert transaction; a
+  concurrent insert race is caught by `driver.UniqueViolationer` and retried,
+  where the loser now sees the winner.
+- **Cross-instance reuse has no local completion signal.** A reused unique run
+  may be executed by another engine, so returning an ordinary in-process waiter
+  would hang. The engine binds the caller's handle to a **poll waiter** instead
+  (or to the existing local waiter if it owns the run). This is the same
+  limitation that makes a plain `Enqueue` on node A, executed on node B, wait
+  indefinitely — acceptable because it predates v1.5, but reuse had to solve it.
+- **Queue pause lives in the claim SQL.** A `queue_pauses` row gates the
+  candidate SELECT and both UPDATE arms, so every engine observes a pause with
+  no sync loop and it survives restarts. The engine's in-memory set is only a
+  fast-path skip.
+- **Run pause is hybrid, and resume means "now".** Go cannot suspend a stack, so
+  a paused run's running step is interrupted via its context and **requeued
+  with the attempt refunded** on a pause-induced cancellation; resuming replays
+  it (durable tasks replay their journal; non-durable steps re-run from the top,
+  so they should be idempotent). A task that errors for a real reason still
+  fails the run, and a task that finishes before the cancel lands completes.
+  `ResumeRun` resets the run and its QUEUED steps to the current time, which
+  means a run paused while scheduled ahead loses its future `run_at` — the
+  intended meaning of "resume". Boot recovery and `InterruptAll` deliberately
+  skip PAUSED runs.
+
+A recurring theme: three of the four are enforced by a predicate in the claim
+transaction (unique index, `queuePauses`, `runNotPausedGate`), so multi-instance
+correctness is the database's job and the engine keeps no authoritative state.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

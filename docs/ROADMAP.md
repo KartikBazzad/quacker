@@ -1,9 +1,10 @@
 # Roadmap
 
-Status: **v1.0–v1.4 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.5 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
-storage-driver contract with a MySQL/MariaDB driver. The v1.0 stability gates
+storage-driver contract with a MySQL/MariaDB driver, plus v1.5 job-control
+primitives (unique jobs, snooze, queue pause, run pause/resume). The v1.0 stability gates
 (semver policy, chaos, fuzzing, pkg.go.dev examples) are complete; release tags
 wait on a git remote.
 
@@ -331,11 +332,33 @@ translates SQL. See [DRIVERS.md](DRIVERS.md).
   select-then-update instead of `UPDATE ... RETURNING`, and derived-table
   `LIMIT` subqueries.
 
-## v1.5 — job-control primitives (📐 DESIGN — not started)
+## v1.5 — job-control primitives (✅ DONE)
 
-Three items from the Features table, each independently shippable. All three are
-additive (new options/methods + migrations), keep the existing query layer, and
-work on SQLite/Postgres/MySQL.
+Shipped: **unique jobs**, **snooze**, **queue pause/resume**, and **run
+pause/resume** (jobs + workflows), each an additive API + migration, all three
+dialects, with Postgres/MySQL integration coverage.
+
+As built, deviating from the design where the tests demanded it:
+
+- **Unique jobs** — as designed, plus two pieces the design under-specified:
+  the engine retries an insert race bounded (`driver.UniqueViolationer`) and, on
+  `UniqueReuse` of a run this engine does not own, binds the handle to a
+  **poll waiter** (cross-instance reuse has no local completion signal).
+  `UniqueReplace` cancels the old run *and* interrupts its contexts / releases
+  its waiter, or a replaced task could keep running unobserved.
+- **Queue pause** — as designed; the pause predicate sits in the candidate
+  SELECT and both UPDATE arms.
+- **Snooze** — as designed; no migration.
+- **Run pause** — hybrid as chosen: a running step's ctx is cancelled and the
+  executor **requeues it (refunding the attempt)** on a pause-induced
+  cancellation; a task that errors for a real reason still fails the run, and a
+  task that finishes before the cancel lands just completes. `ResumeRun` resets
+  the run and its QUEUED steps to now, so a run paused while scheduled ahead
+  starts immediately — and, consequently, resume does not preserve a future
+  `run_at`. Boot recovery and `InterruptAll` leave PAUSED runs alone; the claim
+  SQL (`runNotPausedGate`) is the source of truth across instances.
+
+Below is the original design, kept for reference.
 
 ### 1. Unique jobs (enqueue-time dedup)
 
@@ -475,7 +498,6 @@ the public contract (documented in DRIVERS.md), and all three get integration
 coverage in the Postgres and MySQL suites plus the root File/Memory suite.
 
 ## Backlog
-- Pause and Resume Jobs/workflows
 - Custom storage backends
 - Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
 
@@ -498,36 +520,38 @@ names the closest API today.
 | Error and panic handling | ✅ | Panics recovered → step `FAILED` (and retried); errors persisted; retries + backoff. |
 | Job-persisted logging | ✅ | `WithLogStorage(true)` + `q.Logs`; sink chain via `WithTaskLogSink`. |
 | Multiple queues | ✅ | `Queue(name)` per task + `WithQueue(name, n)`. |
-| Pausing queues | 📐 v1.5 | Designed below: DB-backed pause table + claim predicate. |
+| Pausing queues | ✅ | `PauseQueue`/`ResumeQueue`/`PausedQueues`, enforced in the claim SQL. |
 | Per-queue job retention | 🟡 | `WithRetention`/`q.Purge` are global, filtered by status — not per queue. |
 | Periodic and cron jobs | ✅ | `Cron` with 5-field specs, descriptors, and sub-second `@every`. |
 | Recorded output | ✅ | Run/step `output` persisted; `q.Execution(...).Output`, `DepOutput[T]`. |
 | Resumable jobs | ✅ | Durable replay (`SleepDurable`/`WaitFor`/`RunOnce`) + File restart recovery. |
 | Scheduled jobs | ✅ | `WithRunAt(t)` / `WithDelay(d)` on enqueue. |
 | Sequences | ❌ | No sequence primitive; DAG deps order within a workflow. Strict per-key ordering is still future work. |
-| Snoozing jobs | 📐 v1.5 | Designed below: move a non-running run's `run_at` forward. |
+| Snoozing jobs | ✅ | `Snooze`/`SnoozeFor` move a non-running run's `run_at` forward. |
 | Subscriptions | ✅ | `On`/`Emit` bindings, durable `WaitFor`, and a live `q.Subscribe(runID)` stream. |
 | Testing | ✅ | `Memory()`/`Ephemeral()` + `WithPollInterval` for fast deterministic tests, examples, and `example_test.go`. No assertion harness. |
 | Transactional job completion | 🟡 | Completion is atomic inside the engine, but there is no API to enlist an enqueue in the caller's business DB transaction (`WithDB` shares a pool, not a tx). |
-| Unique jobs | 📐 v1.5 | Designed below: enqueue-time dedup via a nullable unique column. |
+| Unique jobs | ✅ | `WithUnique`/`WithUniqueKey` + `UniqueConflict{Reuse,Error,Replace}`. |
 | Work functions | ✅ | Tasks are plain Go functions (`NewTask`). |
+| Pause/resume jobs & workflows | ✅ | `PauseRun`/`ResumeRun` (v1.5); running steps requeue on resume. |
 | Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
 
-Tally: 14 shipped, 4 partial, 7 missing.
+Tally: 18 shipped, 4 partial, 4 missing (unique jobs, queue pause, snooze, and
+run pause/resume shipped in v1.5).
 
 ### Missing / partial — suggested follow-ups
 
 Addable within the embedded model, roughly by value:
 
-1. **Unique jobs** — enqueue-time dedup key (unique index + upsert), complements `WithKey`.
-2. **Pausing queues** — a paused flag that holds claims per queue (`SetQueue`-level, cheap).
-3. **Snoozing jobs** — reschedule a queued/running run (`run_at` bump), reuses `WithRunAt`.
-4. **Sequences / strict per-key order** — already named as future work in v0.2 notes.
-5. **Per-queue retention** — add a `Queue` field to `RetentionPolicy`/`PurgeOptions`.
-6. **Dead letter queue** — mark terminal-failed runs as DLQ-eligible; list/replay from there.
-7. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
-8. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
-9. **Transactional completion** — expose enqueue-on-`*sql.Tx` for Postgres/MySQL (real value for outbox patterns).
-10. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
+1. **Sequences / strict per-key order** — already named as future work in v0.2 notes.
+2. **Per-queue retention** — add a `Queue` field to `RetentionPolicy`/`PurgeOptions`.
+3. **Dead letter queue** — mark terminal-failed runs as DLQ-eligible; list/replay from there.
+4. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
+5. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
+6. **Transactional completion** — expose enqueue-on-`*sql.Tx` for Postgres/MySQL (real value for outbox patterns).
+7. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
 
-Overlaps with the Hatchet comparison: concurrency strategies, per-queue retention, DLQ, unique jobs, snoozing, sequences. This list also reads like a Postgres-backed job-library matrix (River/Oban-shaped), so it is a useful parity target beyond Hatchet.
+Overlaps with the Hatchet comparison: concurrency strategies, per-queue
+retention, DLQ, sequences. This list also reads like a Postgres-backed
+job-library matrix (River/Oban-shaped), so it is a useful parity target beyond
+Hatchet.

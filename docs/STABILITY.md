@@ -22,7 +22,8 @@ The stable surface is the **exported identifiers of `package quacker` and the
 `internal/engine`, `internal/bus`) is implementation detail and may change at
 any time.
 
-- New options, hooks, fields, and methods are additive and non-breaking.
+- New options, hooks, fields, methods, and **status values** (e.g.
+  `StatusPaused`) are additive and non-breaking.
 - Removing or changing the signature of an exported identifier is breaking.
 - When something is superseded it is first deprecated in a doc comment before
   removal in the next major.

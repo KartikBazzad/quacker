@@ -144,6 +144,7 @@ out, _ := h.Result(ctx)   // waits for the run, decodes Out</code></pre>
 <div class="feature"><b>DAG workflows</b><span>Step dependencies, upstream outputs, per-step tasks, live DAG introspection.</span></div>
 <div class="feature"><b>Triggers</b><span>Cron (incl. sub-second @every), in-process events, child runs — persisted and re-armed.</span></div>
 <div class="feature"><b>Concurrency control</b><span>Per-key limits and queue rate windows, enforced in the claim transaction.</span></div>
+<div class="feature"><b>Job control</b><span>Unique jobs, snooze, and queue/run pause &amp; resume — persisted and multi-instance.</span></div>
 <div class="feature"><b>Operations</b><span>Middleware, log sinks, retention/purge, metrics, OTel spans, debug stream.</span></div>
 <div class="feature"><b>SQLite inside</b><span>Memory, ephemeral, or file storage with migrations and restart recovery.</span></div>
 <div class="feature"><b>No infrastructure</b><span>One process, one writer connection, no broker to operate.</span></div>

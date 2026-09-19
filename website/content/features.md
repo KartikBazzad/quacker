@@ -95,6 +95,31 @@ across processes sharing a database.
 - **Worker labels** — `WithLabels("gpu")` on a task and
   `WithWorkerLabels("gpu")` on an engine route work only to capable workers.
 
+## Job control
+
+- **Unique jobs** — `WithUnique(func(in) string)` (or `WithUniqueKey`) makes a
+  run unique per key while it is non-terminal. A collision resolves by
+  `UniqueConflict`: `UniqueReuse` (default, returns the live run's handle),
+  `UniqueError` (`ErrDuplicateJob`), or `UniqueReplace` (cancel the live run).
+- **Snooze** — `q.Snooze(ctx, runID, until)` / `SnoozeFor` pushes a non-running
+  run's start time forward; a run with a RUNNING step returns `ErrRunRunning`.
+- **Pause queues** — `q.PauseQueue(ctx, name)` stops claims from a queue
+  (running steps finish; new work queues) until `ResumeQueue`. Persisted, so
+  every engine observes it.
+- **Pause runs** — `q.PauseRun(ctx, runID)` interrupts a running step and holds
+  the run; `ResumeRun` replays it. Durable tasks resume cleanly from their
+  journal; non-durable steps re-run from the top.
+
+```go
+task := quacker.NewTask("sync", syncFn,
+    quacker.WithUnique(func(in SyncInput) string { return in.Account }),
+    quacker.WithUniqueConflict(quacker.UniqueReuse))
+
+q.PauseQueue(ctx, "sync")           // hold the whole queue
+q.SnoozeFor(ctx, runID, time.Hour)  // or push one run forward
+q.PauseRun(ctx, runID)              // or pause a single run
+```
+
 ## Triggers and scheduling
 
 - **Cron** — `quacker.Cron(q, "nightly", "0 2 * * *", task, input)`; standard
