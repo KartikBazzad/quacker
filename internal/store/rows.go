@@ -57,6 +57,10 @@ type Run struct {
 	// DeadLetteredAt is when the run was dead-lettered (unix nanos; 0 when
 	// not). Set for an opted-in task's run when it exhausts retries.
 	DeadLetteredAt int64
+	// SequenceKey, when non-empty, partitions the run into a sequence; Seq is
+	// its insertion order within that sequence.
+	SequenceKey string
+	Seq         int64
 }
 
 // Step is a row in the steps table. A single-task run has exactly one step.
@@ -110,6 +114,11 @@ type Step struct {
 	// LeaseExpiresAt is when the lease lapses ("" / 0 when leases are off); a
 	// reaper re-queues a RUNNING step whose lease has expired.
 	LeaseExpiresAt int64
+	// SequenceKey/Seq mirror the run's sequence membership for the claim gate;
+	// a step is claimable only when no earlier same-sequence step is
+	// unfinished.
+	SequenceKey string
+	Seq         int64
 }
 
 // Cron is a row in the crons table.
@@ -189,19 +198,19 @@ func decodeList(s string) []string {
 
 const runCols = `id, workflow, kind, status, queue, priority, input, output, error,
 	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent,
-	COALESCE(unique_key, ''), paused_at, dead_lettered_at`
+	COALESCE(unique_key, ''), paused_at, dead_lettered_at, sequence_key, seq`
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
 	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event, labels,
-	worker_id, lease_expires_at`
+	worker_id, lease_expires_at, sequence_key, seq`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.Workflow, &r.Kind, &r.Status, &r.Queue, &r.Priority,
 		&r.Input, &r.Output, &r.Error, &r.Attempts, &r.MaxAttempts,
 		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID, &r.TraceParent,
-		&r.UniqueKey, &r.PausedAt, &r.DeadLetteredAt)
+		&r.UniqueKey, &r.PausedAt, &r.DeadLetteredAt, &r.SequenceKey, &r.Seq)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +225,7 @@ func scanStep(row interface{ Scan(...any) error }) (*Step, error) {
 		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt,
 		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt,
 		&s.ResumeAt, &s.WaitKind, &s.WaitEvent, &labels,
-		&s.WorkerID, &s.LeaseExpiresAt)
+		&s.WorkerID, &s.LeaseExpiresAt, &s.SequenceKey, &s.Seq)
 	if err != nil {
 		return nil, err
 	}

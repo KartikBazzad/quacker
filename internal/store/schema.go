@@ -242,6 +242,21 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 );
 `
 
+// migration17 adds sequences: a per-run sequence key and insertion-order
+// value (denormalized to steps) plus the counter that allocates it.
+const migration17 = `
+ALTER TABLE runs ADD COLUMN sequence_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE steps ADD COLUMN sequence_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_steps_sequence ON steps (sequence_key, seq);
+CREATE TABLE IF NOT EXISTS counters (
+	name TEXT PRIMARY KEY,
+	next BIGINT NOT NULL
+);
+INSERT INTO counters (name, next) VALUES ('run', 0) ON CONFLICT (name) DO NOTHING;
+`
+
 // migration16 adds the dead-letter marker: set when an opted-in task's run
 // exhausts its retries.
 const migration16 = `
@@ -271,6 +286,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 14, SQL: migration14},
 	{Version: 15, SQL: migration15},
 	{Version: 16, SQL: migration16},
+	{Version: 17, SQL: migration17},
 }
 
 // init validates the built-in migration list's invariant before any Open can

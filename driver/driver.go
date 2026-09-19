@@ -116,6 +116,11 @@ type Backend interface {
 	// from CorrelatedKeyGate; MySQL must use a derived-table form because it
 	// forbids reading the table being updated in a subquery (error 1093).
 	KeyGate() string
+	// SequenceGate is the predicate (no placeholders) that admits a step only
+	// when no earlier-inserted step in the same sequence is unfinished. It is
+	// a coroutine on the enclosing steps row (SQLite/Postgres); MySQL needs the
+	// derived-table form.
+	SequenceGate() string
 	// LabelGate is the SQL predicate (containing one '?' for the worker-labels
 	// JSON) admitting a step only when its labels are a subset of the worker's.
 	LabelGate() string
@@ -175,6 +180,17 @@ func IsUniqueViolation(be Backend, err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "unique") || strings.Contains(s, "duplicate")
+}
+
+// CorrelatedSequenceGate is the default per-sequence ordering predicate: a
+// step is admitted only when no same-sequence step with a smaller Seq is still
+// unfinished. The statement must expose `steps`.
+func CorrelatedSequenceGate() string {
+	return `NOT EXISTS (SELECT 1 FROM steps s2
+		WHERE s2.sequence_key = steps.sequence_key
+		  AND s2.sequence_key <> ''
+		  AND s2.seq < steps.seq
+		  AND s2.status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED'))`
 }
 
 // MigrateLocker is an optional Backend extension for drivers whose migration

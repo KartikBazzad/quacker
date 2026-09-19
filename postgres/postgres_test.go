@@ -636,6 +636,51 @@ func TestPostgresDeadLetter(t *testing.T) {
 	})
 }
 
+// TestPostgresSequenceOrder: two engines share a database and must still run a
+// sequence strictly in insertion order.
+func TestPostgresSequenceOrder(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var order []int
+	task := quacker.NewTask("pg.seq", func(ctx context.Context, in int) (int, error) {
+		mu.Lock()
+		order = append(order, in)
+		mu.Unlock()
+		return in, nil
+	}, quacker.WithSequence(func(in int) string { return "s" }))
+	quacker.Register(b, task) // so either engine can execute
+
+	inputs := []int{0, 1, 2, 3, 4}
+	hs, err := quacker.EnqueueBatch(ctx, a, task, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		for _, h := range hs {
+			s, err := a.Execution(ctx, h.RunID())
+			if err != nil || s.Status != quacker.StatusSucceeded {
+				return false
+			}
+		}
+		return true
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != len(inputs) {
+		t.Fatalf("ran %d, want %d", len(order), len(inputs))
+	}
+	for i, v := range order {
+		if v != i {
+			t.Fatalf("execution order = %v, want %v", order, inputs)
+		}
+	}
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

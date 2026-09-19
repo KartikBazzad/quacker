@@ -122,6 +122,28 @@ func WithUniqueConflict(m UniqueConflict) TaskOption {
 	return func(c *taskConfig) { c.uniqueOn = true; c.uniqueMode = m }
 }
 
+// WithSequence makes runs of this task execute strictly one-at-a-time in
+// insertion order within a sequence key derived from the input, while
+// different keys run in parallel. An earlier run that is still queued,
+// running, retrying, or suspended holds the line (head-of-line blocking); a
+// key returning "" is unsequenced. Sequences are a stronger guarantee than
+// WithKey's concurrency cap, which does not fix execution order across
+// retries.
+func WithSequence[I any](fn func(I) string) TaskOption {
+	return func(c *taskConfig) {
+		c.sequenceOn = true
+		c.sequenceFn = func(codec engine.Codec, raw json.RawMessage) string {
+			var in I
+			if len(raw) > 0 {
+				if err := codec.Unmarshal(raw, &in); err != nil {
+					return "" // undecodable input: unsequenced
+				}
+			}
+			return fn(in)
+		}
+	}
+}
+
 // WithDeadLetter marks a run dead-lettered when it exhausts its retries, so it
 // appears in DeadLetters and can be retried with RetryDeadLetter. Runs of a
 // task without it that fail are ordinary FAILED runs.
@@ -198,5 +220,6 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	def.Wrappers = t.cfg.wrap
 	def.Labels = t.cfg.labels
 	def.DeadLetter = t.cfg.deadLetter
+	def.SequenceFn = t.cfg.sequenceFn
 	return def
 }

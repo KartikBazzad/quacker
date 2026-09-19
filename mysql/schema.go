@@ -160,3 +160,17 @@ ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
 const myMigration5 = `
 ALTER TABLE runs ADD COLUMN dead_lettered_at BIGINT NOT NULL DEFAULT 0;
 `
+
+// myMigration6 adds sequences.
+const myMigration6 = `
+ALTER TABLE runs ADD COLUMN sequence_key VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE steps ADD COLUMN sequence_key VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX idx_steps_sequence ON steps (sequence_key, seq);
+CREATE TABLE IF NOT EXISTS counters (
+	name VARCHAR(64) NOT NULL PRIMARY KEY,
+	next BIGINT NOT NULL
+) ENGINE=InnoDB;
+INSERT IGNORE INTO counters (name, next) VALUES ('run', 0);
+`

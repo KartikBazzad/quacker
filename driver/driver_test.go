@@ -57,6 +57,7 @@ func (fakeBackend) SupportsLeases() bool                           { return fals
 func (fakeBackend) SupportsCheckpoint(Config) bool                 { return false }
 func (fakeBackend) RecoverOnBoot(Config) bool                      { return false }
 func (fakeBackend) KeyGate() string                                { return CorrelatedKeyGate() }
+func (fakeBackend) SequenceGate() string                           { return CorrelatedSequenceGate() }
 func (fakeBackend) LabelGate() string                              { return "1=1" }
 func (fakeBackend) BlockedDependentsSQL() string                   { return "SELECT 1" }
 func (fakeBackend) UpsertSQL(table string, insertCols, conflictCols, updateCols []string) string {

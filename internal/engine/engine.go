@@ -75,6 +75,9 @@ type TaskDef struct {
 	// DeadLetter marks a run dead-lettered when it exhausts retries, so it can
 	// be listed and retried from the dead-letter queue.
 	DeadLetter bool
+	// SequenceFn extracts a sequence key; runs sharing a key execute strictly
+	// one-at-a-time in insertion order. nil means unsequenced.
+	SequenceFn func(c Codec, input json.RawMessage) string
 }
 
 // StepReq is one step of an enqueue request.
@@ -994,17 +997,23 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 				}
 			}
 		}
+		var seqKey string
+		if def.SequenceFn != nil {
+			seqKey = def.SequenceFn(e.codec, req.Input)
+		}
 		steps = append(steps, &store.Step{
 			ID: runID + "/" + sr.Name, RunID: runID, Name: sr.Name, Task: def.Name, Ord: int64(i),
 			Status: status, DependsOn: sr.Deps, Queue: stepQueue, Priority: req.Priority,
 			Input: req.Input, MaxAttempts: int64(maxAtt), Timeout: def.Timeout,
 			RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
 			ConcurrencyKey: key, KeyLimit: keyLimit, Labels: def.Labels,
+			SequenceKey: seqKey,
 		})
 	}
 	// run-level max attempts mirrors the first step for introspection.
 	run.MaxAttempts = steps[0].MaxAttempts
 	run.ConcurrencyKey = steps[0].ConcurrencyKey
+	run.SequenceKey = steps[0].SequenceKey
 	return run, steps, nil
 }
 

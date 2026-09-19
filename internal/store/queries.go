@@ -100,8 +100,32 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 	}
 	ids := make([]string, len(runs))
 	var replaced []ReplacedRun
+	// Reserve insertion-order values for sequenced runs in one shot. Runs
+	// without a sequence key never touch the counter.
+	nSeq := 0
+	for _, run := range runs {
+		if run.SequenceKey != "" {
+			nSeq++
+		}
+	}
+	var seqNext int64
+	if nSeq > 0 {
+		base, err := s.allocSeq(ctx, tx, int64(nSeq))
+		if err != nil {
+			return nil, nil, err
+		}
+		seqNext = base
+	}
 	for i, run := range runs {
 		ids[i] = run.ID
+		if run.SequenceKey != "" {
+			seqNext++
+			run.Seq = seqNext
+			for _, st := range steps[i] {
+				st.SequenceKey = run.SequenceKey
+				st.Seq = run.Seq
+			}
+		}
 		if run.UniqueKey != "" {
 			existing, err := liveRunByUnique(ctx, tx, run.Workflow, run.UniqueKey)
 			if err != nil {
@@ -131,6 +155,21 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 		}
 	}
 	return ids, replaced, nil
+}
+
+// allocSeq reserves n consecutive sequence values, returning the base: the
+// first reserved value is base+1. The UPDATE row-locks the counter for the
+// transaction on Postgres/MySQL, and SQLite is single-writer, so concurrent
+// enqueues allocate distinct, ordered values.
+func (s *Store) allocSeq(ctx context.Context, tx *txn, n int64) (int64, error) {
+	if _, err := tx.exec(ctx, `UPDATE counters SET next = next + ? WHERE name=?`, n, "run"); err != nil {
+		return 0, err
+	}
+	var next int64
+	if err := tx.queryRow(ctx, `SELECT next FROM counters WHERE name=?`, "run").Scan(&next); err != nil {
+		return 0, err
+	}
+	return next - n, nil
 }
 
 // liveRunByUnique returns the id of a non-terminal run holding (workflow, key),
@@ -206,11 +245,11 @@ func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) er
 // is not unique so the unique index ignores it.
 func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
 	res, err := tx.exec(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent, unique_key)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?)`,
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent, unique_key, sequence_key, seq)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?)`,
 		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
 		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.TraceParent,
-		nullableString(run.UniqueKey))
+		nullableString(run.UniqueKey), run.SequenceKey, run.Seq)
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}
@@ -219,11 +258,11 @@ func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
 	}
 	for _, st := range steps {
 		_, err := tx.exec(ctx, `INSERT INTO steps
-			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels)
-			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?)`,
+			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels, sequence_key, seq)
+			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?,?,?)`,
 			st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
 			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
-			st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels))
+			st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels), st.SequenceKey, st.Seq)
 		if err != nil {
 			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
 		}
@@ -742,6 +781,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 		) AND `+s.keyGate+`
 		AND `+queuePausedGate+`
 		AND `+runNotPausedGate+`
+		AND `+s.seqGate+`
 		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
@@ -776,14 +816,14 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate,
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate,
 				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate,
+				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate,
 				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {

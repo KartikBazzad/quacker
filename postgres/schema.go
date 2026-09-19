@@ -165,3 +165,17 @@ ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
 const pgMigration8 = `
 ALTER TABLE runs ADD COLUMN dead_lettered_at BIGINT NOT NULL DEFAULT 0;
 `
+
+// pgMigration9 adds sequences.
+const pgMigration9 = `
+ALTER TABLE runs ADD COLUMN sequence_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE steps ADD COLUMN sequence_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN seq BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_steps_sequence ON steps (sequence_key, seq);
+CREATE TABLE IF NOT EXISTS counters (
+	name TEXT PRIMARY KEY,
+	next BIGINT NOT NULL
+);
+INSERT INTO counters (name, next) VALUES ('run', 0) ON CONFLICT (name) DO NOTHING;
+`
