@@ -544,6 +544,43 @@ shutdown, which is only safe when one engine owns the database. That is
 exactly what the multi-instance phase (§Phase 2: worker leases, claim advisory
 lock, `FOR UPDATE` run locks, cron CAS) replaces.
 
+### 30. Multi-instance correctness is leases plus three locks, added only where needed
+
+Everything in the engine assumed one process: `recoverInterrupted` re-queued
+every RUNNING row on boot, `InterruptAll` swept them all on shutdown, and the
+claim/DAG gates were only correct because the single writer serialized them.
+Making several engines safe against one Postgres database adds four things,
+each scoped to the networked backend so SQLite is untouched:
+
+- **Step leases** (`worker_id`, `lease_expires_at`). A claim takes a lease; a
+  heartbeat extends this worker's in-flight steps; a leaderless reaper
+  re-queues expired ones. Reaping is guarded on `status='RUNNING'`, so
+  concurrent reapers can't double-requeue. Postgres disables boot recovery
+  entirely (`RecoverOnBoot` false) — the boot requeue that is correct for one
+  process would, in a cluster, steal a peer's live work. This is the single
+  most important switch: recovery becomes continuous and lease-driven instead
+  of "assume everything RUNNING is dead".
+- **A global claim advisory lock.** Claims already take one transaction per
+  tick; adding a `pg_advisory_xact_lock` at its start makes the counting gates
+  (per-key, rate window) serialize across nodes exactly as the single writer
+  does locally, with no change to the gates themselves. The alternative —
+  `SELECT … FOR UPDATE SKIP LOCKED` plus per-key advisory locks — buys claim
+  parallelism at a large complexity cost; claims are short, so the simple lock
+  is the right first move.
+- **Per-run `FOR UPDATE`.** `CompleteStep`/`FinalFailStep`/`CancelRun` read a
+  run and its steps then decide the terminal transition; two nodes finishing
+  sibling steps could otherwise both see "no active steps" and race. Locking
+  the run row at the start of the transaction serializes the decision.
+- **Cron CAS.** Each engine arms crons in memory; without coordination N nodes
+  fire each occurrence N times. CAS-ing `next_at` *in the same transaction as
+  the enqueue* makes firing at-most-once across the fleet (a crash rolls both
+  back and retries), with no leader election.
+
+Shutdown and leases interact deliberately: `InterruptAll(workerID, …)` sweeps
+only the closing worker's RUNNING steps and converges the runs it leaves with
+no active step, so a graceful restart of one node never interrupts another's
+in-flight work.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

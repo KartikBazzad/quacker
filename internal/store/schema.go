@@ -205,6 +205,16 @@ const migration9 = `
 ALTER TABLE runs ADD COLUMN trace_parent TEXT NOT NULL DEFAULT '';
 `
 
+// migration 10 adds multi-instance step leases (worker identity + expiry).
+// SQLite is single-process and does not use them, but the columns keep the
+// schema aligned with Postgres and let tests exercise the lease path.
+const migration10 = `
+ALTER TABLE steps ADD COLUMN worker_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN lease_expires_at BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_steps_lease  ON steps (status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_steps_worker ON steps (worker_id, status);
+`
+
 var sqliteMigrations = []Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -215,6 +225,7 @@ var sqliteMigrations = []Migration{
 	{Version: 7, SQL: migration7},
 	{Version: 8, SQL: migration8},
 	{Version: 9, SQL: migration9},
+	{Version: 10, SQL: migration10},
 }
 
 // init validates each migration list's invariant before any Open can rely on

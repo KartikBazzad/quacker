@@ -83,7 +83,7 @@ func TestMigrationV2Columns(t *testing.T) {
 	if key != "" || keyLimit != 0 || claimedAt != 0 {
 		t.Fatalf("v2 defaults = (%q,%d,%d), want ('',0,0)", key, keyLimit, claimedAt)
 	}
-	claims, err := s.ClaimDue(context.Background(), "q", 10, 1, 0, 0, nil)
+	claims, err := s.ClaimDue(context.Background(), "q", 10, 1, 0, 0, nil, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	if err := s.CreateRun(ctx, run, []*Step{step}); err != nil {
 		t.Fatal(err)
 	}
-	claims, err := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil)
+	claims, err := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil, "", 0)
 	if err != nil || len(claims) != 1 || claims[0].Resumed {
 		t.Fatalf("first claim = %+v err=%v, want one fresh claim", claims, err)
 	}
@@ -236,7 +236,7 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	if err := s.SuspendStep(ctx, "r/s", "wait", "go", 0, now); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil); len(c) != 0 {
+	if c, _ := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil, "", 0); len(c) != 0 {
 		t.Fatalf("event-only wait was claimed: %+v", c)
 	}
 
@@ -247,7 +247,7 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	if err := s.SuspendStep(ctx, "r/s", "sleep", "", now-1, now); err != nil {
 		t.Fatal(err)
 	}
-	claims, err = s.ClaimDue(ctx, "q", 1, now, 0, 0, nil)
+	claims, err = s.ClaimDue(ctx, "q", 1, now, 0, 0, nil, "", 0)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("resume claim = %+v err=%v", claims, err)
 	}
@@ -306,7 +306,7 @@ func TestCreateRunsAndClaimDueMulti(t *testing.T) {
 		{Name: "q1", Limit: 10},
 		{Name: "q2", Limit: 10},
 		{Name: "q3", Limit: 0}, // zero budget: skipped
-	}, now, nil)
+	}, now, nil, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +469,7 @@ func TestDeliverEventWakesWaitersAndRespectsTimeout(t *testing.T) {
 		if err := s.CreateRun(ctx, run, []*Step{step}); err != nil {
 			t.Fatal(err)
 		}
-		if c, err := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil); err != nil || len(c) != 1 {
+		if c, err := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil, "", 0); err != nil || len(c) != 1 {
 			t.Fatalf("claim %s: %+v err=%v", id, c, err)
 		}
 	}

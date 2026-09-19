@@ -27,6 +27,15 @@ func (sqliteBackend) Migrations() []Migration { return sqliteMigrations }
 
 func (sqliteBackend) MigrateLock(context.Context, *sql.Tx) error { return nil }
 
+func (sqliteBackend) ClaimLock(context.Context, *sql.Tx) error { return nil }
+
+func (sqliteBackend) RunLock(context.Context, *sql.Tx, string) error { return nil }
+
+// SupportsLeases is false: SQLite is single-process, so boot recovery and the
+// single writer already serialize everything; leases would only risk
+// requeueing a live long-running step.
+func (sqliteBackend) SupportsLeases() bool { return false }
+
 func (sqliteBackend) SupportsCheckpoint(cfg Config) bool { return cfg.Mode != ModeMemory }
 
 func (sqliteBackend) RecoverOnBoot(cfg Config) bool { return cfg.Mode == ModeFile }

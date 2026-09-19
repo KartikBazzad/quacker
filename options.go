@@ -64,6 +64,8 @@ type config struct {
 	logger             *slog.Logger
 	middleware         []engine.Middleware
 	workerLabels       []string
+	workerID           string
+	leaseTTL           time.Duration
 	logSink            func(LogEntry)
 	logStorage         bool
 	metricsFn          func(*Metrics)
@@ -155,6 +157,21 @@ func WithMiddleware(mw ...Middleware) Option {
 // that can run it (e.g. "gpu", "linux").
 func WithWorkerLabels(labels ...string) Option {
 	return func(c *config) { c.workerLabels = append(c.workerLabels, labels...) }
+}
+
+// WithWorkerID sets this engine's identity for multi-instance step leases.
+// Must be unique per running engine against a shared database; empty generates
+// one. Only meaningful for leases backends (Postgres).
+func WithWorkerID(id string) Option {
+	return func(c *config) { c.workerID = id }
+}
+
+// WithLeaseTTL sets how long a claimed step's lease lasts before a reaper may
+// requeue it (multi-instance leases only). Keep it comfortably longer than a
+// scheduler stall; a running step's lease is extended by a heartbeat at a
+// third of this interval. Default 30s.
+func WithLeaseTTL(d time.Duration) Option {
+	return func(c *config) { c.leaseTTL = d }
 }
 
 // WithTaskLogSink sets the base destination for task log lines, replacing

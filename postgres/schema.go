@@ -119,3 +119,11 @@ CREATE TABLE IF NOT EXISTS step_journal (
 );
 CREATE INDEX IF NOT EXISTS idx_journal_wait ON step_journal (kind, done, event);
 `
+
+// pgMigration2 adds multi-instance step leases.
+const pgMigration2 = `
+ALTER TABLE steps ADD COLUMN worker_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN lease_expires_at BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_steps_lease  ON steps (status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_steps_worker ON steps (worker_id, status);
+`

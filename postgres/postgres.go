@@ -49,21 +49,50 @@ func (pgBackend) Rebind(q string) string {
 var rebindCache sync.Map
 
 func (pgBackend) Migrations() []store.Migration {
-	return []store.Migration{{Version: 1, SQL: pgSchema}}
+	return []store.Migration{
+		{Version: 1, SQL: pgSchema},
+		{Version: 2, SQL: pgMigration2},
+	}
 }
 
-// MigrateLock takes a transaction-scoped Postgres advisory lock so two nodes
-// booting at once serialize migrations instead of racing DDL. The lock is
-// released automatically when the migration transaction ends.
+// Advisory-lock keys; arbitrary but stable constants.
+const (
+	migrateLockKey = 0x71756163_6b657200 // migrations
+	claimLockKey   = 0x71756163_6b657201 // claim batches
+)
+
+// MigrateLock takes a transaction-scoped advisory lock so two nodes booting at
+// once serialize migrations instead of racing DDL. Released when the tx ends.
 func (pgBackend) MigrateLock(ctx context.Context, tx *sql.Tx) error {
-	const migrateLockKey = 0x71756163_6b657200 // "quack" + tag
 	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(migrateLockKey))
 	return err
 }
 
+// ClaimLock serializes claim transactions cluster-wide, so the per-key and
+// rate gates (which count rows) are evaluated one batch at a time exactly as
+// they are under SQLite's single writer.
+func (pgBackend) ClaimLock(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(claimLockKey))
+	return err
+}
+
+// RunLock locks a run row so concurrent step completions of the same run
+// serialize their terminal decision.
+func (pgBackend) RunLock(ctx context.Context, tx *sql.Tx, runID string) error {
+	_, err := tx.ExecContext(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR UPDATE`, runID)
+	return err
+}
+
+// SupportsLeases is true for Postgres: several engines share the database, so
+// worker identity + leases are how crashed nodes' work is recovered.
+func (pgBackend) SupportsLeases() bool { return true }
+
 func (pgBackend) SupportsCheckpoint(store.Config) bool { return false }
 
-func (pgBackend) RecoverOnBoot(store.Config) bool { return true }
+// RecoverOnBoot is false: boot recovery that re-queues every RUNNING row would
+// steal a peer node's in-flight work. The lease reaper recovers a crashed
+// node's steps instead.
+func (pgBackend) RecoverOnBoot(store.Config) bool { return false }
 
 // LabelGate: labels are stored as JSON text; cast to jsonb and test subset
 // membership with jsonb_array_elements_text.

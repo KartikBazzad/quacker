@@ -84,6 +84,12 @@ type Step struct {
 	// Labels are the worker labels a step requires; an engine claims it only
 	// when its own worker labels are a superset. Empty means any engine.
 	Labels []string
+	// WorkerID is the engine that holds this RUNNING step's lease ("" when
+	// unclaimed or when leases are off).
+	WorkerID string
+	// LeaseExpiresAt is when the lease lapses ("" / 0 when leases are off); a
+	// reaper re-queues a RUNNING step whose lease has expired.
+	LeaseExpiresAt int64
 }
 
 // Cron is a row in the crons table.
@@ -166,7 +172,8 @@ const runCols = `id, workflow, kind, status, queue, priority, input, output, err
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
-	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event, labels`
+	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event, labels,
+	worker_id, lease_expires_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
@@ -186,7 +193,8 @@ func scanStep(row interface{ Scan(...any) error }) (*Step, error) {
 		&s.Input, &s.Output, &s.Error, &s.Attempts, &s.MaxAttempts, &s.Timeout,
 		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt,
 		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt,
-		&s.ResumeAt, &s.WaitKind, &s.WaitEvent, &labels)
+		&s.ResumeAt, &s.WaitKind, &s.WaitEvent, &labels,
+		&s.WorkerID, &s.LeaseExpiresAt)
 	if err != nil {
 		return nil, err
 	}

@@ -160,6 +160,12 @@ type Engine struct {
 	// false keeps the disabled path allocation-free.
 	tracer  trace.Tracer
 	tracing bool
+	// workerID identifies this engine for step leases; leaseMode is true when
+	// the backend is multi-instance (Postgres), enabling stamping, heartbeat,
+	// and the reaper.
+	workerID  string
+	leaseMode bool
+	leaseTTL  time.Duration
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -218,6 +224,12 @@ type Options struct {
 	// execution, and emit. The library depends only on the OTel API; the
 	// caller supplies the SDK/provider.
 	TracerProvider trace.TracerProvider
+	// WorkerID identifies this engine for step leases (multi-instance
+	// backends). Empty is replaced with a generated id.
+	WorkerID string
+	// LeaseTTL is how long a claim's lease lasts before the reaper may
+	// requeue it (leases mode only). <=0 defaults to 30s.
+	LeaseTTL time.Duration
 	// LogSink is the base task-log destination. When nil and LogStorage is
 	// off, task logs go to the engine logger; when nil and LogStorage is on,
 	// they persist to SQLite only.
@@ -303,6 +315,15 @@ func New(o Options) (*Engine, error) {
 		e.tracer = o.TracerProvider.Tracer(tracerName)
 		e.tracing = true
 	}
+	e.workerID = o.WorkerID
+	if e.workerID == "" {
+		e.workerID = newWorkerID()
+	}
+	e.leaseMode = o.Store.SupportsLeases()
+	e.leaseTTL = o.LeaseTTL
+	if e.leaseTTL <= 0 {
+		e.leaseTTL = 30 * time.Second
+	}
 	return e, nil
 }
 
@@ -334,6 +355,11 @@ func (e *Engine) Start() {
 	if e.retention != nil {
 		e.loopWG.Add(1)
 		go func() { defer e.loopWG.Done(); e.retentionLoop() }()
+	}
+	if e.leaseMode {
+		e.loopWG.Add(2)
+		go func() { defer e.loopWG.Done(); e.heartbeatLoop() }()
+		go func() { defer e.loopWG.Done(); e.reapLoop() }()
 	}
 }
 
@@ -742,7 +768,11 @@ func (e *Engine) tick() {
 	if len(reqs) == 0 {
 		return
 	}
-	claims, err := e.st.ClaimDueMulti(e.ctx, reqs, now, e.workerLabels)
+	workerID, leaseUntil := "", int64(0)
+	if e.leaseMode {
+		workerID, leaseUntil = e.workerID, now+int64(e.leaseTTL)
+	}
+	claims, err := e.st.ClaimDueMulti(e.ctx, reqs, now, e.workerLabels, workerID, leaseUntil)
 	if err != nil {
 		if e.ctx.Err() == nil {
 			e.log.Error("quacker: claim failed", "err", err)
@@ -1146,9 +1176,66 @@ func (e *RunError) Error() string {
 	return fmt.Sprintf("quacker: run %s failed: %s", e.RunID, e.Msg)
 }
 
-// interruptAll marks in-flight work INTERRUPTED (shutdown sweep).
+// interruptAll marks in-flight work INTERRUPTED (shutdown sweep). In leases
+// mode it is scoped to this worker, so a graceful shutdown never interrupts a
+// peer node's steps.
 func (e *Engine) interruptAll(now int64) error {
-	return e.st.InterruptAll(context.Background(), now)
+	workerID := ""
+	if e.leaseMode {
+		workerID = e.workerID
+	}
+	return e.st.InterruptAll(context.Background(), workerID, now)
+}
+
+// heartbeatLoop extends the leases of this worker's RUNNING steps so a peer
+// node's reaper doesn't requeue them.
+func (e *Engine) heartbeatLoop() {
+	interval := e.leaseTTL / 3
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-t.C:
+			if err := e.st.HeartbeatWorker(e.ctx, e.workerID, e.now().Add(e.leaseTTL).UnixNano()); err != nil && e.ctx.Err() == nil {
+				e.log.Error("quacker: lease heartbeat", "err", err)
+			}
+		}
+	}
+}
+
+// reapLoop re-queues this cluster's expired leases (a crashed worker's
+// in-flight steps). It is leaderless: the guarded UPDATE means at most one
+// reaper wins each row.
+func (e *Engine) reapLoop() {
+	interval := e.leaseTTL
+	if interval < 500*time.Millisecond {
+		interval = 500 * time.Millisecond
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-t.C:
+			n, err := e.st.ReapExpired(e.ctx, e.now().UnixNano(), 200)
+			if err != nil {
+				if e.ctx.Err() == nil {
+					e.log.Error("quacker: reap expired leases", "err", err)
+				}
+				continue
+			}
+			if n > 0 {
+				e.log.Warn("quacker: requeued expired leases", "count", n)
+				e.wakeScheduler()
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1244,13 @@ func newID(now time.Time) string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return strconv.FormatInt(now.UnixNano(), 36) + "-" + hex.EncodeToString(b[:])
+}
+
+// newWorkerID generates a per-engine lease identity.
+func newWorkerID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "w-" + hex.EncodeToString(b[:])
 }
 
 func truncateErr(err error) string {

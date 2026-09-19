@@ -144,19 +144,101 @@ func (s *Store) beginTx(ctx context.Context) (*txn, error) {
 	return &txn{Tx: t, be: s.be}, nil
 }
 
-// InterruptAll marks in-flight work INTERRUPTED (shutdown sweep). This is
-// single-node semantics; with multi-instance leases it will be scoped to one
-// worker.
-func (s *Store) InterruptAll(ctx context.Context, now int64) error {
-	if _, err := s.write.ExecContext(ctx,
-		`UPDATE steps SET status=?, completed_at=? WHERE status=?`,
-		StatusInterrupted, now, StatusRunning); err != nil {
+// SupportsLeases reports whether the backend is multi-instance and uses step
+// leases (Postgres), as opposed to single-process SQLite.
+func (s *Store) SupportsLeases() bool { return s.be.SupportsLeases() }
+
+// InterruptAll marks in-flight work INTERRUPTED (shutdown sweep). With an
+// empty workerID (single-process SQLite) every RUNNING row is swept. With a
+// workerID (leases mode) only that worker's RUNNING steps are swept, and the
+// runs they leave with no active step are converged to INTERRUPTED — a run
+// another worker is still executing is left alone.
+func (s *Store) InterruptAll(ctx context.Context, workerID string, now int64) error {
+	if workerID == "" {
+		if _, err := s.write.ExecContext(ctx,
+			`UPDATE steps SET status=?, completed_at=? WHERE status=?`,
+			StatusInterrupted, now, StatusRunning); err != nil {
+			return err
+		}
+		_, err := s.write.ExecContext(ctx,
+			`UPDATE runs SET status=?, completed_at=? WHERE status=?`,
+			StatusInterrupted, now, StatusRunning)
 		return err
 	}
+
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.query(ctx, `SELECT DISTINCT run_id FROM steps WHERE status=? AND worker_id=?`,
+		StatusRunning, workerID)
+	if err != nil {
+		return err
+	}
+	var runIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		runIDs = append(runIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=?, worker_id='', lease_expires_at=0
+		WHERE status=? AND worker_id=?`, StatusInterrupted, now, StatusRunning, workerID); err != nil {
+		return err
+	}
+	if len(runIDs) > 0 {
+		args := []any{StatusInterrupted, now, StatusRunning}
+		args = append(args, argsAny(runIDs)...)
+		if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=? WHERE status=? AND id IN (`+
+			placeholders(len(runIDs))+`) AND NOT EXISTS (
+				SELECT 1 FROM steps s WHERE s.run_id=runs.id AND s.status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED'))`,
+			args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// HeartbeatWorker extends the lease of every RUNNING step owned by workerID.
+func (s *Store) HeartbeatWorker(ctx context.Context, workerID string, leaseUntil int64) error {
 	_, err := s.write.ExecContext(ctx,
-		`UPDATE runs SET status=?, completed_at=? WHERE status=?`,
-		StatusInterrupted, now, StatusRunning)
+		`UPDATE steps SET lease_expires_at=? WHERE worker_id=? AND status=?`,
+		leaseUntil, workerID, StatusRunning)
 	return err
+}
+
+// ReapExpired re-queues up to limit RUNNING steps whose lease has expired (a
+// crashed worker), returning how many were requeued. Leaderless: the
+// status='RUNNING' guard means at most one reaper wins each row.
+func (s *Store) ReapExpired(ctx context.Context, now int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.exec(ctx, `UPDATE steps SET
+		status=?, run_at=?, worker_id='', lease_expires_at=0
+		WHERE id IN (
+			SELECT s.id FROM steps s JOIN runs r ON r.id=s.run_id
+			WHERE s.status=? AND s.lease_expires_at > 0 AND s.lease_expires_at < ?
+			  AND r.status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')
+			LIMIT ?)`,
+		StatusQueued, now, StatusRunning, now, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, tx.Commit()
 }
 
 // checkpointLoop runs a PASSIVE wal_checkpoint on the writer every d.

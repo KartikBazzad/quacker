@@ -11,6 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/kartikbazzad/quacker"
+	"github.com/kartikbazzad/quacker/internal/store"
 )
 
 func testDSN(t *testing.T) string {
@@ -161,6 +162,78 @@ func TestPostgresDurable(t *testing.T) {
 	}
 	if out, err := h.Result(ctx); err != nil || out != "delivered" {
 		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+// TestPostgresTwoEngines: two engines share one database and split the work.
+func TestPostgresTwoEngines(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn, quacker.WithPollInterval(10*time.Millisecond))
+	b := openQ(t, dsn, quacker.WithPollInterval(10*time.Millisecond))
+	ctx := context.Background()
+
+	task := quacker.NewTask("pg.shared", func(ctx context.Context, in int) (int, error) {
+		return in * 2, nil
+	})
+	inputs := make([]int, 20)
+	for i := range inputs {
+		inputs[i] = i
+	}
+	hs, err := quacker.EnqueueBatch(ctx, a, task, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, h := range hs {
+		out, err := h.Result(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != i*2 {
+			t.Fatalf("out[%d] = %d, want %d", i, out, i*2)
+		}
+	}
+	// Node B's view reads the shared DB, so it sees all 20 regardless of which
+	// node executed them.
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := b.Runs(ctx, quacker.RunFilter{Workflow: "pg.shared", Status: quacker.StatusSucceeded})
+		return err == nil && len(s) == 20
+	})
+}
+
+// TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
+// expired lease is re-queued by the reaper.
+func TestPostgresLeaseReap(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	s, err := store.Open(store.Config{Mode: store.ModePostgres, DSN: dsn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.SupportsLeases() {
+		t.Fatal("Postgres should support leases")
+	}
+	ctx := context.Background()
+	now := time.Now().UnixNano()
+	sec := int64(time.Second)
+	run := &store.Run{ID: "r", Workflow: "w", Kind: store.KindTask, Status: store.StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	step := &store.Step{ID: "r/s", RunID: "r", Name: "s", Task: "t", Ord: 0, Status: store.StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	if err := s.CreateRun(ctx, run, []*store.Step{step}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimDue(ctx, "q", 1, now, 0, 0, nil, "w1", now+sec)
+	if err != nil || len(claims) != 1 || claims[0].Step.WorkerID != "w1" {
+		t.Fatalf("claim = %+v err=%v", claims, err)
+	}
+	if n, err := s.ReapExpired(ctx, now+sec/2, 10); err != nil || n != 0 {
+		t.Fatalf("early reap = %d err=%v, want 0", n, err)
+	}
+	if n, err := s.ReapExpired(ctx, now+2*sec, 10); err != nil || n != 1 {
+		t.Fatalf("reap = %d err=%v, want 1", n, err)
+	}
+	if _, err := s.ClaimDue(ctx, "q", 1, now+2*sec, 0, 0, nil, "w2", now+3*sec); err != nil {
+		t.Fatal(err)
 	}
 }
 

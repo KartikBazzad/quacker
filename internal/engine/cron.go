@@ -232,22 +232,29 @@ func (e *Engine) cronTick() {
 			e.log.Warn("quacker: cron skipped: task not registered", "cron", name, "task", entry.task)
 			continue
 		}
-		if _, err := e.Enqueue(e.ctx, &EnqueueRequest{
+		run, steps, berr := e.buildRun(&EnqueueRequest{
 			Workflow: entry.task,
 			Kind:     store.KindTask,
 			Input:    entry.input,
 			Queue:    def.Queue,
 			Steps:    []StepReq{{Name: def.Name, Def: def}},
-		}); err != nil && err != ErrClosed {
-			e.log.Error("quacker: cron enqueue failed", "cron", name, "err", err)
+		}, now)
+		if berr != nil {
+			e.log.Error("quacker: cron build failed", "cron", name, "err", berr)
+			continue
 		}
+		// CAS the occurrence and enqueue in one transaction, so exactly one
+		// node fires each occurrence across the cluster.
 		next := entry.sched.s.Next(now)
+		fired, ferr := e.st.FireCron(e.ctx, name, entry.next.UnixNano(), next.UnixNano(), run, steps)
+		if ferr != nil {
+			e.log.Error("quacker: cron fire failed", "cron", name, "err", ferr)
+		}
 		e.mu.Lock()
 		entry.next = next
 		e.mu.Unlock()
-		_ = e.st.UpsertCron(context.Background(), &store.Cron{
-			Name: name, Spec: entry.spec, Task: entry.task, Input: entry.input,
-			NextAt: next.UnixNano(),
-		})
+		if fired {
+			e.wakeScheduler()
+		}
 	}
 }

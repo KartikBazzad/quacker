@@ -25,6 +25,15 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 		return err
 	}
 	defer tx.Rollback()
+	if err := insertRunsTx(ctx, tx, runs, steps); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertRunsTx inserts runs and steps into an existing transaction. Shared by
+// CreateRuns and FireCron (which fuses the insert with a cron CAS).
+func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) error {
 	for i, run := range runs {
 		res, err := tx.exec(ctx, `INSERT INTO runs
 			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent)
@@ -49,7 +58,7 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ErrNonTerminalPurge is returned when a purge is asked to delete a
@@ -279,29 +288,35 @@ type QueueClaim struct {
 
 // ClaimDue claims up to limit due steps for one queue, moving them and their
 // parent runs to RUNNING. It is ClaimDueMulti with a single queue.
-func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64, workerLabels []string) ([]*Claim, error) {
+func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64, workerLabels []string, workerID string, leaseUntil int64) ([]*Claim, error) {
 	return s.ClaimDueMulti(ctx, []QueueClaim{{
 		Name: queue, Limit: limit, RateLimit: rateLimit, RateWindow: rateWindow,
-	}}, now, workerLabels)
+	}}, now, workerLabels, workerID, leaseUntil)
 }
 
 // ClaimDueMulti claims due steps across several queues in one write
 // transaction — one transaction per scheduler tick rather than one per queue.
 // Each queue is capped at its own limit and rate window, and the per-key gate
-// plus the guarded UPDATE are unchanged. Safe under concurrency: the single
-// writer connection serializes the whole batch, and each step UPDATE is
-// re-guarded on its still being claimable.
-func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64, workerLabels []string) ([]*Claim, error) {
+// plus the guarded UPDATE are unchanged.
+//
+// When workerID is non-empty (leases enabled) each claim is stamped with the
+// worker and a lease deadline, and the whole batch takes the backend's claim
+// lock so the counting gates are evaluated cluster-wide exactly as SQLite's
+// single writer does.
+func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64, workerLabels []string, workerID string, leaseUntil int64) ([]*Claim, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := s.be.ClaimLock(ctx, tx.Tx); err != nil {
+		return nil, err
+	}
 
 	workerJSON := encodeList(workerLabels)
 	var claims []*Claim
 	for _, q := range queues {
-		cs, err := s.claimQueueTx(ctx, tx, q, now, workerJSON)
+		cs, err := s.claimQueueTx(ctx, tx, q, now, workerJSON, workerID, leaseUntil)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +369,7 @@ func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int6
 // claimed_at), so the limit is capped at the window's remaining budget. The
 // count is persisted, so the window survives a File-mode restart instead of
 // allowing a fresh-process burst.
-func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int64, workerLabelsJSON string) ([]*Claim, error) {
+func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int64, workerLabelsJSON, workerID string, leaseUntil int64) ([]*Claim, error) {
 	limit := q.Limit
 	if limit <= 0 {
 		return nil, nil
@@ -417,15 +432,17 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			// A resume spends start budget (claimed_at) but is not a new
 			// attempt and does not restamp started_at.
 			res, err = tx.exec(ctx, `UPDATE steps SET
-				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = ''
+				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
+				worker_id = ?, lease_expires_at = ?
 				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+keyGate,
-				StatusRunning, now, st.ID, StatusSuspended, now)
+				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
-				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
+				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
+				worker_id = ?, lease_expires_at = ?
 				WHERE id = ? AND status = ? AND `+keyGate,
-				StatusRunning, now, now, st.ID, StatusQueued)
+				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {
 			return nil, err
@@ -447,6 +464,8 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 		st.Status = StatusRunning
 		st.ClaimedAt = now
 		st.ResumeAt = 0
+		st.WorkerID = workerID
+		st.LeaseExpiresAt = leaseUntil
 		claims = append(claims, &Claim{Step: st, Resumed: resumed})
 	}
 	return claims, nil
@@ -483,6 +502,10 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		return CompleteResult{}, err
 	}
 	defer tx.Rollback()
+	// Serialize concurrent completions of the same run across nodes.
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return CompleteResult{}, err
+	}
 
 	// A run that is already terminal (cancelled/failed/interrupted) must not
 	// gain SUCCEEDED steps from executors that raced the transition.
@@ -591,6 +614,10 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		return CompleteResult{}, err
 	}
 	defer tx.Rollback()
+	// Serialize concurrent completions of the same run across nodes.
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return CompleteResult{}, err
+	}
 
 	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, error=?, completed_at=? WHERE id=?`,
 		StatusFailed, errMsg, now, stepID); err != nil {
@@ -641,6 +668,10 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 		return nil, "", false, err
 	}
 	defer tx.Rollback()
+	// Serialize against concurrent completion of the same run across nodes.
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return nil, "", false, err
+	}
 
 	var status string
 	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
@@ -943,6 +974,30 @@ func (s *Store) ListCrons(ctx context.Context) ([]*Cron, error) {
 		out = append(out, &c)
 	}
 	return out, rows.Err()
+}
+
+// FireCron atomically claims a cron occurrence and enqueues its run: it
+// advances next_at only if it still equals expectNext, and inserts the run in
+// the same transaction. It returns false when another node already fired this
+// occurrence, so a cron fires once per occurrence across the cluster (at-most-
+// once: a crash between the CAS and the insert rolls both back and retries).
+func (s *Store) FireCron(ctx context.Context, name string, expectNext, newNext int64, run *Run, steps []*Step) (bool, error) {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.exec(ctx, `UPDATE crons SET next_at=? WHERE name=? AND next_at=?`, newNext, name, expectNext)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, tx.Commit() // lost the race; nothing to enqueue
+	}
+	if err := insertRunsTx(ctx, tx, []*Run{run}, [][]*Step{steps}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // ---------------------------------------------------------------------------

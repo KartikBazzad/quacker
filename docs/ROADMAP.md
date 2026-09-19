@@ -1,9 +1,9 @@
 # Roadmap
 
 Status: **v0.4 + v1.1 in progress** — v0.3 is shipped (durable execution, DAG
-visualizer, debug logger, perf). Worker labels and OTel tracing are done, and
-the Postgres backend has landed as single-instance; multi-instance step leases
-remain the last item on the multi-instance story.
+visualizer, debug logger, perf). Worker labels, OTel tracing, the Postgres
+backend, and multi-instance step leases are done; the only remaining v1.1 item
+is optional `WithDB` connection reuse.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -248,15 +248,17 @@ Children are ordinary runs and are aged/purged independently.
   Postgres uses `BIGINT` throughout (unix nanos overflow `INTEGER`), identity
   columns, and a `jsonb` label gate; migrations are serialized with an
   advisory lock. Env-gated integration tests run in CI against a Postgres
-  service. **Single-instance only** for now — see the next phase.
+  service.
 - ✅ Migration scripts for PostgreSQL (a per-dialect migration list).
+- ✅ **Multi-instance (leases)**: `worker_id` + `lease_expires_at` on steps; a
+  heartbeat extends leases and a leaderless reaper re-queues expired ones
+  (replacing boot-only recovery, which is disabled for Postgres). `ClaimDueMulti`
+  takes a `pg_advisory_xact_lock` so the counting gates serialize cluster-wide;
+  `CompleteStep`/`FinalFailStep`/`CancelRun` take `SELECT … FOR UPDATE` on the
+  run; and crons fire once per occurrence via a `next_at` CAS fused with the
+  enqueue. A two-engine Postgres test shares one database in CI.
 - **Reuse existing connection**: `WithDB(*sql.DB)` to hand quacker a pool it
-  does not own.
-- **Multi-instance (leases)**: worker id + `lease_expires_at` on steps, a
-  heartbeat, and a leaderless reaper; a global claim advisory lock; `FOR
-  UPDATE` per-run locks in the DAG-mutating transactions; and cron single-fire
-  via a `next_at` CAS in the enqueue transaction. This is what makes several
-  engines safe against one database.
+  does not own. (Optional; the storage constructor already covers most cases.)
 
 ## v1.2 - Performance Optimizations
 - Optimize for high throughput and low latency

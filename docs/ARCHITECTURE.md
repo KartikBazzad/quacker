@@ -96,10 +96,36 @@ SQLite never compile it.
   timestamp/counter (unix nanos overflow `INTEGER`), identity columns, and a
   `jsonb` label gate; `MigrateLock` takes a `pg_advisory_xact_lock` so
   concurrent boots serialize DDL.
+- The backend also supplies the multi-instance hooks: `ClaimLock` (advisory
+  lock on a claim batch), `RunLock` (`FOR UPDATE` on a run), and
+  `SupportsLeases` (false for SQLite). SQLite implements them as no-ops.
 - The engine no longer touches the raw pools: the shutdown sweep is
-  `Store.InterruptAll`, and `Store.Write`/`Read` are used only by tests. This
-  is the seam the multi-instance phase (leases, `FOR UPDATE` run locks) will
-  build on.
+  `Store.InterruptAll`, and `Store.Write`/`Read` are used only by tests.
+
+### Multi-instance (Postgres)
+
+Several engines may share one Postgres database. SQLite keeps its
+single-process behavior; leases are enabled only where `Backend.SupportsLeases`
+is true.
+
+- **Leases.** A claim stamps `worker_id` and `lease_expires_at`. A heartbeat
+  loop (every `LeaseTTL/3`) extends this worker's RUNNING steps; a reaper loop
+  re-queues (`QUEUED`, lease cleared) any RUNNING step whose lease expired,
+  leaderlessly — the `status='RUNNING'` guard means one reaper wins each row.
+  Postgres boot recovery is disabled (`RecoverOnBoot` false): re-queuing every
+  RUNNING row would steal a peer's work, so the reaper replaces it.
+- **Claim serialization.** `ClaimDueMulti` takes a `pg_advisory_xact_lock`, so
+  the per-key and rate gates are evaluated one batch at a time across the
+  cluster, exactly as SQLite's single writer does.
+- **Per-run decisions.** `CompleteStep`, `FinalFailStep`, and `CancelRun`
+  take `SELECT … FOR UPDATE` on the run, so two nodes finishing sibling steps
+  of one run can't both compute the terminal transition.
+- **Cron single-fire.** Firing CAS-es `next_at` and inserts the run in one
+  transaction, so exactly one node enqueues each occurrence (at-most-once: a
+  crash rolls both back and retries).
+- **Shutdown.** `InterruptAll(workerID, …)` sweeps only this worker's RUNNING
+  steps and converges the runs it leaves with no active step; a run another
+  worker is executing is left alone.
 
 ### Schema
 
@@ -229,9 +255,9 @@ registration so the step never starts the task's side effects.
 ### Shutdown
 
 `Close(ctx)` stops the loops, waits for in-flight executions until ctx's
-deadline (default 30s), sweeps any still-RUNNING rows to INTERRUPTED, closes
-the log channel after a final flush, and releases waiters with
-`ErrRunInterrupted`. On `File` storage, the next `Open` re-queues
+deadline (default 30s), sweeps any still-RUNNING rows to INTERRUPTED (in
+leases mode, only this worker's — see "Multi-instance"), closes the log
+channel after a final flush, and releases waiters with `ErrRunInterrupted`. On `File` storage, the next `Open` re-queues
 RUNNING/INTERRUPTED work (`RecoverRunningOnBoot`) and `Start()` re-creates
 the queue registry from `SELECT DISTINCT queue FROM steps`. Claims whose
 task isn't registered in the new process (work resumed before `Register`

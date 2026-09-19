@@ -54,6 +54,8 @@ func Open(opts ...Option) (*Quacker, error) {
 		MetricsInterval: cfg.metricsInterval,
 		Retention:       cfg.retention,
 		TracerProvider:  cfg.tracerProvider,
+		WorkerID:        cfg.workerID,
+		LeaseTTL:        cfg.leaseTTL,
 	}
 	if cfg.logSink != nil {
 		fn := cfg.logSink

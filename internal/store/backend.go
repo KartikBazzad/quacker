@@ -26,6 +26,16 @@ type Backend interface {
 	// inside each per-version transaction (no-op when the database is private
 	// to one process).
 	MigrateLock(ctx context.Context, tx *sql.Tx) error
+	// ClaimLock serializes claim transactions across processes. It runs at the
+	// start of ClaimDueMulti (no-op for single-process SQLite).
+	ClaimLock(ctx context.Context, tx *sql.Tx) error
+	// RunLock locks a run row for the duration of a DAG-mutating transaction
+	// (complete/fail/cancel), serializing per-run decisions across processes
+	// (no-op for single-process SQLite).
+	RunLock(ctx context.Context, tx *sql.Tx, runID string) error
+	// SupportsLeases reports whether step leases are meaningful for this
+	// dialect (true for networked Postgres; false for single-process SQLite).
+	SupportsLeases() bool
 	// SupportsCheckpoint reports whether the WAL checkpoint loop applies.
 	SupportsCheckpoint(cfg Config) bool
 	// RecoverOnBoot reports whether boot-time recovery of RUNNING rows applies.

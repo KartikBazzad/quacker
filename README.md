@@ -104,18 +104,38 @@ quacker.Open(quacker.WithStorage(quacker.Postgres("postgres://user:pass@host/db?
   automatically when the process dies, even on SIGKILL. On platforms
   without kernel advisory locks (`!unix && !windows`), only same-process
   exclusion holds.
-- **`Postgres`** — durable, networked. Requires importing the driver package
+- **`Postgres`** — durable, networked, and **multi-instance**. Requires
+  importing the driver package
   (`import _ "github.com/kartikbazzad/quacker/postgres"`), which keeps pgx out
   of builds that don't use it; without it, `Open` fails with a clear
-  "backend not registered" error. Migrations are serialized with a Postgres
-  advisory lock so several nodes booting at once can't race DDL. **Single
-  instance for now**: boot recovery and shutdown assume one engine owns the
-  database. Multi-instance (step leases, cross-node claim locking) is a later
-  phase and is the one place the storage story is not yet cluster-safe.
+  "backend not registered" error. Several engines may share one database:
+  each gets a worker id, claims carry a **lease** extended by a heartbeat, and
+  a leaderless reaper re-queues a crashed node's expired leases. Claim batches
+  and per-run completion decisions are serialized with advisory/row locks, and
+  crons fire once per occurrence via a compare-and-swap. Migrations too are
+  serialized, so nodes booting at once can't race DDL.
+
+```go
+import _ "github.com/kartikbazzad/quacker/postgres"
+
+q, _ := quacker.Open(
+    quacker.WithStorage(quacker.Postgres(dsn)),
+    quacker.WithWorkerID("worker-a"),  // unique per running engine (default: generated)
+    quacker.WithLeaseTTL(30*time.Second),
+)
+```
 
 WAL modes (`Ephemeral`, `File`) run a passive `wal_checkpoint` every 60s
 (`WithCheckpointInterval`) and a truncating checkpoint on `Close`, so a
 clean shutdown leaves the `-wal` file empty (usually deleted).
+
+**Running several engines (Postgres).** Each engine has a unique worker id and
+leases every step it claims; a heartbeat extends the leases of its in-flight
+steps and a reaper re-queues expired ones, so a crashed node's work is picked
+up without a human. Graceful `Close` interrupts only that worker's steps. Step
+labels route work to capable workers, and crons fire once per occurrence
+across the fleet. All of it is opt-in via the storage choice — SQLite stays
+single-process and unchanged.
 
 How non-blocking introspection works: the store keeps a **single writer
 connection** and a **separate read-only pool**. In WAL mode readers never
