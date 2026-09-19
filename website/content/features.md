@@ -119,6 +119,12 @@ across processes sharing a database.
 - **Transactional enqueue** — `EnqueueTx(ctx, tx, q, task, in)` inserts a run
   on your own `*sql.Tx` (Postgres/MySQL), atomic with your business writes —
   the outbox pattern.
+- **Encrypted payloads** — `WithPayloadKey(key)` encrypts every user payload
+  at rest with AES-256-GCM; decrypt transparently at execution, or read
+  ciphertext from introspection.
+- **Ephemeral runs** — `WithEphemeral()` keeps a run's state only while it is
+  live: deleted on completion and discarded on restart, so there is no history
+  to retain.
 
 ```go
 task := quacker.NewTask("sync", syncFn,

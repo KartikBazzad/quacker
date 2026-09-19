@@ -1,12 +1,12 @@
 # Roadmap
 
-Status: **v1.0–v1.6 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.7 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
 storage-driver contract with a MySQL/MariaDB driver, v1.5 job-control
-primitives (unique jobs, snooze, queue pause, run pause/resume), and v1.6
-(retention per queue, enqueue-on-`*sql.Tx`, dead-letter queue, sequences). The
-v1.0 stability gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
+primitives (unique jobs, snooze, queue pause, run pause/resume), v1.6
+(retention per queue, enqueue-on-`*sql.Tx`, dead-letter queue, sequences), and
+v1.7 (encrypted payloads, ephemeral runs). The v1.0 stability gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
 complete; release tags wait on a git remote.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
@@ -519,6 +519,18 @@ The dead-letter work also fixed a latent bug: `FinalFailStep`'s sibling-cancel
 left a `haltSteps` tombstone that later cancelled a revived (retried) step; a
 halt tombstone is now honored only while the run is terminal.
 
+## v1.7 — encrypted payloads & ephemeral runs (✅ DONE)
+
+- ✅ **Encrypted jobs**: `WithPayloadKey` installs an AES-256-GCM JSON codec
+  (`NewEncryptedJSONCodec`), so every user payload — input/output, `DepOutput`,
+  journal values, event payloads — is encrypted at rest. Schema JSON the SQL
+  gates read and task logs stay plaintext; introspection returns ciphertext. No
+  migration.
+- ✅ **Ephemeral jobs**: `WithEphemeral` persists a run while in flight but
+  deletes it on any terminal transition and discards it at boot recovery, so no
+  history remains. A run executed on another engine returns `ErrRunGone` to an
+  observer. Migrations: SQLite 18, Postgres 10, MySQL 7.
+
 ## Backlog
 - Custom storage backends
 - Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
@@ -537,8 +549,8 @@ names the closest API today.
 | Getting the client within workers | 🟡 | Go tasks close over `q`; context exposes `RunIDFromContext`/`StepFromContext` only — no engine accessor (trivial for embedded use). |
 | Dead letter queue | ✅ | Opt-in `WithDeadLetter`; `DeadLetters`/`RetryDeadLetter`/`DismissDeadLetter` (v1.6). |
 | Durable periodic jobs | ✅ | `Cron` persists and re-arms on `Register`; fires once per occurrence across instances. |
-| Encrypted jobs | ❌ | No payload encryption. `WithCodec` can plug an encrypting codec for user payloads (schema JSON stays plaintext). |
-| Ephemeral jobs | ❌ | Storage is engine-wide (`Memory`/`Ephemeral`); no per-run "don't persist". |
+| Encrypted jobs | ✅ | `WithPayloadKey` (AES-256-GCM codec) encrypts all user payloads at rest (v1.7). |
+| Ephemeral jobs | ✅ | `WithEphemeral`: persisted in flight, deleted on terminal, never recovered (v1.7). |
 | Error and panic handling | ✅ | Panics recovered → step `FAILED` (and retried); errors persisted; retries + backoff. |
 | Job-persisted logging | ✅ | `WithLogStorage(true)` + `q.Logs`; sink chain via `WithTaskLogSink`. |
 | Multiple queues | ✅ | `Queue(name)` per task + `WithQueue(name, n)`. |
@@ -558,19 +570,16 @@ names the closest API today.
 | Pause/resume jobs & workflows | ✅ | `PauseRun`/`ResumeRun` (v1.5); running steps requeue on resume. |
 | Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
 
-Tally: 22 shipped, 2 partial, 0 missing — v1.6 added the dead-letter queue,
-sequences, per-queue retention, and enqueue-on-`*sql.Tx`. The remaining partial
-items are concurrency-limit cancel strategies and the client-in-context
-accessor.
+Tally: 24 shipped, 2 partial, 0 missing — v1.7 added encrypted payloads and
+ephemeral runs. The remaining partial items are concurrency-limit cancel
+strategies and the client-in-context accessor.
 
 ### Missing / partial — suggested follow-ups
 
 Addable within the embedded model, roughly by value:
 
-1. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
-2. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
-3. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
-4. **Client in context** — an engine accessor inside a task (Go closures usually suffice).
+1. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
+2. **Client in context** — an engine accessor inside a task (Go closures usually suffice).
 
 The list reads like a Postgres-backed job-library matrix (River/Oban-shaped),
 which is a useful parity target beyond Hatchet.

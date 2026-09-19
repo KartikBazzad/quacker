@@ -799,6 +799,31 @@ A halt tombstone is only meaningful while the run is terminal, so the executor
 now checks `runTerminal` before honoring one. Any feature that revives terminal
 runs (DLQ retry, and future replay) must keep this in mind.
 
+### 37. v1.7: encryption rides the codec; ephemeral runs trade history for cleanliness
+
+- **Encryption needed no engine change.** User payloads already funnel through
+  the `Codec`, so an AES-256-GCM JSON codec encrypts input/output, `DepOutput`,
+  journal values, and event payloads end to end. The only things that must stay
+  plaintext are the schema JSON the SQL gates read (`depends_on`, `labels`,
+  `unique_key`, `sequence_key`) and task logs; introspection returns ciphertext
+  and the caller decrypts with their codec. The trade: encryption is only as
+  strong as the caller's key handling, and there is no rotation.
+- **Ephemeral is "delete on terminal", not "never persist".** The DB-backed
+  claim model needs the row while the run is live, so ephemeral runs are
+  persisted, then deleted (with steps and logs) inside the same transaction
+  that records them terminal, and dropped at boot recovery rather than
+  requeued. This gives fire-and-forget ergonomics without a second execution
+  path.
+- **Cross-engine observation of an ephemeral run is impossible by design.** An
+  observer's poll waiter (a reused unique run executed elsewhere) sees the row
+  vanish and returns `ErrRunGone` — a clear error rather than a hang. The
+  executing engine's own waiter still carries the output in memory.
+- **Known edges:** a buffered task log flushed after the run is deleted can
+  leave an orphan log row (cleaned by the purge orphan sweep); and in leases
+  mode a QUEUED ephemeral run left by a *crashed* node has no safe ownership
+  signal, so it may be recovered like a normal run. Ephemeral's "no recovery"
+  guarantee is exact for single-process File storage.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned
