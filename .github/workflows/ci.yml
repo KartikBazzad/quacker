@@ -59,3 +59,33 @@ jobs:
         run: go test ./postgres/ -count=1
       - name: race
         run: go test -race ./postgres/ -count=1
+
+  # MySQL integration tests need a real database, so they run on a runner
+  # with a service container (Linux only) and the env var that un-skips them.
+  mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: quacker
+          MYSQL_DATABASE: quacker
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -pquacker"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      QUACKER_TEST_MYSQL_DSN: root:quacker@tcp(127.0.0.1:3306)/quacker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: test
+        run: go test ./mysql/ -count=1
+      - name: race
+        run: go test -race ./mysql/ -count=1

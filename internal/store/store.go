@@ -14,6 +14,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,9 @@ func Open(cfg driver.Config) (*Store, error) {
 	be, err := backendFor(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if err := driver.ValidateMigrations(be.Migrations()); err != nil {
+		return nil, fmt.Errorf("quacker: driver %q: %w", be.Name(), err)
 	}
 	ctx := context.Background()
 	write, read, cleanup, err := be.OpenPools(ctx, cfg)

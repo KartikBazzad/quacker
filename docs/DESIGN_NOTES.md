@@ -673,31 +673,51 @@ Two consequences worth stating:
 Default is `JSONCodec` (a thin `encoding/json` wrapper), so existing data and
 behavior are byte-identical.
 
-### 34. Storage stays first-party; there is no public backend contract
+### 34. Storage drivers are a public SQL-dialect contract (reverses v1.3)
 
-We considered shipping a public plugin point for storage and decided against
-it. The two shapes both fail:
+v1.3 rejected a public storage point. We have since published one, choosing the
+**SQL-dialect seam** (`driver.Backend`) over a backend-agnostic `Store`
+interface, and shipped MySQL/MariaDB as a second driver to prove it.
 
-- **Publish `Backend` (the SQL-dialect seam).** It is not a storage contract at
-  all — it is SQL internals: `Rebind` (`?`→`$n`), per-dialect DDL, the
-  `json_each`/`jsonb_array_elements_text` label gate, advisory/`FOR UPDATE`
-  locks. Exposing it freezes those internals and still only lets someone write
-  *another SQL database*, not a different store.
-- **A backend-agnostic `Store` interface.** The engine plus public API drive
-  ~39 operations, and the transactional correctness lives *inside* them —
-  claim key/rate/label gating, DAG completion, atomic event delivery, cron CAS,
-  and leases. A third-party driver would have to reimplement all of it with
-  identical guarantees, and we cannot enforce that without a conformance suite
-  we'd have to build and maintain.
+The earlier analysis identified the two shapes:
 
-For an embedded, single-binary library the value doesn't justify a large frozen
-surface plus an unverifiable correctness contract on someone else's code.
-Storage is first-party: SQLite (Memory/Ephemeral/File) and Postgres. Adding a
-new SQL database is a normal in-repo change — implement a `Backend` and its
-migrations, and let the existing query layer and tests cover it (the Postgres
-driver is the template). v1.3's extension story is the compile-time plugin
-hooks (§32) and the payload codec (§33), which extend behavior without moving
-the durability guarantees out of the engine.
+- **Publish the dialect seam.** SQL internals — `Rebind`, per-dialect DDL,
+  label gates, advisory/`FOR UPDATE` locks — frozen, and only useful for
+  *another SQL database*.
+- **A backend-agnostic `Store` interface.** ~39 operations whose correctness
+  (claim key/rate/label gating, DAG completion, atomic event delivery, cron
+  CAS, leases) would move onto every third-party driver, unverifiable without a
+  conformance suite we'd build and maintain.
+
+We took the first. The trade is deliberate: the driver translates SQL, it does
+not own transactional behavior. Everything correctness-critical still runs in
+one query layer, so a third-party driver cannot silently weaken the guarantees
+— it can only get the dialect wrong, which the shared tests catch. The cost is
+a frozen dialect surface and a schema a driver must match exactly; see
+[DRIVERS.md](DRIVERS.md) for the contract and portability rules.
+
+Writing the MySQL driver is what made the seam honest — it forced four
+concrete fixes into the shared layer, each of which a purported "just a
+dialect" abstraction would otherwise have hidden:
+
+- **`step_journal.key` → `wkey`.** `KEY` is reserved on MySQL, and the query
+  layer must reference the column unquoted on every dialect (SQLite migration
+  12, Postgres migration 4).
+- **`driver.KeyGate`.** MySQL rejects a correlated subquery that reads the
+  table being updated (error 1093), so the per-key claim predicate is a hook:
+  Postgres/SQLite use the correlated form, MySQL a materialized derived table.
+- **`driver.MigrateLocker`.** `GET_LOCK` is session-scoped, so MySQL acquires
+  it for the whole migration run and releases it, instead of the
+  transaction-scoped advisory locks Postgres uses.
+- **`driver.UpsertSQL`.** `ON CONFLICT ... DO UPDATE` (SQLite/Postgres) vs
+  `ON DUPLICATE KEY UPDATE` (MySQL).
+
+Plus two portable rewrites that removed dialect-specific SQL from the query
+layer: `UPDATE ... RETURNING` became select-then-update under the existing
+per-run lock, and same-table `LIMIT` subqueries were wrapped in derived tables.
+
+The extension story is now: plugins (§32) and the codec (§33) for behavior,
+and `driver.Backend` for the database.
 
 ## Lessons (bugs the tests caught)
 

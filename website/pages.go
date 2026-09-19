@@ -25,6 +25,7 @@ var pages = []pageDef{
 	{slug: "triggers", title: "Triggers: cron, events, children", nav: "Triggers", group: "Guides", src: markdownPage, content: "triggers.md"},
 	{slug: "operations", title: "Operations", nav: "Operations", group: "Guides", src: markdownPage, content: "operations.md"},
 	{slug: "plugins", title: "Plugins", nav: "Plugins", group: "Guides", src: markdownPage, content: "plugins.md"},
+	{slug: "storage-drivers", title: "Storage drivers", nav: "Storage drivers", group: "Guides", src: docsPage, docs: "DRIVERS.md"},
 
 	{slug: "api", title: "API reference", nav: "API reference", group: "Reference", src: renderAPI},
 	{slug: "examples", title: "Examples", nav: "Examples", group: "Reference", src: renderExamples},

@@ -1,11 +1,11 @@
 # Roadmap
 
-Status: **v1.0–v1.3 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.4 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
-perf pass, lifecycle-hook plugins, and a pluggable payload codec are all done.
-Custom storage backends are a deliberate non-goal (storage stays first-party
-SQLite + Postgres). The v1.0 stability gates (semver policy, chaos, fuzzing,
-pkg.go.dev examples) are complete; release tags wait on a git remote.
+perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
+storage-driver contract with a MySQL/MariaDB driver. The v1.0 stability gates
+(semver policy, chaos, fuzzing, pkg.go.dev examples) are complete; release tags
+wait on a git remote.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -301,21 +301,35 @@ it stays type-safe, cross-platform, and single-binary.
   input/output, `DepOutput`, event payloads, and durable `RunOnce`/`WaitFor`
   values); schema structures (`depends_on`, `labels`) stay JSON because the SQL
   gates read them. Engine-wide, default unchanged, same codec across restarts.
-- ⛔ **Custom storage backends — deliberately not planned.** The internal
-  `Backend` seam is SQL-dialect-specific (`Rebind`, DDL, `json_each` gates,
-  advisory locks); publishing it would freeze SQL internals. The alternative —
-  a backend-agnostic `Store` interface — is ~39 operations, and it would move
-  all the transactional correctness (claim key/rate/label gating, DAG
-  completion, atomic event delivery, cron CAS, leases) onto every third-party
-  driver, with a conformance burden we can't enforce. Storage stays first-party
-  (SQLite + Postgres). New SQL backends are welcome as in-repo dialects/PRs;
-  see DESIGN_NOTES §34.
+- ⛔ **Custom storage backends — not planned *in v1.3*.** We chose not to ship
+  a backend-agnostic `Store` interface (~39 operations whose transactional
+  correctness would move onto every third-party driver). **Superseded by v1.4**,
+  which publishes the SQL-dialect seam instead; see DESIGN_NOTES §34.
 
 Design input from Jev (semantic judgments, not tests): After* ordering
 (reverse, 0.91), After* error handling (recover+log, 0.99), and surface shape
 (a single `Hooks` struct over capability interfaces, 0.72). Trust model:
 in-process plugins are trusted code; no sandboxing.
 
+
+## v1.4 - Storage drivers (✅ DONE)
+
+Publish the SQL-dialect seam and prove it with a second third-party-style
+driver. The engine keeps every transactional guarantee; a driver only
+translates SQL. See [DRIVERS.md](DRIVERS.md).
+
+- ✅ **Public driver contract** (`quacker/driver`): `Backend`, `Config`,
+  `Migration`, a name registry (`RegisterBackend`), and `quacker.Driver(name,
+  dsn)`. An out-of-tree package can implement it.
+- ✅ **MySQL/MariaDB driver** (`mysql/`), multi-instance, tested against a real
+  MySQL 8 server in CI: tasks, workflows, durable wait/resume, two engines on
+  one database, label routing, purge, and `WithDB`.
+- ✅ **Reuse an existing pool**: `Storage.WithDB(*sql.DB)` and
+  `PostgresWithDB` (connection reuse).
+- ✅ **Portability fixes** the MySQL driver forced into the shared query layer:
+  `wkey` rename, `driver.KeyGate`, `driver.UpsertSQL`, `driver.MigrateLocker`,
+  select-then-update instead of `UPDATE ... RETURNING`, and derived-table
+  `LIMIT` subqueries.
 
 ## Backlog
 - Pause and Resume Jobs/workflows

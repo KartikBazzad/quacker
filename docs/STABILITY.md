@@ -53,17 +53,18 @@ These are stable interfaces intended for third-party use:
 - **Payload codec** (`Codec`, `WithCodec`).
 - **Observability**: `WithTaskLogSink`/`WithLogSink`, `WithMetricsFunc`,
   `WithTracerProvider`.
-
-**Storage backends are not a public extension point.** SQLite and Postgres are
-first-party; a new SQL database is an in-repo dialect (`store.Backend`) rather
-than a public contract. See DESIGN_NOTES §34 for why.
+- **Storage drivers** (`driver.Backend`, `driver.RegisterBackend`,
+  `quacker.Driver`). A driver is a SQL dialect — it translates connection
+  setup, placeholders, DDL, and a handful of dialect predicates, but never
+  owns transactional behavior. SQLite, Postgres, and MySQL/MariaDB ship in this
+  module; see [DRIVERS.md](DRIVERS.md) for the contract and portability rules.
 
 Plugins are compile-time and trusted in-process code — there is no sandbox.
 
 ## Verification guarantees
 
 - `go test ./...` and `go test -race ./...` (SQLite) on Linux and macOS in CI.
-- Postgres integration tests against a real server in CI.
+- Postgres and MySQL integration tests against real servers in CI.
 - Fuzzing for the DAG validator and the cron parser (`internal/engine`).
 - A File-mode chaos suite that SIGKILLs a child mid-execution and asserts
   at-least-once recovery (no lost terminal states).

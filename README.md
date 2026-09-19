@@ -26,7 +26,7 @@ events, stop := q.Subscribe(h.RunID()) // live transition stream
 | | Hatchet | quacker |
 |---|---|---|
 | Deployment | Server + Postgres (+ Docker) | One `go get`, embedded in your binary |
-| State | Postgres | SQLite (default, pure Go) or Postgres |
+| State | Postgres | SQLite (default, pure Go), Postgres, or MySQL |
 | Introspection | Web UI / API over HTTP | In-process snapshots & streams, zero network |
 | Scope | Distributed fleet | One process, all cores |
 
@@ -92,6 +92,9 @@ quacker.Open(quacker.WithStorage(quacker.File("state.db").RecoverRunningOnBoot(t
 
 import _ "github.com/kartikbazzad/quacker/postgres" // register the driver
 quacker.Open(quacker.WithStorage(quacker.Postgres("postgres://user:pass@host/db?sslmode=disable")))
+
+import _ "github.com/kartikbazzad/quacker/mysql" // register the driver
+quacker.Open(quacker.WithStorage(quacker.Driver("mysql", "user:pass@tcp(host:3306)/db")))
 ```
 
 - **`Memory`** — nothing touches the filesystem. Note: SQLite `:memory:`
@@ -118,6 +121,12 @@ quacker.Open(quacker.WithStorage(quacker.Postgres("postgres://user:pass@host/db?
   and per-run completion decisions are serialized with advisory/row locks, and
   crons fire once per occurrence via a compare-and-swap. Migrations too are
   serialized, so nodes booting at once can't race DDL.
+- **`Driver("mysql", dsn)`** — durable, networked, **multi-instance** MySQL /
+  MariaDB, same guarantees as Postgres. Requires
+  `import _ "github.com/kartikbazzad/quacker/mysql"`. New SQL databases are a
+  driver: implement `driver.Backend` and register it; see
+  [Storage drivers](docs/DRIVERS.md). `Storage.WithDB(*sql.DB)` reuses a pool
+  you already own (also `PostgresWithDB`).
 
 ```go
 import _ "github.com/kartikbazzad/quacker/postgres"
@@ -565,11 +574,11 @@ overhead at all.
 ## Not yet
 
 Strict (ordered) per-key concurrency and a web UI. Compile-time lifecycle-hook
-plugins and a pluggable payload codec shipped (v1.3); **custom storage backends
-are deliberately out of scope** — storage is first-party SQLite + Postgres, and
-new SQL dialects are in-repo/PR work. Multi-process scaling over Postgres,
-worker labels, OTel tracing, durable execution, and DAG visualization are all
-shipped.
+plugins, a pluggable payload codec (v1.3), and a public storage-driver contract
+with MySQL/MariaDB (v1.4) shipped; new SQL databases are a
+[driver](docs/DRIVERS.md) you can implement out-of-tree. Multi-process scaling
+over Postgres/MySQL, worker labels, OTel tracing, durable execution, and DAG
+visualization are all shipped.
 
 ## Documentation
 
@@ -577,6 +586,7 @@ shipped.
 - [Design notes](docs/DESIGN_NOTES.md) — key decisions and lessons from the build
 - [Benchmarks](docs/BENCHMARKS.md) — numbers, methodology, how to reproduce
 - [Roadmap](docs/ROADMAP.md) — shipped versions and follow-on epics
+- [Storage drivers](docs/DRIVERS.md) — the SQL-dialect contract and how to write one
 - [Stability & versioning](docs/STABILITY.md) — API/storage compatibility and the extension points
 
 ## Examples
