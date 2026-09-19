@@ -284,15 +284,30 @@ func (s *Store) recoverInterrupted(ctx context.Context, keep bool) error {
 	}
 	now := nowUnix()
 	for _, table := range []string{"steps", "runs"} {
+		statuses := []string{StatusRunning, StatusInterrupted}
+		extra := ""
+		if table == "steps" {
+			// Clearing the wait fields keeps a failed run's steps from
+			// showing a stale wait/resume.
+			extra = ", resume_at = 0, wait_kind = '', wait_event = ''"
+			if !keep {
+				// A run failed on restart must not orphan a SUSPENDED step;
+				// fail it with the run. (On requeue, SUSPENDED is left intact
+				// so it resumes when due.)
+				statuses = append(statuses, StatusSuspended)
+			}
+		}
 		q := fmt.Sprintf(`UPDATE %s SET
 			status = ?,
-			run_at = ?,
+			run_at = ?%s,
 			error = CASE WHEN ? = 'FAILED' THEN ? ELSE error END,
 			completed_at = CASE WHEN ? = 'FAILED' THEN ? ELSE 0 END
-			WHERE status IN (?, ?)`, table)
-		if _, err := tx.ExecContext(ctx, q,
-			newStatus, now, newStatus, runErr, newStatus, now,
-			StatusRunning, StatusInterrupted); err != nil {
+			WHERE status IN (%s)`, table, extra, placeholders(len(statuses)))
+		args := []any{newStatus, now, newStatus, runErr, newStatus, now}
+		for _, s := range statuses {
+			args = append(args, s)
+		}
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("quacker: recover %s: %w", table, err)
 		}
 	}

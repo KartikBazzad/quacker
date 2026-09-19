@@ -282,6 +282,48 @@ func TestDepsJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRecoverInterruptedFailsSuspendedStep: on RecoverRunningOnBoot(false), a
+// SUSPENDED step is failed with its run rather than left orphaned.
+func TestRecoverInterruptedFailsSuspendedStep(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "suspend.db")
+	s1, err := Open(Config{Mode: ModeFile, Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := nowUnix()
+	if _, err := s1.Write().ExecContext(ctx, `INSERT INTO runs
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
+		VALUES ('r','w','task','RUNNING','q',0,NULL,NULL,'',1,1,?,?,?,0,'','')`, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Write().ExecContext(ctx, `INSERT INTO steps
+		(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event)
+		VALUES ('r/s','r','s','t',0,'SUSPENDED','[]','q',0,NULL,NULL,'',1,1,0,?,?,?,0,'',0,?,?, 'sleep','')`,
+		now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(Config{Mode: ModeFile, Path: p, RecoverRunningOnBoot: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	var rs, ss string
+	if err := s2.Read().QueryRow(`SELECT status FROM runs WHERE id='r'`).Scan(&rs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Read().QueryRow(`SELECT status FROM steps WHERE id='r/s'`).Scan(&ss); err != nil {
+		t.Fatal(err)
+	}
+	if rs != StatusFailed || ss != StatusFailed {
+		t.Fatalf("run=%s step=%s, want FAILED/FAILED", rs, ss)
+	}
+}
+
 // TestMigrationV7ConvertsCommaDeps: a v6 database with comma-joined
 // depends_on is converted to JSON on Open.
 func TestMigrationV7ConvertsCommaDeps(t *testing.T) {

@@ -170,6 +170,12 @@ type Engine struct {
 	logClosed   bool
 	droppedLogs atomic.Int64
 
+	// debugCh is a bounded stream of engine debug records, consumed via
+	// DebugLogs; the engine logger is fanned out to it. debugClosed seals it.
+	debugCh     chan DebugRecord
+	debugMu     sync.Mutex
+	debugClosed bool
+
 	// metrics, when non-nil, is invoked on metricsInterval with a snapshot.
 	onMetrics       func(MetricsSnapshot)
 	metricsInterval time.Duration
@@ -266,6 +272,11 @@ func New(o Options) (*Engine, error) {
 		sinks = append(sinks, e.slogLogSink)
 	}
 	e.logSinks = sinks
+
+	// Fan the engine logger out to the debug stream so engine diagnostics show
+	// up without HTTP, and records the app logs via DebugLogger() share it.
+	e.debugCh = make(chan DebugRecord, debugBuffer)
+	e.log = slog.New(&fanoutHandler{a: o.Log.Handler(), b: &debugHandler{send: e.debugSend}})
 	return e, nil
 }
 
@@ -343,6 +354,14 @@ func (e *Engine) Close(ctx context.Context) error {
 		close(e.logCh)
 		e.logWG.Wait()
 	}
+	// Seal the debug stream last: engine logs after this drop, and a consumer
+	// ranging over DebugLogs() sees it close.
+	e.debugMu.Lock()
+	if !e.debugClosed {
+		e.debugClosed = true
+		close(e.debugCh)
+	}
+	e.debugMu.Unlock()
 	return ctx.Err()
 }
 
@@ -654,6 +673,9 @@ func (e *Engine) tick() {
 					from = store.StatusSuspended
 				}
 				e.publish(c.Step.RunID, c.Step.Name, from, store.StatusRunning, "", now)
+				e.log.Debug("quacker: claimed step",
+					"run", c.Step.RunID, "step", c.Step.Name, "queue", q,
+					"attempt", c.Step.Attempts, "resumed", c.Resumed)
 				if c.Run != nil && c.Run.StartedAt == now && !runStarted[c.Step.RunID] {
 					runStarted[c.Step.RunID] = true
 					e.publish(c.Step.RunID, "", store.StatusQueued, store.StatusRunning, "", now)
@@ -756,7 +778,16 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	}()
 	if suspend != nil {
 		// The helper already recorded SUSPENDED atomically with its journal
-		// entry; just publish the transition.
+		// entry. If the run went terminal while the task ran (e.g. cancelled
+		// during a sleep-ignoring task), converge the step to CANCELLED rather
+		// than leaving a suspension that could linger forever (resume_at=0).
+		if e.runTerminal(st.RunID) {
+			_ = e.st.StepCancelled(bg, st.ID, e.now().UnixNano())
+			e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusCancelled, "", e.now().UnixNano())
+			return
+		}
+		e.log.Debug("quacker: step suspended",
+			"run", st.RunID, "step", st.Name, "wait", st.WaitKind)
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSuspended, "", e.now().UnixNano())
 		return
 	}
@@ -800,6 +831,8 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		if cerr := e.st.RetryStep(bg, st.ID, errStr, now.Add(delay).UnixNano(), now.UnixNano()); cerr != nil {
 			e.log.Error("quacker: record retry", "run", st.RunID, "step", st.Name, "err", cerr)
 		}
+		e.log.Debug("quacker: step retrying",
+			"run", st.RunID, "step", st.Name, "attempt", st.Attempts, "delay", delay.String(), "err", errStr)
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusQueued, errStr, now.UnixNano())
 		e.wakeScheduler()
 	default:
@@ -858,6 +891,7 @@ func (e *Engine) finishRun(runID, status string, output json.RawMessage, errMsg 
 	if w != nil {
 		w.finish(status, output, err)
 	}
+	e.log.Debug("quacker: run finished", "run", runID, "status", status, "err", errMsg)
 	e.publish(runID, "", store.StatusRunning, status, errMsg, now)
 }
 

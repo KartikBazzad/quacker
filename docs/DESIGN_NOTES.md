@@ -430,6 +430,20 @@ old comma form as a safety net. The public `Step(name, task, deps ...string)`
 signature is unchanged — variants already passed as `[]string` with `deps...`,
 and snapshots (`StepState.Deps`, `DAGNode.Deps`) were arrays all along.
 
+### 25. Debug logs are a fan-out stream, not a server
+
+The engine's own diagnostics were only visible through the `*slog.Logger`
+passed to `WithLogger`, which is fine when that logger is stdout but awkward
+when a user wants to inspect engine activity programmatically. `q.DebugLogs`
+adds a bounded, drop-on-full channel, and `New` wraps the engine logger in a
+`fanoutHandler` so every engine record reaches both the user's handler and the
+stream. `q.DebugLogger()` returns a logger writing to the same stream, so the
+app can interleave its own lines. This keeps the "no server" promise — the
+user pulls records and forwards them wherever — while the task-log sink chain
+(§13) stays a separate concern: task logs are the app's output, debug records
+are the engine's narration. `debugSend` checks a mutex-guarded closed flag, so
+a log emitted after `Close` drops instead of panicking on a closed channel.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

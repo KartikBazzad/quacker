@@ -221,6 +221,10 @@ retry attempts.
   50ms) into `logs`.
 - Middleware (global `Use`/`WithMiddleware` + per-task `Wrap`) composes
   `global → per-task → body` inside the executor's panic-recover, per attempt.
+- The engine logger is fanned out to a bounded debug stream (`q.DebugLogs`,
+  distinct from task logs): the engine's own records plus anything via
+  `q.DebugLogger()`, drop-on-full and closed at `Close`, so the engine can be
+  observed without serving HTTP.
 - `loopWG` also owns two optional loops: the metrics push
   (`WithMetricsFunc`/`WithMetricsInterval`) and the retention purge
   (`WithRetention`), both joined before the store closes.
@@ -290,7 +294,7 @@ does not fail the parent. See DESIGN_NOTES §22.
   RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
-  XML-escaping).
+  XML-escaping, debug-log capture/close, recovery of suspended steps).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

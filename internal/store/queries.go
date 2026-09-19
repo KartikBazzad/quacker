@@ -573,9 +573,11 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 }
 
 // StepCancelled marks a single step CANCELLED (used when a run is cancelled
-// while the step is executing; the run row is already terminal).
+// while the step is executing; the run row is already terminal). SUSPENDED is
+// included so a step that suspended after its run went terminal (the
+// cancellation race) converges to CANCELLED rather than lingering forever.
 func (s *Store) StepCancelled(ctx context.Context, stepID string, now int64) error {
-	_, err := s.write.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
+	_, err := s.write.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=?, resume_at=0, wait_kind='', wait_event='' WHERE id=? AND status IN ('QUEUED','RUNNING','SUSPENDED')`,
 		StatusCancelled, now, stepID)
 	return err
 }

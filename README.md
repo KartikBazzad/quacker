@@ -66,8 +66,10 @@ is the wrong amount of infrastructure.
   restarts; `quacker.RunOnce` keeps side effects from repeating when a task
   replays
 - **Cancellation** — instant, propagated to running task contexts
-- **Non-blocking introspection** — `Execution`, `Runs`, `Metrics`, `Logs`,
-  `Subscribe` — never pause or slow the workers
+- **Non-blocking introspection** — `Execution`, `Runs`, `Metrics`, `DAGJSON`,
+  `Logs`, `Subscribe` — never pause or slow the workers
+- **Debug log stream** — `q.DebugLogs()` yields engine activity (claims,
+  retries, suspensions, completions) in-process, without serving HTTP
 - **Graceful shutdown** — drains in-flight work, marks stragglers, optional
   recovery on restart (File storage)
 
@@ -383,6 +385,26 @@ invokes `fn(*Metrics)` on an interval — a one-liner for Prometheus until OTel
 lands. All snapshot types marshal to JSON, so exposing them over HTTP is
 trivial.
 
+## Debug logging
+
+The engine streams its own activity — claims, retries, suspensions, run
+completions, plus anything you log through `q.DebugLogger()` — so you can
+observe it without the engine serving HTTP:
+
+```go
+go func() {
+    for rec := range q.DebugLogs() {
+        log.Printf("%s %s %v", rec.Level, rec.Message, rec.Attrs)
+    }
+}()
+
+q.DebugLogger().Info("checkpoint reached", "batch", 7) // joins the same stream
+```
+
+The stream is bounded and drops records when the consumer falls behind — it
+never blocks the engine or grows unbounded — and it closes on `Close`, ending
+the range. For a lossless-per-subscriber status stream use `Subscribe`.
+
 ## Notes & semantics
 
 - **Task names are part of the storage format.** Renaming a task orphans its
@@ -407,8 +429,8 @@ trivial.
 ## Not yet
 
 Distributed workers across processes (the Postgres/multi-instance epic),
-strict (ordered) per-key concurrency, worker labels/affinity, an embedded
-debug-log stream and web UI, and OpenTelemetry.
+strict (ordered) per-key concurrency, worker labels/affinity, a web UI, and
+OpenTelemetry.
 
 ## Documentation
 

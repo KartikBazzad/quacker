@@ -2,8 +2,8 @@
 
 Status: **v0.3 in progress** — v0.2 is fully shipped; durable execution is
 complete (slices A/B/C: substrate + durable sleep, durable event waits, child
-runs), and the DAG visualizer. Remaining v0.3: embedded debug logger and perf.
-Then worker labels, OTel, and the Postgres/multi-instance epic.
+runs), the DAG visualizer, and the embedded debug logger. Remaining v0.3:
+perf. Then worker labels, OTel, and the Postgres/multi-instance epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -199,8 +199,9 @@ Children are ordinary runs and are aged/purged independently.
   with the **current state** of every node, as a structured model, indented
   JSON, or a standalone status-coloured SVG (dependency-level layout,
   dependency-free renderer). See `examples/dagsvg`.
-- **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to
-  a channel the user consumes — the engine never serves HTTP.
+- ✅ **Embedded debug logger**: `q.DebugLogs()` streams engine activity
+  (claims, retries, suspensions, completions) plus anything logged via
+  `q.DebugLogger()`, bounded and drop-on-full; the engine never serves HTTP.
 - **Perf**: batch enqueue, multi-queue claim batching in one transaction,
   `-cpu` parallel benchmarks.
 

@@ -279,6 +279,36 @@ func TestSleepSurvivesRestart(t *testing.T) {
 	})
 }
 
+// TestSuspendAfterRunCancelledConvergesCancelled: a task that ignores
+// cancellation and suspends after its run went terminal must end CANCELLED,
+// not linger SUSPENDED forever.
+func TestSuspendAfterRunCancelledConvergesCancelled(t *testing.T) {
+	q := newTestQ(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	task := NewTask("cancel-then-suspend", func(ctx context.Context, in greetIn) (greetOut, error) {
+		close(started)
+		<-release
+		if err := SleepDurable(ctx, time.Hour); err != nil { // ignores cancellation
+			return greetOut{}, err
+		}
+		return greetOut{}, nil
+	})
+	h, err := Enqueue(context.Background(), q, task, greetIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := q.Cancel(h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitFor(t, 3*time.Second, func() bool {
+		s, err := q.Execution(context.Background(), h.RunID())
+		return err == nil && len(s.Steps) == 1 && s.Steps[0].Status == StatusCancelled
+	})
+}
+
 // TestSleepDurableOutsideTask: helper misuse is a clear error.
 func TestSleepDurableOutsideTask(t *testing.T) {
 	if err := SleepDurable(context.Background(), time.Millisecond); err == nil {
