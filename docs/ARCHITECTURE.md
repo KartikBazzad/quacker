@@ -13,7 +13,7 @@ How quacker works inside one process. For user-facing docs see the
 │   Enqueue/EnqueueWorkflow/Cron · Execution/Runs/Metrics/Logs        │
 │   Subscribe · Cancel                                                │
 │   Use/Wrap (middleware) · Purge/WithRetention · WithMetricsFunc     │
-│   WithTaskLogSink/WithLogSink · WithLogStorage                      │
+│   WithTaskLogSink/WithLogSink · WithLogStorage · DAGJSON/DAGSVG     │
 └──────────────┬─────────────────────────────┬────────────────────────┘
                │ writes + queries            │ JSON adapter
 ┌──────────────▼──────────────┐   ┌──────────▼───────────────────────┐
@@ -109,7 +109,8 @@ migration 4 adds `events` (best-effort emit audit) and
 adds the durable-execution columns on `steps` and the `step_journal` table
 (entries cascade with their step); migration 6 adds `runs.parent_id` +
 `idx_runs_parent` for child-run lineage (no foreign key — a purged parent may
-leave a dangling id).
+leave a dangling id); migration 7 rewrites `steps.depends_on` from
+comma-joined text to a JSON array.
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -118,8 +119,10 @@ empty.
 
 Every task execution is a **step** row; a single-task run has exactly one.
 `steps.name` is the DAG identity, `steps.task` is the registered function to
-run (they differ for named workflow steps). `depends_on` is a comma-separated
-list of step names. Timestamps are unix nanoseconds (`0` = unset).
+run (they differ for named workflow steps). `depends_on` is a JSON array of
+step names (`["charge","ship"]`), so a name containing any delimiter is safe;
+migration 7 converted it from the earlier comma-joined form. Timestamps are
+unix nanoseconds (`0` = unset).
 
 Concurrency control columns (migration 2): `concurrency_key` is computed
 from the task's `WithKey` extractor at enqueue — steps sharing a key are
@@ -286,7 +289,8 @@ does not fail the parent. See DESIGN_NOTES §22.
   sub-second and persistent cron, event emit/On/Off/arming, durable sleep and
   RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
-  subscription semantics, child-run lineage/independence).
+  subscription semantics, child-run lineage/independence, DAG JSON/SVG and
+  XML-escaping).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

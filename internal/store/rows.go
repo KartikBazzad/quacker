@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -115,18 +116,39 @@ type EventSub struct {
 
 func nowUnix() int64 { return time.Now().UnixNano() }
 
-func joinDeps(deps []string) string { return strings.Join(deps, ",") }
+// joinDeps encodes step dependencies for the steps.depends_on column, which
+// holds a JSON array (["a","b"]) rather than a delimited string: a step name
+// containing any delimiter cannot corrupt the list.
+func joinDeps(deps []string) string {
+	if len(deps) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(deps)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
 
+// splitDeps decodes steps.depends_on. It still tolerates the legacy
+// comma-joined form as a safety net for databases written before migration 7.
 func splitDeps(s string) []string {
-	if s == "" {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "[]" || s == "null" {
 		return nil
 	}
-	parts := strings.Split(s, ",")
-	out := parts[:0]
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	if !strings.HasPrefix(s, "[") {
+		var legacy []string
+		for _, p := range strings.Split(s, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				legacy = append(legacy, p)
+			}
 		}
+		return legacy
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil
 	}
 	return out
 }

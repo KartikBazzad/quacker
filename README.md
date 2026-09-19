@@ -52,6 +52,8 @@ is the wrong amount of infrastructure.
   process's growth in every storage mode
 - **Metrics callback** — `WithMetricsFunc` pushes periodic state snapshots
 - **DAG workflows** — steps with dependencies, upstream outputs via `DepOutput`
+- **DAG visualization** — `q.DAGJSON` / `q.DAGSVG` render a run's step graph
+  with the current state of every node
 - **Child runs** — `quacker.EnqueueChild` from inside a task records lineage;
   `Execution` exposes a run's children
 - **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`), sub-second
@@ -112,8 +114,8 @@ ship := quacker.NewTask("ship", func(ctx context.Context, o Order) (Shipment, er
 
 wf := quacker.NewWorkflow[Order]("fulfill",
     quacker.Step("charge", charge),
-    quacker.Step("ship", ship, "charge"),           // runs after charge
-    quacker.Step("notify", notify, "charge", "ship"),
+    quacker.Step("ship", ship, "charge"),  // after charge
+    quacker.Step("notify", notify, "ship"), // after ship — and therefore charge
 )
 
 h, _ := quacker.EnqueueWorkflow[Shipment](ctx, q, wf, order) // Result = last step's output
@@ -122,6 +124,35 @@ h, _ := quacker.EnqueueWorkflow[Shipment](ctx, q, wf, order) // Result = last st
 Steps start the moment their dependencies succeed. If a step exhausts its
 retries, the run fails and remaining steps are cancelled. Task logs written
 inside steps are persisted and readable via `q.Logs(ctx, runID, limit)`.
+
+**Dependencies are direct requirements.** Ordering is transitive — a step
+named as a dep of `ship` is already ordered before anything `ship` precedes —
+so you only list `"charge"` on `notify` if you want the edge explicit or
+robust to `ship`'s definition changing. There is one hard reason to list it:
+`DepOutput` sees only *declared* deps, so a step must name a dep to read its
+output (see `ship` reading `charge` above).
+
+## DAG visualization
+
+Inspect a run's step graph — with the **current state** of every node — as
+JSON or as a self-contained SVG (no Graphviz, no browser needed):
+
+```go
+js, _ := q.DAGJSON(ctx, runID) // nodes, edges, statuses, attempts, errors
+svg, _ := q.DAGSVG(ctx, runID) // status-coloured boxes in dependency order
+os.WriteFile("dag.svg", svg, 0o644)
+
+d, _ := q.DAG(ctx, runID) // the structured model, if you prefer
+```
+
+Nodes are laid out in dependency levels (left to right) and coloured by
+status. Here is a workflow mid-failure — `charge` succeeded, `ship` failed,
+`notify` was cancelled:
+
+![example DAG](docs/example-dag.svg)
+
+`DAGJSON` marshals to JSON for persistence or an HTTP endpoint; `DAGSVG`
+returns a standalone document you can write to a file or serve inline.
 
 ## Concurrency & rate control
 
@@ -260,6 +291,16 @@ the parent can finish while its children run — and a failed child does not
 fail the parent. `RunFilter{ParentID: ...}` lists a run's children, and
 lineage is informational: purging a parent leaves its children (with a
 dangling `ParentID`) intact.
+
+A child enqueued **before** a durable await re-enqueues on replay (the task
+re-runs from the top), so wrap it in `RunOnce` when the task also uses
+`SleepDurable`/`WaitFor`:
+
+```go
+childID, err := quacker.RunOnce(ctx, "spawn-children", func() ([]string, error) {
+    // enqueue once, return the ids for later
+})
+```
 
 ## Durable execution
 

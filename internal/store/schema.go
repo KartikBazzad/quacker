@@ -180,6 +180,17 @@ ALTER TABLE runs ADD COLUMN parent_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_id, created_at);
 `
 
+// migration 7 converts steps.depends_on from the legacy comma-joined text to
+// a JSON array (["a","b"]), so a step name containing a comma can no longer
+// corrupt the dependency list. char(34) is a double quote; an empty list
+// becomes [].
+const migration7 = `
+UPDATE steps SET depends_on = CASE
+	WHEN depends_on = '' THEN '[]'
+	ELSE '[' || char(34) || replace(depends_on, ',', char(34) || ',' || char(34)) || char(34) || ']'
+END;
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
@@ -187,6 +198,7 @@ var migrations = []migration{
 	{version: 4, sql: migration4},
 	{version: 5, sql: migration5},
 	{version: 6, sql: migration6},
+	{version: 7, sql: migration7},
 }
 
 // init validates the migration list's invariant before any Open can rely

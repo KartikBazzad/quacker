@@ -5,6 +5,9 @@
 *.quacker.lock
 *.test
 
+# Example output (examples/dagsvg writes this to its working directory)
+/dag.svg
+
 # macOS Finder metadata
 .DS_Store
 

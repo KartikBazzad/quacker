@@ -256,6 +256,85 @@ func TestJournalRoundTripAndResumeClaim(t *testing.T) {
 	}
 }
 
+// TestDepsJSONRoundTrip: dependencies round-trip through a JSON array, so a
+// step name containing the old comma delimiter survives.
+func TestDepsJSONRoundTrip(t *testing.T) {
+	for _, deps := range [][]string{
+		nil,
+		{},
+		{"charge"},
+		{"charge", "ship"},
+		{"a,b", "c\"d"},
+	} {
+		got := splitDeps(joinDeps(deps))
+		if len(got) != len(deps) {
+			t.Fatalf("round trip %v -> %v", deps, got)
+		}
+		for i := range deps {
+			if got[i] != deps[i] {
+				t.Fatalf("round trip %v -> %v", deps, got)
+			}
+		}
+	}
+	// Legacy comma form still decodes.
+	if got := splitDeps("a,b"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("legacy decode = %v", got)
+	}
+}
+
+// TestMigrationV7ConvertsCommaDeps: a v6 database with comma-joined
+// depends_on is converted to JSON on Open.
+func TestMigrationV7ConvertsCommaDeps(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "v6.db")
+	db, err := sql.Open("sqlite", "file:"+p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{migration2, migration3, migration4, migration5, migration6} {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for v := 1; v <= 6; v++ {
+		if _, err := db.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, 0)`, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := nowUnix()
+	if _, err := db.Exec(`INSERT INTO runs
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
+		VALUES ('r','w','task','QUEUED','q',0,NULL,NULL,'',0,1,?,?,0,0,'','')`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO steps
+		(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event)
+		VALUES ('r/s','r','s','t',0,'QUEUED','a,b','q',0,NULL,NULL,'',0,1,0,?,?,0,0,'',0,0,0,'','')`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(Config{Mode: ModeFile, Path: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var deps string
+	if err := s.Read().QueryRow(`SELECT depends_on FROM steps WHERE id='r/s'`).Scan(&deps); err != nil {
+		t.Fatal(err)
+	}
+	if deps != `["a","b"]` {
+		t.Fatalf("depends_on = %q, want [\"a\",\"b\"]", deps)
+	}
+}
+
 // TestMigrationV6ParentAndListChildren: migration 6 adds parent_id, and
 // ListChildren/ListRuns(parent) find a run's children.
 func TestMigrationV6ParentAndListChildren(t *testing.T) {

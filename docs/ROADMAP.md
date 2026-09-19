@@ -2,8 +2,8 @@
 
 Status: **v0.3 in progress** — v0.2 is fully shipped; durable execution is
 complete (slices A/B/C: substrate + durable sleep, durable event waits, child
-runs). Remaining v0.3: embedded debug logger, DAG visualizer, perf. Then
-worker labels, OTel, and the Postgres/multi-instance epic.
+runs), and the DAG visualizer. Remaining v0.3: embedded debug logger and perf.
+Then worker labels, OTel, and the Postgres/multi-instance epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -194,8 +194,10 @@ so a purged parent leaves its children with a dangling id (documented).
 Children are ordinary runs and are aged/purged independently.
 - **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to a channel, which can be consumed by the user.
   - "We dont want the quacker to serve http. so a method can return debug logs"
-- **DAG Visualizer**: `q.DAGJSON()` returns a JSON representation of the DAG, which can be consumed by the user.
-  - "We need this JSON to return Current State of the Entire DAG"
+- ✅ **DAG Visualizer** (`q.DAG`/`q.DAGJSON`/`q.DAGSVG`): a run's step graph
+  with the **current state** of every node, as a structured model, indented
+  JSON, or a standalone status-coloured SVG (dependency-level layout,
+  dependency-free renderer). See `examples/dagsvg`.
 - **Perf**: batch enqueue, multi-queue claim batching in one transaction,
   `-cpu` parallel benchmarks.
 

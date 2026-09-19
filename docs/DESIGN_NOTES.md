@@ -405,6 +405,30 @@ choices are deliberate:
   substrate — a parent can `WaitFor` a completion event, or poll descendants
   — rather than being baked into the enqueue path.
 
+### 23. The DAG visualizer renders SVG itself, from stored state
+
+`q.DAGJSON`/`q.DAGSVG` are per-run and read the run's stored `steps` (name,
+`depends_on`, status, attempts), so they show the *current state* and work for
+recovered or purged-adjacent runs, not just freshly registered workflows.
+Rendering SVG in-process (dependency-level longest-path layout, one box per
+step, bezier edges) avoids a Graphviz/cgo dependency and keeps the library's
+"one `go get`, embeddable" promise; labels are XML-escaped and long names
+truncated, and the layout is deterministic for a given graph. The alternative
+— shelling out to `dot` — would have broken the no-external-binary property
+for a fairly small amount of drawing code.
+
+### 24. Step dependencies are a JSON array, not a delimited string
+
+`steps.depends_on` started as a comma-joined `TEXT`, with `splitDeps`/`joinDeps`
+as the codec. That couples the storage format to a delimiter that step names
+were never forbidden from containing, so a step named `"a,b"` silently became
+two dependencies. SQLite has no array type, so the fix is a JSON array
+(`["a","b"]`) written and read by `encoding/json`; migration 7 rewrites legacy
+rows with a `replace`-based SQL expression, and `splitDeps` still accepts the
+old comma form as a safety net. The public `Step(name, task, deps ...string)`
+signature is unchanged — variants already passed as `[]string` with `deps...`,
+and snapshots (`StepState.Deps`, `DAGNode.Deps`) were arrays all along.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned
@@ -489,14 +513,18 @@ is nothing for the writer to collide with.
 
 ## Other behaviors worth knowing
 
-- Cron `@every` durations are rounded up to 1 second by the cron parser
-  (`robfig/cron` `Every()` floors at 1s). v0.2 will construct
-  `ConstantDelaySchedule` directly to support sub-second intervals.
-- Crons live in the `crons` table for introspection but are driven from an
-  in-memory map — after a restart the app re-registers them. v0.2 will arm
-  DB-persisted crons automatically when their task is registered.
+- Cron `@every` supports sub-second intervals: the engine parses it and uses
+  its own fixed-delay schedule, because `robfig/cron`'s
+  `ConstantDelaySchedule.Next` is wrong below one second (see §16).
+- Crons and event subscriptions persist and re-arm automatically the moment
+  their target task is registered; a File-mode app only needs `Register` at
+  startup (see §17).
 - Timeouts and cancellation are cooperative: tasks that ignore `ctx` are
   only stopped at the drain deadline, recorded as INTERRUPTED.
-- `logs` has no foreign key to `runs` (deliberate: logs flush in batches and
-  may outlive nothing in particular; cascade deletes aren't needed since
-  v0.1 never deletes runs — retention arrives in v0.2).
+- `logs` has no foreign key to `runs`: they are only persisted when
+  `WithLogStorage(true)` is set, and are deleted explicitly by retention
+  (which also runs an orphan sweep) rather than by cascade (see §13, §14).
+- The DAG visualizer (`q.DAG`/`q.DAGSVG`) lays nodes out by dependency level
+  and renders SVG itself, so there is no Graphviz or browser dependency; the
+  layout is derived from the stored `depends_on` edges and current step
+  states, not from a registered workflow definition.

@@ -39,7 +39,10 @@ func unixToTime(n int64) time.Time {
 
 // StepState is a point-in-time snapshot of one step.
 type StepState struct {
-	Name   string   `json:"name"`
+	Name string `json:"name"`
+	// Task is the registered task that executes the step; it differs from
+	// Name for named workflow steps.
+	Task   string   `json:"task,omitempty"`
 	Status Status   `json:"status"`
 	Deps   []string `json:"deps,omitempty"`
 	// Key is the step's concurrency key (empty when unkeyed). Steps
@@ -183,7 +186,7 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 	}
 	for _, s := range steps {
 		ex.Steps = append(ex.Steps, StepState{
-			Name: s.Name, Status: Status(s.Status), Deps: s.DependsOn, Key: s.ConcurrencyKey,
+			Name: s.Name, Task: s.Task, Status: Status(s.Status), Deps: s.DependsOn, Key: s.ConcurrencyKey,
 			Attempts: int(s.Attempts), MaxAttempts: int(s.MaxAttempts), Timeout: s.Timeout,
 			Input: s.Input, Output: s.Output, Error: s.Error,
 			RunAt: unixToTime(s.RunAt), CreatedAt: unixToTime(s.CreatedAt),
