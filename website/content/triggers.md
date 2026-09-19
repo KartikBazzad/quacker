@@ -62,8 +62,8 @@ snap, _ := q.Execution(ctx, parentRunID) // snap.Children lists them
   dangling `ParentID`) intact — no cascade.
 - Each child records the step that spawned it (`ParentStep`), so
   `q.DAGTree` / `DAGTreeJSON` / `DAGTreeSVG` draw the parent plus its child
-  runs, with each child attached to its spawning step and each run boxed and
-  labelled as a group (the groups are in the tree JSON too). `DAG`/`DAGSVG`
+  runs, with each child attached to its spawning step and the parent run and
+  each step's fan-out boxed and labelled as groups (also in the tree JSON). `DAG`/`DAGSVG`
   show only one run's own steps.
 
 > **Replay caveat:** in a durable task, `EnqueueChild` before a

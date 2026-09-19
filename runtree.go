@@ -11,6 +11,10 @@ import (
 // attached to the step that spawned them (Recorded as runs.parent_step). It
 // recurses into grandchildren, bounded by depth and node count.
 //
+// Nodes are grouped: the root run's steps, then one group per spawning step
+// whose child runs are clustered together (a fan-out of N children is one
+// group, not N).
+//
 // This is the run-level view: DAG/DAGSVG show only one run's own steps, because
 // a child run is an independent run (EnqueueChild does not join it to the
 // parent). DAGTree is what draws the whole family.
@@ -22,9 +26,11 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 	)
 	out := &DAG{}
 	seen := map[string]bool{}
+	// The root run's own steps form the first group.
+	out.Groups = append(out.Groups, DAGGroup{Name: runID})
 
-	var add func(id, prefix, from, label string, depth int) error
-	add = func(id, prefix, from, label string, depth int) error {
+	var addRun func(id, prefix, from, groupKey string, depth int) error
+	addRun = func(id, prefix, from, groupKey string, depth int) error {
 		if depth > maxDepth || seen[id] || len(out.Nodes) >= maxNodes {
 			return nil
 		}
@@ -37,14 +43,10 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 			out.RunID, out.Workflow, out.Kind, out.Status, out.Queue =
 				ex.RunID, ex.Workflow, ex.Kind, ex.Status, ex.Queue
 		}
-		if label == "" {
-			label = ex.Workflow
-		}
-		out.Groups = append(out.Groups, DAGGroup{Name: id, Label: label, Status: ex.Status})
 		for _, s := range ex.Steps {
 			name := prefix + s.Name
 			node := DAGNode{
-				Name: name, Task: s.Task, Status: s.Status, Group: id,
+				Name: name, Task: s.Task, Status: s.Status, Group: groupKey,
 				Attempts: s.Attempts, MaxAttempts: s.MaxAttempts, Error: s.Error,
 			}
 			for _, d := range s.Deps {
@@ -61,27 +63,78 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 			}
 			out.Nodes = append(out.Nodes, node)
 		}
+
 		kids, err := q.Runs(ctx, RunFilter{ParentID: id, Limit: maxChildren})
 		if err != nil {
 			return err
 		}
-		for i, k := range kids {
-			childPrefix := prefix + shortRunID(k.RunID) + "/"
-			childFrom := ""
-			if k.ParentStep != "" {
-				childFrom = prefix + k.ParentStep
+		// Group a step's child runs together: one group per spawning step, so
+		// a fan-out of N children is one cluster, not N clusters.
+		type stepGroup struct {
+			step string
+			kids []RunSummary
+		}
+		var order []*stepGroup
+		byStep := map[string]*stepGroup{}
+		for _, k := range kids {
+			g, ok := byStep[k.ParentStep]
+			if !ok {
+				g = &stepGroup{step: k.ParentStep}
+				byStep[k.ParentStep] = g
+				order = append(order, g)
 			}
-			childLabel := fmt.Sprintf("%s #%d", k.Workflow, i+1)
-			if err := add(k.RunID, childPrefix, childFrom, childLabel, depth+1); err != nil {
-				return err
+			g.kids = append(g.kids, k)
+		}
+		for _, g := range order {
+			label := fmt.Sprintf("%d child runs", len(g.kids))
+			if g.step != "" {
+				label = fmt.Sprintf("%s → %d child runs", g.step, len(g.kids))
+			}
+			groupKey := id + "/" + g.step
+			out.Groups = append(out.Groups, DAGGroup{Name: groupKey, Label: label, Status: aggregateRunStatus(g.kids)})
+			for _, k := range g.kids {
+				kPrefix := prefix + shortRunID(k.RunID) + "/"
+				kFrom := ""
+				if g.step != "" {
+					kFrom = prefix + g.step
+				}
+				if err := addRun(k.RunID, kPrefix, kFrom, groupKey, depth+1); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	}
-	if err := add(runID, "", "", "", 0); err != nil {
+	if err := addRun(runID, "", "", runID, 0); err != nil {
 		return nil, err
 	}
+	out.Groups[0].Label = out.Workflow
+	out.Groups[0].Status = out.Status
 	return out, nil
+}
+
+// aggregateRunStatus summarizes a group of runs: a failure or cancellation in
+// the group wins, otherwise any in-flight run makes it RUNNING, else the shared
+// status.
+func aggregateRunStatus(rs []RunSummary) Status {
+	status := StatusSucceeded
+	for _, r := range rs {
+		switch r.Status {
+		case StatusFailed:
+			return StatusFailed
+		case StatusCancelled:
+			status = StatusCancelled
+		case StatusInterrupted:
+			if status != StatusCancelled {
+				status = StatusInterrupted
+			}
+		case StatusRunning, StatusQueued, StatusBlocked, StatusSuspended, StatusPaused:
+			if status == StatusSucceeded {
+				status = StatusRunning
+			}
+		}
+	}
+	return status
 }
 
 // DAGTreeJSON renders the run tree (parent + child runs, with current state) as

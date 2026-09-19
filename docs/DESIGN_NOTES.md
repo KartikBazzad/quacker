@@ -912,9 +912,11 @@ v1.10 records the spawning step on the child run (`runs.parent_step`, set from
 `StepFromContext` at `EnqueueChild`/`EnqueueWorkflowChild`) and adds
 **`DAGTree`/`DAGTreeJSON`/`DAGTreeSVG`**: the parent's steps, plus each child
 run's steps namespaced by a short child-run id and attached by an edge from the
-step that spawned them. Every node is tagged with its run (`DAGNode.Group`) and
-the tree carries a labelled `DAGGroup` per run, so the SVG draws a dashed box
-around each run ("partition_jobs #3") — the groups are in the JSON as well. It recurses (bounded by depth and node count) so a tree
+step that spawned them. Every node is tagged with a group (`DAGNode.Group`) and
+the tree carries labelled `DAGGroup`s: the root run, plus **one per spawning
+step** whose child runs are clustered together ("partition → 8 child runs") —
+one box for the fan-out, not one per child. The SVG draws the dashed boxes and
+the groups are in the JSON too. It recurses (bounded by depth and node count) so a tree
 of child workflows renders in one image. The plain `DAG` is unchanged, so the
 single-run contract holds; `DAGTree` is the opt-in family view.
 
