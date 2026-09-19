@@ -26,8 +26,6 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 	)
 	out := &DAG{}
 	seen := map[string]bool{}
-	// The root run's own steps form the first group.
-	out.Groups = append(out.Groups, DAGGroup{Name: runID})
 
 	var addRun func(id, prefix, from, groupKey string, depth int) error
 	addRun = func(id, prefix, from, groupKey string, depth int) error {
@@ -105,11 +103,11 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 		}
 		return nil
 	}
-	if err := addRun(runID, "", "", runID, 0); err != nil {
+	// The root run's own steps are left ungrouped (no box); only a spawner's
+	// child runs form a group. groupKey "" keeps the root nodes bare.
+	if err := addRun(runID, "", "", "", 0); err != nil {
 		return nil, err
 	}
-	out.Groups[0].Label = out.Workflow
-	out.Groups[0].Status = out.Status
 	return out, nil
 }
 

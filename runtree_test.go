@@ -88,28 +88,22 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 		}
 	}
 
-	// Grouped by run: the root, plus ONE group for the fan-out (all 3 children
-	// spawned by "fan") — not one group per child.
-	if len(tree.Groups) != 2 {
-		t.Fatalf("groups = %d, want 2 (root + fan-out) (%v)", len(tree.Groups), tree.Groups)
+	// Only a spawner's child runs form a group: ONE group for the "fan"
+	// fan-out (all 3 children), and no box for the root run's own steps.
+	if len(tree.Groups) != 1 {
+		t.Fatalf("groups = %d, want 1 (fan-out only) (%v)", len(tree.Groups), tree.Groups)
 	}
-	groupNames := map[string]bool{}
-	for _, g := range tree.Groups {
-		groupNames[g.Name] = true
-		if g.Label == "" {
-			t.Fatalf("group %s has no label", g.Name)
-		}
+	if got := tree.Groups[0].Label; got != "fan → 3 child runs" {
+		t.Fatalf("fan-out group label = %q, want %q", got, "fan → 3 child runs")
 	}
 	for _, n := range tree.Nodes {
-		if !groupNames[n.Group] {
-			t.Fatalf("node %s group %q is not a declared group", n.Name, n.Group)
+		if strings.HasSuffix(n.Name, "/job") {
+			if n.Group != tree.Groups[0].Name {
+				t.Fatalf("child node %s group = %q, want the fan group", n.Name, n.Group)
+			}
+		} else if n.Group != "" {
+			t.Fatalf("root node %s group = %q, want none", n.Name, n.Group)
 		}
-	}
-	if tree.Groups[0].Label != "tree.parent" {
-		t.Fatalf("root group label = %q, want tree.parent", tree.Groups[0].Label)
-	}
-	if got := tree.Groups[1].Label; got != "fan → 3 child runs" {
-		t.Fatalf("fan-out group label = %q, want %q", got, "fan → 3 child runs")
 	}
 
 	// The plain DAG (one run) does NOT include the children.
