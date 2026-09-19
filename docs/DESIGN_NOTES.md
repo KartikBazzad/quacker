@@ -754,7 +754,11 @@ v1.5 added four job-control primitives. The load-bearing decisions:
   `ResumeRun` resets the run and its QUEUED steps to the current time, which
   means a run paused while scheduled ahead loses its future `run_at` — the
   intended meaning of "resume". Boot recovery and `InterruptAll` deliberately
-  skip PAUSED runs.
+  skip PAUSED runs. In multi-instance, a pause can only interrupt a step
+  running on the *same* engine (context cancellation is in-process); a pause
+  from another node still blocks all new claims, so a step already executing
+  elsewhere runs to completion and the pause takes effect at the next boundary.
+  `TestPostgresRunPauseCrossEngineBoundary` pins that behavior.
 
 A recurring theme: three of the four are enforced by a predicate in the claim
 transaction (unique index, `queuePauses`, `runNotPausedGate`), so multi-instance

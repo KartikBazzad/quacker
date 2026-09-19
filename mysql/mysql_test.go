@@ -303,6 +303,69 @@ func TestMySQLRunPause(t *testing.T) {
 	}
 }
 
+func TestMySQLRunPauseCrossEngineBoundary(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn, quacker.WithWorkerLabels("observer"))
+	b := openQ(t, dsn, quacker.WithWorkerLabels("worker-b"))
+	ctx := context.Background()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	step1 := quacker.NewTask("my.x1", func(ctx context.Context, in string) (string, error) {
+		close(started)
+		<-release
+		return "A", nil
+	}, quacker.WithLabels("worker-b"))
+	step2 := quacker.NewTask("my.x2", func(ctx context.Context, in string) (string, error) {
+		return "B", nil
+	}, quacker.WithLabels("worker-b"))
+	wf := quacker.NewWorkflow[string]("my.xwf",
+		quacker.Step("a", step1), quacker.Step("b", step2, "a"))
+
+	h, err := quacker.EnqueueWorkflow[string](ctx, b, wf, "in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("step a never started on b")
+	}
+	if err := a.PauseRun(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := a.Execution(ctx, h.RunID())
+		if err != nil {
+			return false
+		}
+		for _, st := range s.Steps {
+			if st.Name == "a" && st.Status == quacker.StatusSucceeded {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(80 * time.Millisecond)
+	snap, err := a.Execution(ctx, h.RunID())
+	if err != nil || snap.Status != quacker.StatusPaused {
+		t.Fatalf("run = %+v err=%v, want PAUSED", snap, err)
+	}
+	for _, st := range snap.Steps {
+		if st.Name == "b" && st.Status != quacker.StatusQueued {
+			t.Fatalf("step b = %s, want QUEUED while paused", st.Status)
+		}
+	}
+	if err := b.ResumeRun(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Result(ctx); err != nil || out != "B" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)
