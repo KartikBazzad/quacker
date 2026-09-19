@@ -1,10 +1,9 @@
 # Roadmap
 
-Status: **v0.4, v1.1, v1.2 shipped** — durable execution, DAG visualizer,
-debug logger, worker labels, OTel tracing, the Postgres backend with
-multi-instance leases, and the perf pass (batch enqueue, multi-queue claims,
-DAG-completion fast path) are all done. Next: **v1.3 advanced features**
-(plugin system, custom storage backends); optional `WithDB` remains.
+Status: **v1.3 in progress** — v0.4/v1.1/v1.2 are shipped (durable execution,
+DAG visualizer, debug logger, worker labels, OTel tracing, Postgres with
+multi-instance leases, and the perf pass). v1.3 lifecycle-hook plugins are
+done; the codec and a public storage-driver package are next.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -275,9 +274,30 @@ Children are ordinary runs and are aged/purged independently.
 - Optional: `WithDB(*sql.DB)` connection reuse (the last v1.1 item).
 
 
-## v1.3 - Advanced Features
-- Plugin system for extending functionality
-- Support for custom storage backends
+## v1.3 - Advanced Features (in progress)
+
+Compile-time plugins, not dynamic `plugin` loading or out-of-process servers —
+the same interface + explicit registration model the Postgres driver uses, so
+it stays type-safe, cross-platform, and single-binary.
+
+- ✅ **Lifecycle hooks.** `Open(WithPlugin(p))`; a plugin returns `Hooks` (a
+  struct of optional callbacks) for enqueue, step, run-finished, and emit.
+  `Before*` callbacks run in registration order and may veto (a `BeforeStep`
+  veto fails the step immediately, without retries); `After*` callbacks run in
+  reverse, are observe-only, and recover panics. Plugins are explicit
+  instances (no global registry) and must be concurrency-safe.
+- **Codec.** Replace `encoding/json` for user payloads (task input/output,
+  deps, event payloads, durable journal values) with a pluggable `Codec`;
+  schema structures (`depends_on`, `labels`) stay JSON. Engine-wide, default
+  unchanged.
+- **Custom storage backends.** Expose a curated public driver package (a small
+  interface with its own DTOs, adapted to the internal store) so third parties
+  can implement MySQL/Redis/etc. without freezing the entire store contract.
+
+Design input from Jev (semantic judgments, not tests): After* ordering
+(reverse, 0.91), After* error handling (recover+log, 0.99), and surface shape
+(a single `Hooks` struct over capability interfaces, 0.72). Trust model:
+in-process plugins are trusted code; no sandboxing.
 
 ## ⚖ Open decisions (input welcome, defaults chosen)
 

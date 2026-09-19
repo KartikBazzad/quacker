@@ -347,6 +347,17 @@ no foreign key and no implicit join — children are ordinary runs with
 independent retries, timeouts, suspension, and retention, and a failed child
 does not fail the parent. See DESIGN_NOTES §22.
 
+## Plugins
+
+Compile-time extension via `WithPlugin(p)`: a plugin returns a `Hooks` struct
+of optional callbacks, and the engine invokes them at four points — enqueue
+(`EnqueueBatch`), step (`execute`, around the middleware chain), run-finished
+(`finishRun`), and emit (`Emit`). `Before*` run in registration order and may
+veto (a `BeforeStep` error fails the step immediately, no retries); `After*` run
+in reverse and are observe-only, with panics recovered and logged. There is no
+global registry and no dynamic loading; plugins are trusted in-process code and
+must be concurrency-safe. See DESIGN_NOTES §32.
+
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
@@ -358,8 +369,9 @@ does not fail the parent. See DESIGN_NOTES §22.
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
   XML-escaping, debug-log capture/close, recovery of suspended steps,
-  batch enqueue, multi-queue claim, worker-label routing, and OTel spans
-  including the cross-restart link).
+  batch enqueue, multi-queue claim, worker-label routing, OTel spans including
+  the cross-restart link, and plugin hooks (ordering, veto, panic recovery,
+  per-attempt, concurrency).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

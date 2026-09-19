@@ -48,6 +48,8 @@ is the wrong amount of infrastructure.
   window; the window is persisted, so it survives File-mode restarts
 - **Middleware** — `quacker.Use` / `Wrap` decorators around task execution
   for timing, tracing, error taxonomies, and custom metrics
+- **Plugins** — compile-time `WithPlugin` lifecycle hooks (enqueue, step, run
+  finished, emit) that can observe or veto in-process
 - **Bring-your-own logs** — task logs flow to a sink you choose (engine slog
   by default); opt into SQLite persistence with `WithLogStorage(true)`
 - **Retention / purge** — `q.Purge` and `WithRetention` bound a long-lived
@@ -253,6 +255,39 @@ Middleware runs once per attempt, so timing and retry observability are
 accurate. Order is global → per-task → body; a middleware may short-circuit
 by returning without calling `next`. Panics are recovered exactly like a task
 panic. `StepFromContext` exposes `RunID`, `Step`, `Task`, and `Attempt`.
+
+## Plugins
+
+Plugins are **compile-time** — a Go type passed to `Open(WithPlugin(p))`, not a
+dynamically loaded `.so` or an out-of-process server. A plugin returns a
+`Hooks` struct and sets only the callbacks it needs:
+
+```go
+type auditor struct{}
+
+func (auditor) Name() string { return "audit" }
+func (auditor) Hooks() quacker.Hooks {
+    return quacker.Hooks{
+        // Runs before the task body; return an error to veto (step FAILED, no retries).
+        BeforeStep: func(ctx context.Context, s quacker.StepInfo) (context.Context, error) {
+            if blocked(s) {
+                return ctx, fmt.Errorf("rejected %s", s.RunID)
+            }
+            return ctx, nil
+        },
+        OnRunFinished: func(ctx context.Context, r quacker.RunInfo) { record(r) },
+    }
+}
+
+q, _ := quacker.Open(quacker.WithPlugin(auditor{}))
+```
+
+`Before*` callbacks run in registration order and may veto; `After*` callbacks
+run in reverse and are observe-only (their panics are recovered, never changing
+the outcome). Hooks run per attempt, for workflows and recovered runs. They are
+trusted, in-process code and must be safe for concurrent use. For wrapping the
+*task body* use [middleware](#middleware); for a post-hoc transition stream use
+`Subscribe`.
 
 ## Task logs
 
@@ -504,10 +539,10 @@ overhead at all.
 
 ## Not yet
 
-Strict (ordered) per-key concurrency, a web UI, and plugin/custom-storage
-extension points (v1.3). Multi-process scaling over Postgres is supported, and
-worker labels, OTel tracing, durable execution, and DAG visualization are all
-shipped.
+Strict (ordered) per-key concurrency and a web UI. Compile-time lifecycle-hook
+plugins shipped (v1.3); a pluggable payload codec and custom storage drivers
+are next. Multi-process scaling over Postgres, worker labels, OTel tracing,
+durable execution, and DAG visualization are all shipped.
 
 ## Documentation
 

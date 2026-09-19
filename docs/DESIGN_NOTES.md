@@ -617,6 +617,34 @@ Two lessons from getting there:
   benchmark now uses a fresh store per iteration with setup outside the timer.
   Measure the thing you changed, in isolation.
 
+### 32. Plugins are compile-time and explicit; hooks are a struct, not interfaces
+
+The plugin system is deliberately the Go idiom — interfaces + registration —
+not `-buildmode=plugin` (platform-locked, toolchain-hash-fragile) or an
+out-of-process server (contradicts "embeddable, no deploy"). A plugin is a
+`Plugin` (name + `Hooks()`) passed to `Open(WithPlugin(p))`, so there is no
+global registry, no init-order coupling, and it is trivial to test. The public
+surface is a **single `Hooks` struct of optional function fields** rather than
+a family of capability interfaces; Jev rated the struct higher (0.72) once the
+minimal-surface constraint was explicit, and it keeps docs and registration to
+one type.
+
+Semantics chosen for least surprise:
+
+- `Before*` run in registration order and may veto; `After*` run in **reverse**
+  (Jev 0.91) so they pair like nested decorators.
+- `After*` are **observe-only** — they cannot change an already-recorded
+  outcome, and their panics are recovered and logged (Jev 0.99). Only `Before*`
+  can influence flow, by returning an error.
+- A `BeforeStep` veto is an **immediate FAILED with no retries**: a deterministic
+  rejection shouldn't burn the retry budget, and a transient condition is the
+  hook's to allow. This reuses `FinalFailStep` (siblings cancelled, run failed).
+- Hooks are engine-level, complementing per-task middleware (which wraps the
+  body) and `Subscribe` (a post-hoc, drop-on-overflow transition stream).
+  Order is hook → middleware → body → middleware → hook.
+- Hooks run per attempt, for workflows and recovered runs; the unregistered-task
+  park path is skipped. In-process plugins are trusted code.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

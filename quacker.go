@@ -56,6 +56,7 @@ func Open(opts ...Option) (*Quacker, error) {
 		TracerProvider:  cfg.tracerProvider,
 		WorkerID:        cfg.workerID,
 		LeaseTTL:        cfg.leaseTTL,
+		Hooks:           cfg.plugins,
 	}
 	if cfg.logSink != nil {
 		fn := cfg.logSink

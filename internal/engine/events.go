@@ -74,13 +74,20 @@ func (e *Engine) RemoveEvent(event, task string) error {
 // after the atomic wake but before the enqueues loses those run bindings
 // (unbound events and event waits still deliver). It returns how many On
 // binding runs were enqueued.
-func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage) (int, error) {
+func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage) (n int, rerr error) {
 	if name == "" {
 		return 0, errors.New("quacker: event name required")
 	}
 	if ctx == nil {
 		ctx = e.ctx
 	}
+	info := EmitInfo{Event: name}
+	// BeforeEmit may veto: nothing is persisted or delivered.
+	if ctx, rerr = e.beforeEmit(ctx, info); rerr != nil {
+		return 0, rerr
+	}
+	defer func() { e.afterEmit(ctx, info, n, rerr) }()
+
 	ctx, span := e.startSpan(ctx, "quacker.emit", attribute.String("quacker.event", name))
 	woken, err := e.st.DeliverEvent(ctx, name, payload, e.now().UnixNano())
 	endSpan(span, err)
@@ -94,7 +101,6 @@ func (e *Engine) Emit(ctx context.Context, name string, payload json.RawMessage)
 	subs := append([]*eventSub(nil), e.eventSubs[name]...)
 	e.mu.RUnlock()
 
-	n := 0
 	var firstErr error
 	for _, s := range subs {
 		def := e.taskDef(s.task) // freshest registered definition

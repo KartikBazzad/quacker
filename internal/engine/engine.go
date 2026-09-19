@@ -166,6 +166,8 @@ type Engine struct {
 	workerID  string
 	leaseMode bool
 	leaseTTL  time.Duration
+	// hookGroups are plugin hooks in registration order (immutable after New).
+	hookGroups []Hooks
 	// haltSteps marks steps that were cancelled or orphaned by a failed run
 	// before their executor registered a cancel func — the executor checks
 	// (and clears) its tombstone right after registering, closing the
@@ -230,6 +232,8 @@ type Options struct {
 	// LeaseTTL is how long a claim's lease lasts before the reaper may
 	// requeue it (leases mode only). <=0 defaults to 30s.
 	LeaseTTL time.Duration
+	// Hooks are plugin lifecycle callbacks, invoked in slice order.
+	Hooks []Hooks
 	// LogSink is the base task-log destination. When nil and LogStorage is
 	// off, task logs go to the engine logger; when nil and LogStorage is on,
 	// they persist to SQLite only.
@@ -324,6 +328,7 @@ func New(o Options) (*Engine, error) {
 	if e.leaseTTL <= 0 {
 		e.leaseTTL = 30 * time.Second
 	}
+	e.hookGroups = append([]Hooks(nil), o.Hooks...)
 	return e, nil
 }
 
@@ -558,6 +563,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	runs := make([]*store.Run, len(reqs))
 	steps := make([][]*store.Step, len(reqs))
 	waiters := make([]*Waiter, len(reqs))
+	infos := make([]EnqueueInfo, len(reqs))
 	var enqueueSpans []trace.Span
 	defer func() {
 		for _, s := range enqueueSpans {
@@ -573,6 +579,11 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 		if err != nil {
 			return nil, err
 		}
+		info := EnqueueInfo{Workflow: run.Workflow, Kind: run.Kind, Queue: run.Queue, Priority: run.Priority}
+		if _, herr := e.beforeEnqueue(ctx, info); herr != nil {
+			return nil, herr // plugin veto: nothing is written
+		}
+		infos[i] = info
 		if span != nil {
 			// Record the producer span so the executing step can link to it,
 			// even after a restart or on another process.
@@ -594,6 +605,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	e.mu.Lock()
 	if e.closing.Load() {
 		e.mu.Unlock()
+		e.afterEnqueueReverse(ctx, infos, ErrClosed)
 		return nil, ErrClosed
 	}
 	for _, w := range waiters {
@@ -607,10 +619,20 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 			delete(e.waiters, w.RunID)
 		}
 		e.mu.Unlock()
+		e.afterEnqueueReverse(ctx, infos, err)
 		return nil, err
 	}
+	e.afterEnqueueReverse(ctx, infos, nil)
 	e.wakeScheduler()
 	return waiters, nil
+}
+
+// afterEnqueueReverse fires AfterEnqueue for each info in reverse
+// registration order (one group per registered plugin).
+func (e *Engine) afterEnqueueReverse(ctx context.Context, infos []EnqueueInfo, err error) {
+	for i := len(infos) - 1; i >= 0; i-- {
+		e.afterEnqueue(ctx, infos[i], err)
+	}
 }
 
 // buildRun validates one enqueue request and materializes its run and steps.
@@ -875,6 +897,16 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	if jerr != nil {
 		e.log.Error("quacker: load journal", "run", st.RunID, "step", st.Name, "err", jerr)
 	}
+	stepInfo := StepInfo{
+		RunID: st.RunID, Step: st.Name, Task: taskName, Queue: st.Queue,
+		Attempt: int(st.Attempts), Key: st.ConcurrencyKey, Labels: st.Labels,
+	}
+	// Plugin hooks run before the body; a BeforeStep error vetoes it (skips
+	// the task and fails the step immediately, without retries).
+	var vetoed bool
+	if taskCtx, err = e.beforeStep(taskCtx, stepInfo); err != nil {
+		vetoed = true
+	}
 	// Start the step's span (a new root linked to the enqueue span, since the
 	// producer is long gone). It is attached to the task context so user code
 	// and middleware can create child spans.
@@ -883,20 +915,22 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	stepCtx := withStepContext(taskCtx, c, depOutputs, e.logSend, journal, e)
 	handler := e.wrapHandler(def)
 	var suspend *suspendSignal
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				// A durable helper asks to suspend by panicking; recognize it
-				// before the generic panic-to-error conversion.
-				if s, ok := r.(*suspendSignal); ok {
-					suspend = s
-					return
+	if !vetoed {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// A durable helper asks to suspend by panicking; recognize
+					// it before the generic panic-to-error conversion.
+					if s, ok := r.(*suspendSignal); ok {
+						suspend = s
+						return
+					}
+					err = fmt.Errorf("panic: %v\n%s", r, stack())
 				}
-				err = fmt.Errorf("panic: %v\n%s", r, stack())
-			}
+			}()
+			out, err = handler(stepCtx, st.Input)
 		}()
-		out, err = handler(stepCtx, st.Input)
-	}()
+	}
 	if suspend != nil {
 		// The helper already recorded SUSPENDED atomically with its journal
 		// entry. If the run went terminal while the task ran (e.g. cancelled
@@ -913,9 +947,21 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		return
 	}
 
+	if !vetoed {
+		e.afterStep(taskCtx, stepInfo, err)
+	}
+
 	now := e.now()
 	errStr := truncateErr(err)
 	switch {
+	case vetoed:
+		// A BeforeStep hook rejected the step: fail immediately, no retries.
+		if e.runTerminal(st.RunID) {
+			_ = e.st.StepCancelled(bg, st.ID, now.UnixNano())
+			e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusCancelled, errStr, now.UnixNano())
+		} else {
+			e.recordFinalFailure(st, errStr, now)
+		}
 	case err == nil:
 		res, cerr := e.st.CompleteStep(bg, st.ID, st.RunID, out, now.UnixNano())
 		if cerr != nil {
@@ -957,19 +1003,25 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusQueued, errStr, now.UnixNano())
 		e.wakeScheduler()
 	default:
-		res, cerr := e.st.FinalFailStep(bg, st.ID, st.RunID, errStr, now.UnixNano())
-		if cerr != nil {
-			e.log.Error("quacker: record failure", "run", st.RunID, "step", st.Name, "err", cerr)
-			return
-		}
-		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusFailed, errStr, now.UnixNano())
-		for _, name := range res.CancelledSteps {
-			e.publish(st.RunID, name, store.StatusRunning, store.StatusCancelled, "", now.UnixNano())
-		}
-		e.cancelStepContexts(res.CancelledStepIDs)
-		if res.RunTerminal {
-			e.finishRun(st.RunID, res.RunStatus, nil, res.RunError, now.UnixNano())
-		}
+		e.recordFinalFailure(st, errStr, now)
+	}
+}
+
+// recordFinalFailure marks a step FAILED, cancels its siblings, and finishes
+// the run — the shared tail of an exhausted failure and a plugin veto.
+func (e *Engine) recordFinalFailure(st *store.Step, errStr string, now time.Time) {
+	res, cerr := e.st.FinalFailStep(context.Background(), st.ID, st.RunID, errStr, now.UnixNano())
+	if cerr != nil {
+		e.log.Error("quacker: record failure", "run", st.RunID, "step", st.Name, "err", cerr)
+		return
+	}
+	e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusFailed, errStr, now.UnixNano())
+	for _, name := range res.CancelledSteps {
+		e.publish(st.RunID, name, store.StatusRunning, store.StatusCancelled, "", now.UnixNano())
+	}
+	e.cancelStepContexts(res.CancelledStepIDs)
+	if res.RunTerminal {
+		e.finishRun(st.RunID, res.RunStatus, nil, res.RunError, now.UnixNano())
 	}
 }
 
@@ -1014,6 +1066,13 @@ func (e *Engine) finishRun(runID, status string, output json.RawMessage, errMsg 
 	}
 	e.log.Debug("quacker: run finished", "run", runID, "status", status, "err", errMsg)
 	e.publish(runID, "", store.StatusRunning, status, errMsg, now)
+	if len(e.hookGroups) > 0 {
+		info := RunInfo{RunID: runID, Status: status, Error: errMsg}
+		if r, gerr := e.st.GetRun(context.Background(), runID); gerr == nil {
+			info.Workflow = r.Workflow
+		}
+		e.onRunFinished(context.Background(), info)
+	}
 }
 
 func (e *Engine) runTerminal(runID string) bool {

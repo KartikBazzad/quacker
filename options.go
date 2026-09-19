@@ -66,6 +66,7 @@ type config struct {
 	workerLabels       []string
 	workerID           string
 	leaseTTL           time.Duration
+	plugins            []engine.Hooks
 	logSink            func(LogEntry)
 	logStorage         bool
 	metricsFn          func(*Metrics)
