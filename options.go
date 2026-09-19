@@ -102,7 +102,7 @@ type config struct {
 	logStorage         bool
 	metricsFn          func(*Metrics)
 	metricsInterval    time.Duration
-	retention          *engine.RetentionPolicy
+	retentions         []*engine.RetentionPolicy
 	tracerProvider     trace.TracerProvider
 }
 
@@ -242,14 +242,18 @@ func WithMetricsInterval(d time.Duration) Option {
 // policy's OlderThan, on its own interval. Purging is storage-agnostic and
 // bounds growth in every mode (Memory included). OlderThan must be > 0 for
 // the loop to act; interval defaults to one minute.
+//
+// Call it more than once to layer policies: a global one (empty Queue) plus
+// per-queue overrides with their own cutoff. Each runs on its own interval
+// and purges only the rows it selects.
 func WithRetention(p RetentionPolicy) Option {
 	return func(c *config) {
-		rp := &engine.RetentionPolicy{
+		c.retentions = append(c.retentions, &engine.RetentionPolicy{
 			OlderThan: p.OlderThan,
 			Statuses:  statusStrings(p.Statuses),
+			Queue:     p.Queue,
 			KeepLogs:  p.KeepLogs,
 			Interval:  p.Interval,
-		}
-		c.retention = rp
+		})
 	}
 }

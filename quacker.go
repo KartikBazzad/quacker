@@ -53,7 +53,7 @@ func Open(opts ...Option) (*Quacker, error) {
 		WorkerLabels:    cfg.workerLabels,
 		LogStorage:      cfg.logStorage,
 		MetricsInterval: cfg.metricsInterval,
-		Retention:       cfg.retention,
+		Retentions:      cfg.retentions,
 		TracerProvider:  cfg.tracerProvider,
 		WorkerID:        cfg.workerID,
 		LeaseTTL:        cfg.leaseTTL,

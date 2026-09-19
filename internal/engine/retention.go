@@ -13,13 +13,15 @@ type RetentionPolicy struct {
 	// Statuses restricts which terminal statuses may be purged; empty means
 	// every terminal status.
 	Statuses []string
+	// Queue, when non-empty, restricts the policy to that queue.
+	Queue string
 	// KeepLogs retains the logs of purged runs (and skips the orphan sweep).
 	KeepLogs bool
 	Interval time.Duration
 }
 
-func (e *Engine) retentionLoop() {
-	interval := e.retention.Interval
+func (e *Engine) retentionLoop(p *RetentionPolicy) {
+	interval := p.Interval
 	if interval <= 0 {
 		interval = time.Minute
 	}
@@ -33,13 +35,12 @@ func (e *Engine) retentionLoop() {
 		case <-e.ctx.Done():
 			return
 		case <-t.C:
-			e.runRetention()
+			e.runRetention(p)
 		}
 	}
 }
 
-func (e *Engine) runRetention() {
-	p := e.retention
+func (e *Engine) runRetention(p *RetentionPolicy) {
 	if p == nil || p.OlderThan <= 0 {
 		return
 	}
@@ -47,6 +48,7 @@ func (e *Engine) runRetention() {
 	res, err := e.st.PurgeRuns(e.ctx, store.PurgeOptions{
 		Before:   cutoff,
 		Statuses: p.Statuses,
+		Queue:    p.Queue,
 		KeepLogs: p.KeepLogs,
 	})
 	if err != nil {

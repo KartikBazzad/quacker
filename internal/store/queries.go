@@ -236,6 +236,8 @@ type PurgeOptions struct {
 	// Statuses restricts deletion to these terminal statuses; empty means
 	// every terminal status. A non-terminal status is an error.
 	Statuses []string
+	// Queue, when non-empty, restricts deletion to runs in that queue.
+	Queue string
 	// KeepLogs retains the logs of purged runs and skips the orphan sweep.
 	KeepLogs bool
 	// BatchSize bounds rows deleted per transaction. <= 0 uses 500.
@@ -277,7 +279,7 @@ func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, 
 	}
 	var res PurgeResult
 	for {
-		n, r, err := s.purgeRunBatch(ctx, statuses, opts.Before, batch, opts.KeepLogs)
+		n, r, err := s.purgeRunBatch(ctx, statuses, opts.Queue, opts.Before, batch, opts.KeepLogs)
 		if err != nil {
 			return res, err
 		}
@@ -337,7 +339,7 @@ func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64
 
 // purgeRunBatch deletes one batch of eligible runs (and their steps/logs) in
 // a single transaction, returning how many runs were selected.
-func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
+func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, queue string, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
 	var res PurgeResult
 	tx, err := s.beginTx(ctx)
 	if err != nil {
@@ -348,13 +350,14 @@ func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, before int
 	q := `SELECT r.id FROM runs r
 		WHERE r.status IN (` + placeholders(len(statuses)) + `)
 		  AND r.completed_at > 0 AND r.completed_at < ?
+		  AND (? = '' OR r.queue = ?)
 		  AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id AND s.status = ?)
 		ORDER BY r.completed_at LIMIT ?`
-	args := make([]any, 0, len(statuses)+3)
+	args := make([]any, 0, len(statuses)+5)
 	for _, st := range statuses {
 		args = append(args, st)
 	}
-	args = append(args, before, StatusRunning, batch)
+	args = append(args, before, queue, queue, StatusRunning, batch)
 	rows, err := tx.query(ctx, q, args...)
 	if err != nil {
 		return 0, res, err

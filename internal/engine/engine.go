@@ -212,8 +212,9 @@ type Engine struct {
 	// metrics, when non-nil, is invoked on metricsInterval with a snapshot.
 	onMetrics       func(MetricsSnapshot)
 	metricsInterval time.Duration
-	// retention, when non-nil, purges terminal runs on its own interval.
-	retention *RetentionPolicy
+	// retentions, when non-empty, each purge terminal runs on their own
+	// interval (a global policy plus per-queue overrides).
+	retentions []*RetentionPolicy
 
 	unknownWarned sync.Map // task name -> warned once
 }
@@ -257,8 +258,8 @@ type Options struct {
 	// OnMetrics, when set, is called every MetricsInterval with a snapshot.
 	OnMetrics       func(MetricsSnapshot)
 	MetricsInterval time.Duration
-	// Retention, when set, runs PurgeRuns on RetentionInterval.
-	Retention *RetentionPolicy
+	// Retentions, when set, each run PurgeRuns on their own interval.
+	Retentions []*RetentionPolicy
 }
 
 // New returns an engine. Call Start to begin scheduling.
@@ -304,7 +305,7 @@ func New(o Options) (*Engine, error) {
 		workerLabels:    append([]string(nil), o.WorkerLabels...),
 		onMetrics:       o.OnMetrics,
 		metricsInterval: o.MetricsInterval,
-		retention:       o.Retention,
+		retentions:      o.Retentions,
 	}
 	if e.metricsInterval <= 0 {
 		e.metricsInterval = 15 * time.Second
@@ -384,9 +385,9 @@ func (e *Engine) Start() {
 		e.loopWG.Add(1)
 		go func() { defer e.loopWG.Done(); e.metricsLoop() }()
 	}
-	if e.retention != nil {
+	for _, p := range e.retentions {
 		e.loopWG.Add(1)
-		go func() { defer e.loopWG.Done(); e.retentionLoop() }()
+		go func(p *RetentionPolicy) { defer e.loopWG.Done(); e.retentionLoop(p) }(p)
 	}
 	if e.leaseMode {
 		e.loopWG.Add(2)

@@ -21,6 +21,8 @@ type PurgeOptions struct {
 	// Statuses restricts the purge to these terminal statuses; empty means
 	// all four. A non-terminal status returns ErrNonTerminalPurge.
 	Statuses []Status
+	// Queue, when non-empty, restricts the purge to runs in that queue.
+	Queue string
 	// KeepLogs retains the logs of purged runs (and skips the orphan sweep).
 	// The default (false) deletes them with the run.
 	KeepLogs bool
@@ -38,6 +40,10 @@ type RetentionPolicy struct {
 	// Statuses restricts which terminal statuses may be purged; empty means
 	// all of them.
 	Statuses []Status
+	// Queue, when non-empty, restricts the policy to runs in that queue. Use
+	// several WithRetention policies (a global one plus per-queue overrides)
+	// for different cutoffs per queue.
+	Queue string
 	// KeepLogs retains the logs of purged runs.
 	KeepLogs bool
 	// Interval is how often the purge runs; <= 0 uses one minute (min 1s).
@@ -55,6 +61,7 @@ func (q *Quacker) Purge(ctx context.Context, opts PurgeOptions) (PurgeResult, er
 	return q.st.PurgeRuns(ctx, store.PurgeOptions{
 		Before:    time.Now().Add(-opts.OlderThan).UnixNano(),
 		Statuses:  statusStrings(opts.Statuses),
+		Queue:     opts.Queue,
 		KeepLogs:  opts.KeepLogs,
 		BatchSize: opts.BatchSize,
 	})
