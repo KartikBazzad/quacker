@@ -47,7 +47,7 @@ Drop `-benchtime` for quicker runs; raise it for stable numbers. Run with
 backends; `File` on an SSD should be close to `Ephemeral` since
 `synchronous=NORMAL` only fsyncs on WAL checkpoints.
 
-## What's not yet measured (v0.2 candidates)
+## What's not yet measured (follow-up candidates)
 
 - Parallel benchmark (`-cpu 1,4,10`) — scheduler contention above 1 producer.
 - `Ephemeral` vs `Memory` delta (expect: memory slightly faster per write,

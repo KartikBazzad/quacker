@@ -67,8 +67,8 @@ As built (deviating from the sketch where the sketch was weaker):
 per-key gating counts persisted `RUNNING` rows sharing the step's
 `concurrency_key` at claim time — no in-memory semaphores to leak on
 park/cancel/interrupt, and File-mode restarts inherit the right count.
-`WithKeyConcurrency(n)` gives N-per-key (default 1); strict-order-per-key
-stays v0.3. Rate limiting is a sliding window over persisted `claimed_at`
+`WithKeyConcurrency(n)` gives N-per-key (default 1); strict (ordered)
+per-key execution remains future work. Rate limiting is a sliding window over persisted `claimed_at`
 timestamps inside the claim transaction — `WithRate(queue, n, per)` /
 `SetRateLimit` — which beats a token bucket on the acceptance test (no 2N
 boundary bursts) and survives restarts. Keys are visible in `Execution`
@@ -129,8 +129,8 @@ uses resume-cadence semantics: a stored next time still in the future is
 kept, a missed one is recomputed from now (skip missed, no catch-up burst).
 Event delivery is **best-effort and in-process**: the event is persisted for
 audit (`q.Events`) and then one run is enqueued per binding, each receiving
-the payload as input; durable at-least-once event waits are deliberately left
-to v0.3. Migration v4 adds `events` and `event_subscriptions`; event bindings
+the payload as input; durable at-least-once event waits were deliberately left
+to v0.3 (shipped in slice B). Migration v4 adds `events` and `event_subscriptions`; event bindings
 re-arm on `Register` exactly like crons. To keep the new events table from
 becoming an unbounded-growth hole, `q.Purge`/`WithRetention` now age events
 out with the same cutoff (`PurgeResult.Events`).
@@ -192,12 +192,15 @@ Migration v6 adds `runs.parent_id` + an index. `EnqueueChild` /
 join, a failed child does not fail the parent, and there is no foreign key,
 so a purged parent leaves its children with a dangling id (documented).
 Children are ordinary runs and are aged/purged independently.
-- **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to a channel, which can be consumed by the user.
-  - "We dont want the quacker to serve http. so a method can return debug logs"
+
+### Slice D — visibility & perf (in progress)
+
 - ✅ **DAG Visualizer** (`q.DAG`/`q.DAGJSON`/`q.DAGSVG`): a run's step graph
   with the **current state** of every node, as a structured model, indented
   JSON, or a standalone status-coloured SVG (dependency-level layout,
   dependency-free renderer). See `examples/dagsvg`.
+- **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to
+  a channel the user consumes — the engine never serves HTTP.
 - **Perf**: batch enqueue, multi-queue claim batching in one transaction,
   `-cpu` parallel benchmarks.
 
@@ -228,14 +231,14 @@ Children are ordinary runs and are aged/purged independently.
 - Plugin system for extending functionality
 - Support for custom storage backends
 
-## ⚖ Decision points (input welcome, defaults chosen)
+## ⚖ Open decisions (input welcome, defaults chosen)
 
-1. **v0.2 flagship**: plan assumes per-key concurrency + rate limiting are
-   the headline features, with hardening first. If you'd rather ship
-   durable sleep early (it's the sexiest Hatchet-parity feature but the
-   biggest design lift), v0.2 and v0.3 can swap.
-2. **Debug logger**: embedded debug logger is planned; it will be a method on the quacker instance that returns a logger that writes to a channel, which can be consumed by the user.
-3. **Events**: in-process emit/listen is planned; if you want webhook or
-   external-event ingestion, that changes the schema — flag it before the
-   migrations land.
-4. **License**: MIT assumed for the repo; say the word before the first tag.
+1. **Debug logger**: planned as `q.DebugLogger()`, a method returning a
+   channel-backed logger the user consumes; the engine stays HTTP-free.
+2. **External events**: in-process emit/listen shipped (v0.2 P2). Webhook or
+   external-event ingestion would change the schema — flag it before it lands.
+3. **Multi-instance**: the Postgres epic needs a store interface plus worker
+   identity and step leases, because boot recovery currently re-queues every
+   RUNNING row — correct for one process, unsafe for a cluster.
+4. **License/tags**: MIT is in place (v0.2 P2); semver tags are pending a git
+   remote.

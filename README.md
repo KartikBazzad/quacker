@@ -61,9 +61,10 @@ is the wrong amount of infrastructure.
   restart
 - **In-process events** — `q.Emit(name, payload)` fans out to tasks bound with
   `quacker.On(name, task)`, each receiving the payload as input
-- **Durable execution** — `quacker.SleepDurable` suspends a run without
-  holding a worker slot and survives restarts; `quacker.RunOnce` keeps side
-  effects from repeating when a task replays
+- **Durable execution** — `quacker.SleepDurable` and
+  `quacker.WaitFor` suspend a run without holding a worker slot and survive
+  restarts; `quacker.RunOnce` keeps side effects from repeating when a task
+  replays
 - **Cancellation** — instant, propagated to running task contexts
 - **Non-blocking introspection** — `Execution`, `Runs`, `Metrics`, `Logs`,
   `Subscribe` — never pause or slow the workers
@@ -123,7 +124,7 @@ h, _ := quacker.EnqueueWorkflow[Shipment](ctx, q, wf, order) // Result = last st
 
 Steps start the moment their dependencies succeed. If a step exhausts its
 retries, the run fails and remaining steps are cancelled. Task logs written
-inside steps are persisted and readable via `q.Logs(ctx, runID, limit)`.
+inside steps go to your configured log sink (see [Task logs](#task-logs)).
 
 **Dependencies are direct requirements.** Ordering is transitive — a step
 named as a dep of `ship` is already ordered before anything `ship` precedes —
@@ -371,6 +372,7 @@ q.Close(ctx)               // stop claiming, drain in-flight (30s default deadli
 snap, _ := q.Execution(ctx, h.RunID())          // full snapshot (JSON-tagged)
 runs, _ := q.Runs(ctx, quacker.RunFilter{Status: quacker.StatusRunning})
 m, _ := q.Metrics(ctx)                          // counts by status, queue depths
+dag, _ := q.DAGJSON(ctx, h.RunID())             // step graph + current state
 logs, _ := q.Logs(ctx, h.RunID(), 100)          // needs WithLogStorage(true)
 events, stop := q.Subscribe("")                 // "" = all runs
 ```
@@ -393,9 +395,10 @@ trivial.
   so a restarted app only needs `quacker.Register`, not a re-`Cron`/re-`On`.
   A stored fire time still in the future is kept; a missed one is skipped
   (no catch-up burst). Unregistered targets simply stay pending.
-- **Events are best-effort and in-process.** `Emit` persists the event then
-  enqueues one run per bound task; a crash between the two can lose those
-  dispatches. Durable event waits arrive in v0.3.
+- **Events are best-effort and in-process.** `Emit` records the event and
+  atomically wakes every durable `WaitFor` on it; the `On`-binding fan-out
+  (enqueueing a run per bound task) is best-effort, so a crash between the two
+  can lose those enqueues. Event *waits* are durable and at-least-once.
 - Tasks should honor `ctx` — timeouts and cancellation are cooperative.
 - One engine per process assumes a single writer to a given `File` path —
   enforced by the `.quacker.lock` kernel-lock guard: a second engine on
@@ -403,23 +406,24 @@ trivial.
 
 ## Not yet
 
-Distributed workers across processes, per-key rate limits and strict
-per-key ordering, durable pause/resume (durable sleep), worker
-labels/affinity, a web UI, OpenTelemetry.
+Distributed workers across processes (the Postgres/multi-instance epic),
+strict (ordered) per-key concurrency, worker labels/affinity, an embedded
+debug-log stream and web UI, and OpenTelemetry.
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — how the engine, store, and event bus fit together
 - [Design notes](docs/DESIGN_NOTES.md) — key decisions and lessons from the build
 - [Benchmarks](docs/BENCHMARKS.md) — numbers, methodology, how to reproduce
-- [Roadmap](docs/ROADMAP.md) — v0.2 hardening & control, v0.3 durable execution, known issues
+- [Roadmap](docs/ROADMAP.md) — shipped versions, v0.3 visibility/perf, follow-on epics
 
 ## Examples
 
  runnable programs live in [`examples/`](examples/):
 [`simple`](examples/simple/main.go) · [`dag`](examples/dag/main.go) ·
-[`cron`](examples/cron/main.go) · [`events`](examples/events/main.go) ·
-[`durable`](examples/durable/main.go) · [`children`](examples/children/main.go) ·
+[`dagsvg`](examples/dagsvg/main.go) · [`cron`](examples/cron/main.go) ·
+[`events`](examples/events/main.go) · [`durable`](examples/durable/main.go) ·
+[`children`](examples/children/main.go) ·
 [`introspect`](examples/introspect/main.go)
 
 ## Development

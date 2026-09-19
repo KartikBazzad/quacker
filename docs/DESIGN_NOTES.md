@@ -296,8 +296,9 @@ In-process events are deliberately *not* durable delivery. `Emit` persists
 the event row (for `q.Events` introspection) and then enqueues one run per
 armed binding, each with the payload as input. A crash between the persist
 and the enqueues can lose those dispatches — this is documented rather than
-hidden, and durable at-least-once event waits are the v0.3 `WaitFor` design,
-which needs suspension/cursor machinery this feature does not. Bindings
+hidden; durable at-least-once `WaitFor` waits, added later (v0.3 slice B),
+build on the journal/subscription machinery rather than this best-effort
+fan-out. Bindings
 themselves are persisted (`event_subscriptions`, unique per event+task) so
 they re-arm like crons, and `Off` deletes both the in-memory and stored
 binding.
