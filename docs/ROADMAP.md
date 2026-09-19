@@ -331,18 +331,203 @@ translates SQL. See [DRIVERS.md](DRIVERS.md).
   select-then-update instead of `UPDATE ... RETURNING`, and derived-table
   `LIMIT` subqueries.
 
+## v1.5 — job-control primitives (📐 DESIGN — not started)
+
+Three items from the Features table, each independently shippable. All three are
+additive (new options/methods + migrations), keep the existing query layer, and
+work on SQLite/Postgres/MySQL.
+
+### 1. Unique jobs (enqueue-time dedup)
+
+**API**
+
+```go
+// Task-level: derive a uniqueness key from input. "" means "not unique".
+func WithUnique[I any](fn func(I) string) TaskOption
+
+// Enqueue-time override, and explicit key for callers with no task default:
+func WithUniqueKey(key string) EnqueueOption
+
+type UniqueConflict int
+const (
+    UniqueReuse   UniqueConflict = iota // return the live run's handle (default)
+    UniqueError                         // fail the enqueue with ErrDuplicateJob
+    UniqueReplace                       // cancel the live run, enqueue the new one
+)
+func WithUniqueConflict(c UniqueConflict) TaskOption
+
+var ErrDuplicateJob = errors.New("quacker: a run with this unique key already exists")
+```
+
+Uniqueness is scoped to the **task name** (`runs.workflow`) and held while the
+run is non-terminal (QUEUED/RUNNING/BLOCKED/SUSPENDED); it frees automatically
+on any terminal transition. `UniqueReuse` returns a `*RunHandle` bound to the
+existing run (same as any handle; `Result` decodes that run's output).
+
+**Storage**
+
+- New **nullable** `runs.unique_key` — `NULL` for non-unique runs.
+- New unique index `(workflow, unique_key)`. All three dialects treat `NULL` as
+  distinct in a unique index, so an arbitrary number of non-unique runs coexist
+  — this is why the column is nullable instead of `DEFAULT ''` (MySQL has no
+  partial indexes).
+- Every terminal transition nulls the column: the success path in
+  `CompleteStep`, `FinalFailStep`, `CancelRun`, `InterruptAll`, and boot
+  recovery. Purge already deletes terminal rows.
+- Migrations: SQLite v13, Postgres v5, MySQL v2.
+
+**Execution path**
+
+- `EnqueueRequest` gains `UniqueKey string` and `Conflict UniqueConflict`; the
+  engine fills the key from `WithUnique`/`WithUniqueKey` at enqueue.
+- Inside the enqueue transaction the insert is attempted; on conflict, per mode:
+  *reuse* → `SELECT id FROM runs WHERE workflow=? AND unique_key=? AND status IN
+  (non-terminal)` and return that handle (if the row just went terminal, retry
+  the insert once); *error* → `ErrDuplicateJob`; *replace* → cancel the live run
+  then insert.
+- Portability needs one driver addition: `IsUniqueViolation(err error) bool`
+  (SQLite "constraint failed", Postgres SQLSTATE `23505`, MySQL error `1062`).
+- `EnqueueBatch` applies the same rule per element; two elements sharing a key
+  in one batch resolve by the first, per the conflict mode.
+
+**Tests**: reuse returns the same `runID`; a new enqueue after terminal creates a
+new run; concurrent enqueues (two goroutines, and two engines on one Postgres/MySQL)
+produce exactly one run; replace cancels the prior run; non-unique tasks are
+unaffected; duplicate keys within one batch.
+
+### 2. Pausing queues
+
+**API**
+
+```go
+func (q *Quacker) PauseQueue(ctx context.Context, name string) error
+func (q *Quacker) ResumeQueue(ctx context.Context, name string) error
+func (q *Quacker) PausedQueues(ctx context.Context) ([]string, error)
+```
+
+A paused queue stops **claiming** new steps; RUNNING steps finish normally.
+Enqueues, crons, and events still create runs, which accumulate QUEUED. Resume
+wakes the scheduler immediately (reuses the existing wake channel) instead of
+waiting for the poll interval.
+
+**Storage**
+
+- New table `queue_pauses(queue TEXT PRIMARY KEY, paused_at INTEGER NOT NULL)`.
+- `ClaimDueMulti` adds a predicate to the candidate SELECT:
+  `AND NOT EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = steps.queue)`.
+  Enforcing in SQL (not just in the engine) keeps it correct across instances
+  and process restarts without a sync loop; the PK index makes it cheap.
+- Migrations: SQLite v14, Postgres v6, MySQL v3.
+
+**Execution path**
+
+- The engine keeps a local `paused map[string]struct{}` loaded at `Start` and
+  updated on Pause/Resume, used only as a fast-path skip in `tick`; the SQL
+  predicate is the source of truth for other engines.
+- `PauseQueue`/`ResumeQueue` are idempotent upserts/deletes (`ResumeQueue` on an
+  unpaused queue is a no-op).
+
+**Tests**: pause holds claims while `Enqueue`/`Cron` keep producing QUEUED runs;
+resume drains without waiting a poll; two engines share the pause; pausing an
+unknown queue is allowed and creates the row.
+
+### 3. Snoozing jobs
+
+**API**
+
+```go
+func (q *Quacker) Snooze(ctx context.Context, runID string, until time.Time) error
+func (q *Quacker) SnoozeFor(ctx context.Context, runID string, d time.Duration) error
+var (
+    ErrRunRunning  = errors.New("quacker: cannot snooze a running run")
+    ErrRunTerminal = errors.New("quacker: cannot snooze a terminal run")
+)
+```
+
+Move a **non-running** run's start time forward. Allowed when the run has no
+RUNNING step (QUEUED/BLOCKED/SUSPENDED); a RUNNING run returns `ErrRunRunning`
+(callers `Cancel` first), a terminal run `ErrRunTerminal`, unknown `ErrNotFound`.
+`SnoozeFor(d)` is sugar for `Snooze(now+d)`.
+
+**Storage**: no schema change — `run_at` already exists and is what the claim
+SELECT reads.
+
+**Execution path** — `Store.Snooze(ctx, runID, until)` in one transaction:
+
+1. `RunLock` (Postgres/MySQL row lock; SQLite single-writer) so it cannot race a
+   claim or a completion.
+2. Reject if any step is RUNNING or the run is terminal.
+3. `UPDATE steps SET run_at=? WHERE run_id=? AND status='QUEUED'`.
+4. `UPDATE runs SET run_at=? WHERE id=? AND status NOT IN (terminal)`.
+
+SUSPENDED steps keep their `resume_at` (a snooze must not wake a durable wait
+early); a run-level snooze shifts only QUEUED work. Existing waiters are
+unaffected. `Execution.RunAt` reflects the new time.
+
+**Tests**: a snoozed QUEUED run isn't claimed before `until` and is after;
+`ErrRunRunning` for a running run; a DAG mid-flight shifts only its queued
+steps; terminal → `ErrRunTerminal`; the run lock prevents a concurrent claim
+during snooze on Postgres/MySQL.
+
+**Shared work**: migrations add one version per dialect per feature (or one
+combined version per dialect), `driver.IsUniqueViolation` is a small addition to
+the public contract (documented in DRIVERS.md), and all three get integration
+coverage in the Postgres and MySQL suites plus the root File/Memory suite.
+
 ## Backlog
 - Pause and Resume Jobs/workflows
 - Custom storage backends
+- Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
 
-## ⚖ Open decisions (input welcome, defaults chosen)
 
-1. **Debug logger**: planned as `q.DebugLogger()`, a method returning a
-   channel-backed logger the user consumes; the engine stays HTTP-free.
-2. **External events**: in-process emit/listen shipped (v0.2 P2). Webhook or
-   external-event ingestion would change the schema — flag it before it lands.
-3. **Multi-instance**: shipped — dialect seam, worker leases (heartbeat +
-   reaper), claim/run locks, and cron single-fire. Optional follow-ups:
-   `LISTEN/NOTIFY` wakeups remain (`WithDB` connection reuse shipped).
-4. **License/tags**: MIT is in place (v0.2 P2); semver tags are pending a git
-   remote.
+## Features: status against the current codebase
+
+Legend: ✅ shipped · 🟡 partial · ❌ missing. Reviewed item by item; each note
+names the closest API today.
+
+| Feature | Status | Notes |
+|---|---|---|
+| Batching | ✅ | `EnqueueBatch` — one transaction, all-or-nothing, handles in input order. |
+| Cancelling jobs | ✅ | `q.Cancel(runID)`: QUEUED/BLOCKED/SUSPENDED → CANCELLED, RUNNING gets ctx cancel. No bulk/by-filter cancel. |
+| Concurrency limits | 🟡 | Queue (`WithQueue`), per-key (`WithKey`/`WithKeyConcurrency`), sliding-window rate (`WithRate`). Missing: cancel strategies, multiple/shared keys, per-worker slots, dynamic limits. |
+| Getting the client within workers | 🟡 | Go tasks close over `q`; context exposes `RunIDFromContext`/`StepFromContext` only — no engine accessor (trivial for embedded use). |
+| Dead letter queue | ❌ | Failed runs stay `FAILED` with their error; no DLQ. Query with `q.Runs(RunFilter{Status: StatusFailed})`. |
+| Durable periodic jobs | ✅ | `Cron` persists and re-arms on `Register`; fires once per occurrence across instances. |
+| Encrypted jobs | ❌ | No payload encryption. `WithCodec` can plug an encrypting codec for user payloads (schema JSON stays plaintext). |
+| Ephemeral jobs | ❌ | Storage is engine-wide (`Memory`/`Ephemeral`); no per-run "don't persist". |
+| Error and panic handling | ✅ | Panics recovered → step `FAILED` (and retried); errors persisted; retries + backoff. |
+| Job-persisted logging | ✅ | `WithLogStorage(true)` + `q.Logs`; sink chain via `WithTaskLogSink`. |
+| Multiple queues | ✅ | `Queue(name)` per task + `WithQueue(name, n)`. |
+| Pausing queues | 📐 v1.5 | Designed below: DB-backed pause table + claim predicate. |
+| Per-queue job retention | 🟡 | `WithRetention`/`q.Purge` are global, filtered by status — not per queue. |
+| Periodic and cron jobs | ✅ | `Cron` with 5-field specs, descriptors, and sub-second `@every`. |
+| Recorded output | ✅ | Run/step `output` persisted; `q.Execution(...).Output`, `DepOutput[T]`. |
+| Resumable jobs | ✅ | Durable replay (`SleepDurable`/`WaitFor`/`RunOnce`) + File restart recovery. |
+| Scheduled jobs | ✅ | `WithRunAt(t)` / `WithDelay(d)` on enqueue. |
+| Sequences | ❌ | No sequence primitive; DAG deps order within a workflow. Strict per-key ordering is still future work. |
+| Snoozing jobs | 📐 v1.5 | Designed below: move a non-running run's `run_at` forward. |
+| Subscriptions | ✅ | `On`/`Emit` bindings, durable `WaitFor`, and a live `q.Subscribe(runID)` stream. |
+| Testing | ✅ | `Memory()`/`Ephemeral()` + `WithPollInterval` for fast deterministic tests, examples, and `example_test.go`. No assertion harness. |
+| Transactional job completion | 🟡 | Completion is atomic inside the engine, but there is no API to enlist an enqueue in the caller's business DB transaction (`WithDB` shares a pool, not a tx). |
+| Unique jobs | 📐 v1.5 | Designed below: enqueue-time dedup via a nullable unique column. |
+| Work functions | ✅ | Tasks are plain Go functions (`NewTask`). |
+| Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
+
+Tally: 14 shipped, 4 partial, 7 missing.
+
+### Missing / partial — suggested follow-ups
+
+Addable within the embedded model, roughly by value:
+
+1. **Unique jobs** — enqueue-time dedup key (unique index + upsert), complements `WithKey`.
+2. **Pausing queues** — a paused flag that holds claims per queue (`SetQueue`-level, cheap).
+3. **Snoozing jobs** — reschedule a queued/running run (`run_at` bump), reuses `WithRunAt`.
+4. **Sequences / strict per-key order** — already named as future work in v0.2 notes.
+5. **Per-queue retention** — add a `Queue` field to `RetentionPolicy`/`PurgeOptions`.
+6. **Dead letter queue** — mark terminal-failed runs as DLQ-eligible; list/replay from there.
+7. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
+8. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
+9. **Transactional completion** — expose enqueue-on-`*sql.Tx` for Postgres/MySQL (real value for outbox patterns).
+10. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
+
+Overlaps with the Hatchet comparison: concurrency strategies, per-queue retention, DLQ, unique jobs, snoozing, sequences. This list also reads like a Postgres-backed job-library matrix (River/Oban-shaped), so it is a useful parity target beyond Hatchet.
