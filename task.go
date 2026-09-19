@@ -227,13 +227,9 @@ type Task[I, O any] struct {
 // capped at 30s, with 10% jitter.
 var defaultBackoff = Exponential(500 * time.Millisecond)
 
-// NewTask creates a task named name. The name is the task's identity (see
-// ID): it must be unique per process and is persisted with run state, so it is
-// part of the storage format — renaming a task orphans its in-flight runs, and
-// registering two different functions under one name silently keeps the last
-// (a common footgun with per-shard closures). To run one task as several steps
-// with per-step behavior, derive the shard from StepFromContext instead of
-// creating a closure per shard; to depend on a task, pass the *Task to StepOn.
+// NewTask creates a task named name. Names must be unique per process and
+// are persisted with run state, so they are part of the storage format:
+// renaming a task orphans its in-flight runs.
 func NewTask[I, O any](name string, fn func(ctx context.Context, in I) (O, error), opts ...TaskOption) *Task[I, O] {
 	cfg := taskConfig{maxAttempts: 1, backoff: defaultBackoff}
 	for _, opt := range opts {
@@ -244,11 +240,6 @@ func NewTask[I, O any](name string, fn func(ctx context.Context, in I) (O, error
 
 // Name returns the task's registered name.
 func (t *Task[I, O]) Name() string { return t.name }
-
-// ID returns the task's stable identity, used to resolve the task after a
-// restart and as the reference when a *Task is passed to Step as a dependency.
-// It is currently the task name; keep it stable across deploys.
-func (t *Task[I, O]) ID() string { return t.name }
 
 // toDef adapts the typed task to the engine's JSON-based definition.
 func (t *Task[I, O]) toDef() *engine.TaskDef {
