@@ -6,35 +6,89 @@ in the loop.
 
 ## Results
 
-Machine: Apple M-series (darwin/arm64), Go 1.26.5, `modernc.org/sqlite`
-v1.59.0 (pure Go driver), storage `Memory()`.
+Machine: **Apple M4, 10 cores** (darwin/arm64), Go 1.26.5, `modernc.org/sqlite`
+(pure Go), storage noted per benchmark. Re-measured after v1.9.
 
 ```
-BenchmarkEnqueueRun-10               171,704 ns/op   (~5,800 enqueues/s)
-BenchmarkThroughput-10               186,430 ns/op   (~5,400 runs/s end-to-end*)
-BenchmarkExecutionSnapshot-10         34,088 ns/op   (~29,000 snapshots/s**)
+BenchmarkEnqueueRun-10        426,655 ns/op  ~2,300 enqueues/s (contended)
+BenchmarkThroughput-10        458,678 ns/op  ~2,180 runs/s (enqueue→execute→Result)
+BenchmarkSaturatedThroughput  2,713,627,250 ns/op for n=5000  ~1,840 runs/s
 ```
 
-Numbers re-measured after the pre-release correctness fixes (statistically
-unchanged from the initial run: enqueue 163→172µs, throughput 172→186µs,
-snapshots 33.4→34.1µs — within run-to-run noise).
+- **`BenchmarkEnqueueRun`** is `Enqueue` in a loop while the scheduler and
+  workers drain the same database, so it is a contended enqueue+execute figure,
+  not clean insert latency.
+- **`BenchmarkThroughput`** awaits each run before enqueuing the next, so it is
+  per-job round-trip latency (~460 µs), *not* saturated throughput.
+- **`BenchmarkSaturatedThroughput`** (Ephemeral/WAL, 64 workers, n=5000) is the
+  real ceiling: enqueue a batch, then wait for all runs. It is the number to
+  compare against a queue's "jobs/sec". At n=1000 it is ~2,460 runs/s (less
+  index depth); on `Memory()` (no WAL) it collapses to ~440 runs/s — use
+  `Ephemeral`/`File` for throughput benchmarks, never `Memory`.
 
-\* enqueue → execute on a worker → await `Result`.
-\** while the engine is concurrently enqueuing and executing a 20,000-run
-write load against the same database.
+## Producer throughput (insert-only)
 
-## Interpretation
+The store layer isolates the insert path (no worker activity). `EnqueueBatch`
+inserts N runs in one transaction; per-run cost falls with batch size.
 
-- **End-to-end throughput ~5–6k runs/s** with JSON (de)serialization on both
-  sides, full state persistence, and per-run transactions. The engine is far
-  from the bottleneck; the JSON adapter and SQLite inserts dominate.
-- **Snapshot reads cost ~33µs during sustained write load** — the
-  "introspection never pauses execution" guarantee in numbers. Readers go
-  through the WAL read pool and are untouched by the writer's transaction
-  stream.
-- Compare intent, not absolutes: Hatchet's published ~10k tasks/s figure is a
-  distributed system over Postgres and HTTP; quacker trades distribution for
-  being ~free to embed.
+SQLite, `ModeEphemeral` (`BenchmarkCreateRunsBatch`, n=100 ≈ 25,700 inserts/s):
+
+```
+n=1     115,240 ns/op   ~115 µs/run   ~8,700/s
+n=10    445,873 ns/op    ~45 µs/run  ~22,400/s
+n=100 3,893,511 ns/op    ~39 µs/run  ~25,700/s
+```
+
+Postgres (`BenchmarkPostgresEnqueueBatch`, far-future runs so nothing executes
+— insert-only; each run is two statements, one `runs` and one `steps`):
+
+```
+n=1      765,653 ns/op   ~766 µs/run   ~1,300/s
+n=10   2,476,807 ns/op   ~248 µs/run   ~4,000/s
+n=100 24,137,270 ns/op   ~241 µs/run   ~4,100/s
+n=1000 254,776,831 ns/op ~255 µs/run   ~3,900/s
+```
+
+Postgres is round-trip bound: two `database/sql` Execs per run (no multi-row
+INSERT or `COPY`). Concurrent producers use the pool and scale
+(`BenchmarkPostgresEnqueueParallel`, 100 runs/op):
+
+```
+-cpu 1    24.55 ms/op  ~4,070/s
+-cpu 4    11.56 ms/op  ~8,650/s
+-cpu 10    8.65 ms/op ~11,560/s
+```
+
+## Comparison to River
+
+River reports **~46,000 jobs/sec on a commodity MacBook Air (M2)** from its
+batch job completer — that is **work/completion** throughput (it batches
+completions and excludes insertion), on Postgres, across many workers.
+
+quacker on Postgres, saturated end-to-end (insert + execute + complete, one
+transaction per completion, single writer):
+
+| | River | quacker |
+|---|---|---|
+| Units | work/s (batch completion) | jobs/s (insert + work + persist) |
+| Storage | Postgres, many connections | SQLite (embedded) or Postgres |
+| Machine | M2 Air, 8 cores | M4, 10 cores |
+| Figure | ~46,000/s | ~1,800/s (Ephemeral, 64 workers) |
+
+So River is roughly **20–25× higher** at completion throughput. The reasons are
+structural, not a constant factor:
+
+- **One completion transaction per run.** River completes jobs in bulk
+  (`UPDATE … WHERE id = ANY`); quacker runs `CompleteStep` per run on SQLite's
+  single writer. This is the dominant cost.
+- **Batch insert via `COPY`.** River's `InsertManyFast` uses Postgres `COPY`;
+  quacker issues one Exec per run for `runs` and one for `steps`.
+- **Concurrency.** River fans work across pooled connections; SQLite permits a
+  single writer (quacker's design trade for embedding).
+
+What quacker buys for that: zero infrastructure (no Postgres, no broker), pure
+Go SQLite, one process, and the same code path across SQLite/Postgres/MySQL.
+The doc's framing stands — compare intent, not absolutes.
 
 ## Batching & parallelism (v0.3)
 
@@ -43,14 +97,9 @@ across every queue in one transaction per scheduler tick (was one per queue).
 The insert win, isolated at the store layer so background execution doesn't
 pollute it (`BenchmarkCreateRunsBatch`, `ModeEphemeral`):
 
-```
-BenchmarkCreateRunsBatch/n=1-10      78,816 ns/op   (~79 µs/run)
-BenchmarkCreateRunsBatch/n=10-10    356,588 ns/op   (~36 µs/run)
-BenchmarkCreateRunsBatch/n=100-10  3,183,910 ns/op  (~32 µs/run)
-```
-
-A 100-run batch is ~2.5× cheaper per run than one run per transaction — the
-fixed commit cost is amortized. The scheduler wakes once per batch.
+See "Producer throughput" above for current numbers: a 100-run batch is ~3×
+cheaper per run than one run per transaction — the fixed commit cost is
+amortized. The scheduler wakes once per batch.
 
 Parallel producers do **not** scale linearly: SQLite allows one writer, so
 `BenchmarkEnqueueParallel` shows per-op latency *rising* with `-cpu` as
@@ -80,10 +129,15 @@ size.
 ## Reproduce
 
 ```sh
-go test -run XXX -bench . -benchtime 3000x ./...
-go test -run XXX -bench 'BenchmarkEnqueueParallel' -benchtime 3000x -cpu 1,4,10 .
-go test -run XXX -bench 'BenchmarkCreateRunsBatch' -benchtime 3000x ./internal/store/
+go test -run XXX -bench . -benchtime 2000x ./...
+go test -run XXX -bench 'BenchmarkSaturatedThroughput' -benchtime 1x .
+go test -run XXX -bench 'BenchmarkEnqueueParallel' -benchtime 2000x -cpu 1,4,10 .
+go test -run XXX -bench 'BenchmarkCreateRunsBatch' -benchtime 300x ./internal/store/
 go test -run XXX -bench 'BenchmarkWideDAGComplete' -benchtime 200x ./internal/store/
+
+# Postgres producer throughput (needs a server):
+QUACKER_TEST_POSTGRES_DSN=... \
+  go test -run XXX -bench 'BenchmarkPostgresEnqueue' -benchtime 50x -cpu 1,4,10 ./postgres/
 ```
 
 Drop `-benchtime` for quicker runs; raise it for stable numbers. Run with

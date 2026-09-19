@@ -144,3 +144,46 @@ func BenchmarkExecutionSnapshot(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkSaturatedThroughput measures jobs/sec at saturation: enqueue a batch
+// of n runs, then wait for every run to finish with all workers and the single
+// writer busy. ns/op covers insert + execution; jobs/sec = n / (ns/op) * 1e9.
+// Run with -benchtime 1x; tweak saturatedN / the queue concurrency to probe the
+// ceiling. Ephemeral (WAL) is used because Memory cannot use WAL and is
+// markedly slower under this read/write mix.
+func BenchmarkSaturatedThroughput(b *testing.B) {
+	const (
+		saturatedN = 5000
+		workers    = 64
+	)
+	q, err := Open(
+		WithStorage(Ephemeral()),
+		WithPollInterval(time.Millisecond),
+		WithQueue("bench", workers),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer q.Close(context.Background())
+
+	task := NewTask("sat", func(ctx context.Context, in benchIn) (benchOut, error) {
+		return benchOut{N: in.N}, nil
+	}, Queue("bench"))
+	inputs := make([]benchIn, saturatedN)
+	for i := range inputs {
+		inputs[i] = benchIn{N: i}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hs, err := EnqueueBatch(context.Background(), q, task, inputs)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, h := range hs {
+			if _, err := h.Result(context.Background()); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.ReportMetric(float64(saturatedN)*1e9/float64(b.Elapsed().Nanoseconds()/int64(b.N)), "runs/s")
+}

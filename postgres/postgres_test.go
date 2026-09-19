@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,7 @@ func testDSN(t *testing.T) string {
 }
 
 // resetDB drops quacker's tables so each test starts clean.
-func resetDB(t *testing.T, dsn string) {
+func resetDB(t testing.TB, dsn string) {
 	t.Helper()
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -883,4 +884,83 @@ func TestPostgresLabelsAndPurge(t *testing.T) {
 	if _, err := q.Execution(ctx, h.RunID()); !errors.Is(err, quacker.ErrNotFound) {
 		t.Fatalf("run still present after purge: %v", err)
 	}
+}
+
+// BenchmarkPostgresEnqueueBatch measures pure producer throughput on
+// Postgres — runs are scheduled far in the future so no worker executes them,
+// isolating the insert path (the comparable number to a job queue's
+// "jobs/sec"). Run with:
+//
+//	QUACKER_TEST_POSTGRES_DSN=... go test -run XXX -bench BenchmarkPostgresEnqueueBatch ./postgres/
+func BenchmarkPostgresEnqueueBatch(b *testing.B) {
+	dsn := os.Getenv("QUACKER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		b.Skip("set QUACKER_TEST_POSTGRES_DSN to run the Postgres benchmarks")
+	}
+	resetDB(b, dsn)
+	q, err := quacker.Open(
+		quacker.WithStorage(quacker.Postgres(dsn)),
+		quacker.WithPollInterval(time.Hour), // don't waste cycles scanning
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer q.Close(context.Background())
+
+	type in struct{ N int }
+	task := quacker.NewTask("pg.bench", func(ctx context.Context, v in) (int, error) { return v.N, nil })
+	future := quacker.WithRunAt(time.Now().Add(24 * time.Hour))
+
+	for _, n := range []int{1, 10, 100, 1000} {
+		inputs := make([]in, n)
+		for i := range inputs {
+			inputs[i] = in{N: i}
+		}
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := quacker.EnqueueBatch(context.Background(), q, task, inputs, future); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkPostgresEnqueueParallel measures producer throughput with concurrent
+// enqueuers (the shape of a "jobs/sec" benchmark). Each iteration inserts 100
+// far-future runs; run with -cpu 1,4,10.
+func BenchmarkPostgresEnqueueParallel(b *testing.B) {
+	dsn := os.Getenv("QUACKER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		b.Skip("set QUACKER_TEST_POSTGRES_DSN to run the Postgres benchmarks")
+	}
+	resetDB(b, dsn)
+	q, err := quacker.Open(
+		quacker.WithStorage(quacker.Postgres(dsn)),
+		quacker.WithPollInterval(time.Hour),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer q.Close(context.Background())
+
+	type in struct{ N int }
+	task := quacker.NewTask("pg.benchpar", func(ctx context.Context, v in) (int, error) { return v.N, nil })
+	inputs := make([]in, 100)
+	for i := range inputs {
+		inputs[i] = in{N: i}
+	}
+	future := quacker.WithRunAt(time.Now().Add(24 * time.Hour))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := quacker.EnqueueBatch(context.Background(), q, task, inputs, future); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
