@@ -72,6 +72,9 @@ type TaskDef struct {
 	// KeyLimit is the max simultaneously-running steps sharing one key;
 	// <1 is normalized to 1 at enqueue when a key is present.
 	KeyLimit int
+	// DeadLetter marks a run dead-lettered when it exhausts retries, so it can
+	// be listed and retried from the dead-letter queue.
+	DeadLetter bool
 }
 
 // StepReq is one step of an enqueue request.
@@ -527,6 +530,36 @@ func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
 	e.publish(runID, "", store.StatusPaused, store.StatusQueued, "", now)
 	e.wakeScheduler()
 	return nil
+}
+
+// DeadLetters lists dead-lettered runs, newest first.
+func (e *Engine) DeadLetters(ctx context.Context, workflow, queue string, limit, offset int) ([]*store.Run, error) {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	return e.st.DeadLetters(ctx, workflow, queue, limit, offset)
+}
+
+// RetryDeadLetter reopens a dead-lettered run and wakes the scheduler.
+func (e *Engine) RetryDeadLetter(ctx context.Context, runID string) error {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	now := e.now().UnixNano()
+	if err := e.st.RetryDeadLetter(ctx, runID, now); err != nil {
+		return err
+	}
+	e.publish(runID, "", store.StatusFailed, store.StatusQueued, "", now)
+	e.wakeScheduler()
+	return nil
+}
+
+// DismissDeadLetter clears a run's dead-letter marker without retrying it.
+func (e *Engine) DismissDeadLetter(ctx context.Context, runID string) error {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	return e.st.DismissDeadLetter(ctx, runID)
 }
 
 // consumePause reports whether stepID was pause-marked, clearing the mark.
@@ -1168,9 +1201,11 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	}()
 
 	bg := context.Background()
-	if halted {
+	if halted && e.runTerminal(st.RunID) {
 		// The run was cancelled or failed while this step sat between claim
-		// and registration: don't start the task's side effects at all.
+		// and registration: don't start the task's side effects at all. The
+		// runTerminal guard matters because a dead-letter retry revives a run:
+		// a tombstone left by the earlier failure must not cancel the step now.
 		now := e.now().UnixNano()
 		cancel()
 		_ = e.st.StepCancelled(bg, st.ID, now)
@@ -1324,7 +1359,11 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 // recordFinalFailure marks a step FAILED, cancels its siblings, and finishes
 // the run — the shared tail of an exhausted failure and a plugin veto.
 func (e *Engine) recordFinalFailure(st *store.Step, errStr string, now time.Time) {
-	res, cerr := e.st.FinalFailStep(context.Background(), st.ID, st.RunID, errStr, now.UnixNano())
+	dead := false
+	if def := e.taskDef(st.Task); def != nil {
+		dead = def.DeadLetter
+	}
+	res, cerr := e.st.FinalFailStep(context.Background(), st.ID, st.RunID, errStr, dead, now.UnixNano())
 	if cerr != nil {
 		e.log.Error("quacker: record failure", "run", st.RunID, "step", st.Name, "err", cerr)
 		return

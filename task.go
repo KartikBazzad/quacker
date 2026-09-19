@@ -36,6 +36,9 @@ type taskConfig struct {
 	uniqueFn    func(engine.Codec, json.RawMessage) string
 	uniqueOn    bool
 	uniqueMode  UniqueConflict
+	deadLetter  bool
+	sequenceFn  func(engine.Codec, json.RawMessage) string
+	sequenceOn  bool
 	wrap        []engine.Middleware
 	labels      []string
 }
@@ -119,6 +122,13 @@ func WithUniqueConflict(m UniqueConflict) TaskOption {
 	return func(c *taskConfig) { c.uniqueOn = true; c.uniqueMode = m }
 }
 
+// WithDeadLetter marks a run dead-lettered when it exhausts its retries, so it
+// appears in DeadLetters and can be retried with RetryDeadLetter. Runs of a
+// task without it that fail are ordinary FAILED runs.
+func WithDeadLetter() TaskOption {
+	return func(c *taskConfig) { c.deadLetter = true }
+}
+
 // Wrap attaches per-task middleware around this task's body. Engine-wide
 // middleware (WithMiddleware / Quacker.Use) still wraps the result, so the
 // order is global → per-task → body.
@@ -187,5 +197,6 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	def.KeyLimit = t.cfg.keyLimit
 	def.Wrappers = t.cfg.wrap
 	def.Labels = t.cfg.labels
+	def.DeadLetter = t.cfg.deadLetter
 	return def
 }

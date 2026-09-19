@@ -111,6 +111,8 @@ type RunSummary struct {
 	CreatedAt   time.Time `json:"created_at"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
+	// DeadLetteredAt is set when the run was dead-lettered (zero otherwise).
+	DeadLetteredAt time.Time `json:"dead_lettered_at,omitempty"`
 }
 
 // RunFilter selects runs for Runs.
@@ -225,14 +227,54 @@ func (q *Quacker) Runs(ctx context.Context, f RunFilter) ([]RunSummary, error) {
 	}
 	out := make([]RunSummary, 0, len(rs))
 	for _, r := range rs {
-		out = append(out, RunSummary{
-			RunID: r.ID, Workflow: r.Workflow, Kind: Kind(r.Kind), Status: Status(r.Status),
-			Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID,
-			CreatedAt: unixToTime(r.CreatedAt), StartedAt: unixToTime(r.StartedAt),
-			CompletedAt: unixToTime(r.CompletedAt),
-		})
+		out = append(out, runSummary(r))
 	}
 	return out, nil
+}
+
+func runSummary(r *store.Run) RunSummary {
+	return RunSummary{
+		RunID: r.ID, Workflow: r.Workflow, Kind: Kind(r.Kind), Status: Status(r.Status),
+		Queue: r.Queue, Priority: r.Priority, Error: r.Error, ParentID: r.ParentID,
+		CreatedAt: unixToTime(r.CreatedAt), StartedAt: unixToTime(r.StartedAt),
+		CompletedAt: unixToTime(r.CompletedAt), DeadLetteredAt: unixToTime(r.DeadLetteredAt),
+	}
+}
+
+// DeadLetterFilter selects dead-lettered runs for DeadLetters.
+type DeadLetterFilter struct {
+	// Workflow and Queue, when non-empty, restrict the result.
+	Workflow string
+	Queue    string
+	// Limit caps the result (default 100); Offset skips that many.
+	Limit  int
+	Offset int
+}
+
+// DeadLetters lists runs dead-lettered by a task with WithDeadLetter, newest
+// first.
+func (q *Quacker) DeadLetters(ctx context.Context, f DeadLetterFilter) ([]RunSummary, error) {
+	rs, err := q.eng.DeadLetters(ctx, f.Workflow, f.Queue, f.Limit, f.Offset)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RunSummary, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, runSummary(r))
+	}
+	return out, nil
+}
+
+// RetryDeadLetter reopens a dead-lettered run in place and returns it to the
+// queue. It returns ErrNotDeadLetter if the run exists but is not
+// dead-lettered, and ErrNotFound if it does not exist.
+func (q *Quacker) RetryDeadLetter(ctx context.Context, runID string) error {
+	return q.eng.RetryDeadLetter(ctx, runID)
+}
+
+// DismissDeadLetter clears a run's dead-letter marker without retrying it.
+func (q *Quacker) DismissDeadLetter(ctx context.Context, runID string) error {
+	return q.eng.DismissDeadLetter(ctx, runID)
 }
 
 // Metrics returns run counts by status and per-queue depths.

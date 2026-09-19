@@ -600,6 +600,42 @@ func TestPostgresEnqueueTx(t *testing.T) {
 	}
 }
 
+// TestPostgresDeadLetter: an opted-in run that exhausts retries is
+// dead-lettered and can be retried to success.
+func TestPostgresDeadLetter(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	q := openQ(t, dsn)
+	ctx := context.Background()
+	var calls atomic.Int32
+	task := quacker.NewTask("pg.dlq", func(ctx context.Context, in string) (string, error) {
+		if calls.Add(1) == 1 {
+			return "", errors.New("boom")
+		}
+		return in, nil
+	}, quacker.WithDeadLetter())
+
+	h, err := quacker.Enqueue(ctx, q, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, h.RunID())
+		return err == nil && s.Status == quacker.StatusFailed
+	})
+	letters, err := q.DeadLetters(ctx, quacker.DeadLetterFilter{Workflow: "pg.dlq"})
+	if err != nil || len(letters) != 1 || letters[0].RunID != h.RunID() {
+		t.Fatalf("dead letters = %+v err=%v", letters, err)
+	}
+	if err := q.RetryDeadLetter(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, h.RunID())
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

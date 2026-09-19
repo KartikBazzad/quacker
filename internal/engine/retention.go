@@ -15,6 +15,8 @@ type RetentionPolicy struct {
 	Statuses []string
 	// Queue, when non-empty, restricts the policy to that queue.
 	Queue string
+	// ExcludeDeadLettered keeps dead-lettered runs out of the policy.
+	ExcludeDeadLettered bool
 	// KeepLogs retains the logs of purged runs (and skips the orphan sweep).
 	KeepLogs bool
 	Interval time.Duration
@@ -46,10 +48,11 @@ func (e *Engine) runRetention(p *RetentionPolicy) {
 	}
 	cutoff := e.now().Add(-p.OlderThan).UnixNano()
 	res, err := e.st.PurgeRuns(e.ctx, store.PurgeOptions{
-		Before:   cutoff,
-		Statuses: p.Statuses,
-		Queue:    p.Queue,
-		KeepLogs: p.KeepLogs,
+		Before:              cutoff,
+		Statuses:            p.Statuses,
+		Queue:               p.Queue,
+		ExcludeDeadLettered: p.ExcludeDeadLettered,
+		KeepLogs:            p.KeepLogs,
 	})
 	if err != nil {
 		if e.ctx.Err() == nil {

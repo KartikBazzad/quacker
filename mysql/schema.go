@@ -155,3 +155,8 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 const myMigration4 = `
 ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
 `
+
+// myMigration5 adds the dead-letter marker.
+const myMigration5 = `
+ALTER TABLE runs ADD COLUMN dead_lettered_at BIGINT NOT NULL DEFAULT 0;
+`

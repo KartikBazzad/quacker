@@ -256,6 +256,8 @@ type PurgeOptions struct {
 	Statuses []string
 	// Queue, when non-empty, restricts deletion to runs in that queue.
 	Queue string
+	// ExcludeDeadLettered, when true, never deletes dead-lettered runs.
+	ExcludeDeadLettered bool
 	// KeepLogs retains the logs of purged runs and skips the orphan sweep.
 	KeepLogs bool
 	// BatchSize bounds rows deleted per transaction. <= 0 uses 500.
@@ -297,7 +299,7 @@ func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, 
 	}
 	var res PurgeResult
 	for {
-		n, r, err := s.purgeRunBatch(ctx, statuses, opts.Queue, opts.Before, batch, opts.KeepLogs)
+		n, r, err := s.purgeRunBatch(ctx, statuses, opts.Queue, opts.ExcludeDeadLettered, opts.Before, batch, opts.KeepLogs)
 		if err != nil {
 			return res, err
 		}
@@ -336,6 +338,117 @@ func (s *Store) PurgeRuns(ctx context.Context, opts PurgeOptions) (PurgeResult, 
 	return res, nil
 }
 
+// DeadLetters lists dead-lettered runs (dead_lettered_at > 0), newest first,
+// optionally filtered by workflow and/or queue.
+func (s *Store) DeadLetters(ctx context.Context, workflow, queue string, limit, offset int) ([]*Run, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	where := []string{"dead_lettered_at > 0"}
+	var args []any
+	if workflow != "" {
+		where = append(where, "workflow=?")
+		args = append(args, workflow)
+	}
+	if queue != "" {
+		where = append(where, "queue=?")
+		args = append(args, queue)
+	}
+	args = append(args, limit, offset)
+	rows, err := s.read.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE `+
+		strings.Join(where, " AND ")+` ORDER BY dead_lettered_at DESC LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RetryDeadLetter reopens a dead-lettered run in place: its steps return to
+// QUEUED (BLOCKED when they still have dependencies), attempts and errors are
+// cleared, and the dead-letter marker is removed, so the run is claimed again.
+func (s *Store) RetryDeadLetter(ctx context.Context, runID string, now int64) error {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return err
+	}
+	var status string
+	var dead int64
+	err = tx.queryRow(ctx, `SELECT status, dead_lettered_at FROM runs WHERE id=?`, runID).Scan(&status, &dead)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if status != StatusFailed || dead == 0 {
+		return ErrNotDeadLetter
+	}
+	// Reset steps, restoring BLOCKED for those with dependencies.
+	rows, err := tx.query(ctx, `SELECT id, depends_on FROM steps WHERE run_id=?`, runID)
+	if err != nil {
+		return err
+	}
+	type stepRow struct {
+		id   string
+		deps string
+	}
+	var stepRows []stepRow
+	for rows.Next() {
+		var sr stepRow
+		if err := rows.Scan(&sr.id, &sr.deps); err != nil {
+			rows.Close()
+			return err
+		}
+		stepRows = append(stepRows, sr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, sr := range stepRows {
+		st := StatusQueued
+		if len(decodeList(sr.deps)) > 0 {
+			st = StatusBlocked
+		}
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, attempts=0, error='', output=NULL,
+			started_at=0, completed_at=0, claimed_at=0, worker_id='', lease_expires_at=0,
+			resume_at=0, wait_kind='', wait_event='', run_at=? WHERE id=?`, st, now, sr.id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, attempts=0, error='', output=NULL,
+		started_at=0, completed_at=0, run_at=?, dead_lettered_at=0 WHERE id=?`,
+		StatusQueued, now, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DismissDeadLetter clears a run's dead-letter marker without retrying it.
+func (s *Store) DismissDeadLetter(ctx context.Context, runID string) error {
+	res, err := s.write.ExecContext(ctx, `UPDATE runs SET dead_lettered_at=0 WHERE id=? AND dead_lettered_at>0`, runID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotDeadLetter
+	}
+	return nil
+}
+
 // purgeEvents deletes up to batch events older than before.
 func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64, error) {
 	tx, err := s.beginTx(ctx)
@@ -357,7 +470,7 @@ func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64
 
 // purgeRunBatch deletes one batch of eligible runs (and their steps/logs) in
 // a single transaction, returning how many runs were selected.
-func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, queue string, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
+func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, queue string, excludeDead bool, before int64, batch int, keepLogs bool) (int, PurgeResult, error) {
 	var res PurgeResult
 	tx, err := s.beginTx(ctx)
 	if err != nil {
@@ -365,17 +478,22 @@ func (s *Store) purgeRunBatch(ctx context.Context, statuses []string, queue stri
 	}
 	defer tx.Rollback()
 
+	dead := 0
+	if excludeDead {
+		dead = 1
+	}
 	q := `SELECT r.id FROM runs r
 		WHERE r.status IN (` + placeholders(len(statuses)) + `)
 		  AND r.completed_at > 0 AND r.completed_at < ?
 		  AND (? = '' OR r.queue = ?)
+		  AND (? = 0 OR r.dead_lettered_at = 0)
 		  AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id AND s.status = ?)
 		ORDER BY r.completed_at LIMIT ?`
-	args := make([]any, 0, len(statuses)+5)
+	args := make([]any, 0, len(statuses)+6)
 	for _, st := range statuses {
 		args = append(args, st)
 	}
-	args = append(args, before, queue, queue, StatusRunning, batch)
+	args = append(args, before, queue, queue, dead, StatusRunning, batch)
 	rows, err := tx.query(ctx, q, args...)
 	if err != nil {
 		return 0, res, err
@@ -909,7 +1027,7 @@ func (s *Store) ParkStep(ctx context.Context, stepID string, errMsg string, next
 
 // FinalFailStep marks a step FAILED, cancels all remaining steps of the run,
 // and fails the run (v1 policy: a failed step fails the whole run).
-func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg string, now int64) (CompleteResult, error) {
+func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg string, deadLetter bool, now int64) (CompleteResult, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return CompleteResult{}, err
@@ -958,8 +1076,16 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		}
 	}
 
-	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, error=?, completed_at=?, unique_key=NULL WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
-		StatusFailed, errMsg, now, runID); err != nil {
+	runSet := `status=?, error=?, completed_at=?, unique_key=NULL`
+	runArgs := []any{StatusFailed, errMsg, now}
+	if deadLetter {
+		runSet += `, dead_lettered_at=?`
+		runArgs = append(runArgs, now)
+	}
+	runArgs = append(runArgs, runID)
+	if _, err := tx.exec(ctx, `UPDATE runs SET `+runSet+
+		` WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+		runArgs...); err != nil {
 		return CompleteResult{}, err
 	}
 	res.RunTerminal, res.RunStatus, res.RunError = true, StatusFailed, errMsg

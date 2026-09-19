@@ -35,6 +35,9 @@ var (
 	ErrRunRunning = store.ErrRunRunning
 	// ErrRunTerminal is returned by Snooze (and PauseRun) for a finished run.
 	ErrRunTerminal = store.ErrRunTerminal
+	// ErrNotDeadLetter is returned by RetryDeadLetter/DismissDeadLetter for a
+	// run that is not dead-lettered.
+	ErrNotDeadLetter = store.ErrNotDeadLetter
 )
 
 // RunHandle tracks an enqueued run.

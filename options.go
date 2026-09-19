@@ -249,11 +249,12 @@ func WithMetricsInterval(d time.Duration) Option {
 func WithRetention(p RetentionPolicy) Option {
 	return func(c *config) {
 		c.retentions = append(c.retentions, &engine.RetentionPolicy{
-			OlderThan: p.OlderThan,
-			Statuses:  statusStrings(p.Statuses),
-			Queue:     p.Queue,
-			KeepLogs:  p.KeepLogs,
-			Interval:  p.Interval,
+			OlderThan:           p.OlderThan,
+			Statuses:            statusStrings(p.Statuses),
+			Queue:               p.Queue,
+			ExcludeDeadLettered: p.ExcludeDeadLettered,
+			KeepLogs:            p.KeepLogs,
+			Interval:            p.Interval,
 		})
 	}
 }

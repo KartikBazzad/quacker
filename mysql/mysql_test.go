@@ -522,6 +522,39 @@ func TestMySQLEnqueueTx(t *testing.T) {
 	}
 }
 
+func TestMySQLDeadLetter(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	q := openQ(t, dsn)
+	ctx := context.Background()
+	var calls atomic.Int32
+	task := quacker.NewTask("my.dlq", func(ctx context.Context, in string) (string, error) {
+		if calls.Add(1) == 1 {
+			return "", errors.New("boom")
+		}
+		return in, nil
+	}, quacker.WithDeadLetter())
+
+	h, err := quacker.Enqueue(ctx, q, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, h.RunID())
+		return err == nil && s.Status == quacker.StatusFailed
+	})
+	if letters, err := q.DeadLetters(ctx, quacker.DeadLetterFilter{Workflow: "my.dlq"}); err != nil || len(letters) != 1 {
+		t.Fatalf("dead letters = %+v err=%v", letters, err)
+	}
+	if err := q.RetryDeadLetter(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := q.Execution(ctx, h.RunID())
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)

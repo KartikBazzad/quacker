@@ -17,6 +17,8 @@ var (
 	ErrRunRunning = errors.New("quacker: run is running")
 	// ErrRunTerminal reports that a run has already finished.
 	ErrRunTerminal = errors.New("quacker: run is terminal")
+	// ErrNotDeadLetter reports that a run is not dead-lettered.
+	ErrNotDeadLetter = errors.New("quacker: run is not dead-lettered")
 )
 
 // Run is a row in the runs table. All timestamps are unix nanoseconds
@@ -52,6 +54,9 @@ type Run struct {
 	UniqueKey string
 	// PausedAt is when the run was paused (unix nanos; 0 when not paused).
 	PausedAt int64
+	// DeadLetteredAt is when the run was dead-lettered (unix nanos; 0 when
+	// not). Set for an opted-in task's run when it exhausts retries.
+	DeadLetteredAt int64
 }
 
 // Step is a row in the steps table. A single-task run has exactly one step.
@@ -184,7 +189,7 @@ func decodeList(s string) []string {
 
 const runCols = `id, workflow, kind, status, queue, priority, input, output, error,
 	attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent,
-	COALESCE(unique_key, ''), paused_at`
+	COALESCE(unique_key, ''), paused_at, dead_lettered_at`
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
@@ -196,7 +201,7 @@ func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	err := row.Scan(&r.ID, &r.Workflow, &r.Kind, &r.Status, &r.Queue, &r.Priority,
 		&r.Input, &r.Output, &r.Error, &r.Attempts, &r.MaxAttempts,
 		&r.RunAt, &r.CreatedAt, &r.StartedAt, &r.CompletedAt, &r.ConcurrencyKey, &r.ParentID, &r.TraceParent,
-		&r.UniqueKey, &r.PausedAt)
+		&r.UniqueKey, &r.PausedAt, &r.DeadLetteredAt)
 	if err != nil {
 		return nil, err
 	}

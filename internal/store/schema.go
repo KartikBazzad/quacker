@@ -242,6 +242,12 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 );
 `
 
+// migration16 adds the dead-letter marker: set when an opted-in task's run
+// exhausts its retries.
+const migration16 = `
+ALTER TABLE runs ADD COLUMN dead_lettered_at BIGINT NOT NULL DEFAULT 0;
+`
+
 // migration15 adds run-level pause: a run paused by the user holds its claims
 // until resumed (paused_at is informational).
 const migration15 = `
@@ -264,6 +270,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 13, SQL: migration13},
 	{Version: 14, SQL: migration14},
 	{Version: 15, SQL: migration15},
+	{Version: 16, SQL: migration16},
 }
 
 // init validates the built-in migration list's invariant before any Open can

@@ -23,6 +23,8 @@ type PurgeOptions struct {
 	Statuses []Status
 	// Queue, when non-empty, restricts the purge to runs in that queue.
 	Queue string
+	// ExcludeDeadLettered keeps dead-lettered runs out of the purge.
+	ExcludeDeadLettered bool
 	// KeepLogs retains the logs of purged runs (and skips the orphan sweep).
 	// The default (false) deletes them with the run.
 	KeepLogs bool
@@ -44,6 +46,8 @@ type RetentionPolicy struct {
 	// several WithRetention policies (a global one plus per-queue overrides)
 	// for different cutoffs per queue.
 	Queue string
+	// ExcludeDeadLettered keeps dead-lettered runs out of this policy.
+	ExcludeDeadLettered bool
 	// KeepLogs retains the logs of purged runs.
 	KeepLogs bool
 	// Interval is how often the purge runs; <= 0 uses one minute (min 1s).
@@ -59,11 +63,12 @@ func (q *Quacker) Purge(ctx context.Context, opts PurgeOptions) (PurgeResult, er
 		return PurgeResult{}, errors.New("quacker: Purge requires OlderThan > 0")
 	}
 	return q.st.PurgeRuns(ctx, store.PurgeOptions{
-		Before:    time.Now().Add(-opts.OlderThan).UnixNano(),
-		Statuses:  statusStrings(opts.Statuses),
-		Queue:     opts.Queue,
-		KeepLogs:  opts.KeepLogs,
-		BatchSize: opts.BatchSize,
+		Before:              time.Now().Add(-opts.OlderThan).UnixNano(),
+		Statuses:            statusStrings(opts.Statuses),
+		Queue:               opts.Queue,
+		ExcludeDeadLettered: opts.ExcludeDeadLettered,
+		KeepLogs:            opts.KeepLogs,
+		BatchSize:           opts.BatchSize,
 	})
 }
 
