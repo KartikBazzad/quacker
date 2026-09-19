@@ -24,14 +24,33 @@ type builder struct {
 }
 
 func main() {
-	out := flag.String("out", "public", "output directory")
+	mode := flag.String("mode", "site", "site = HTML site into public/; wiki = GitHub-wiki markdown")
+	out := flag.String("out", "", "output directory (default: public/ or wiki/)")
 	root := flag.String("root", "..", "quacker repository root")
 	flag.Parse()
+	if *out == "" {
+		if *mode == "wiki" {
+			*out = "wiki"
+		} else {
+			*out = "public"
+		}
+	}
 	b := &builder{out: *out, root: *root}
-	if err := b.build(); err != nil {
+	var err error
+	switch *mode {
+	case "site":
+		err = b.build()
+	case "wiki":
+		err = b.buildWiki()
+	default:
+		err = fmt.Errorf("unknown mode %q", *mode)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("docsite: %d pages -> %s\n", len(pages), filepath.Join(*out, "index.html"))
+	if *mode == "site" {
+		fmt.Printf("docsite: %d pages -> %s\n", len(pages), filepath.Join(*out, "index.html"))
+	}
 }
 
 func (b *builder) build() error {
