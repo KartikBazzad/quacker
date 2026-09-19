@@ -232,6 +232,15 @@ ALTER TABLE runs ADD COLUMN unique_key TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_unique ON runs (workflow, unique_key);
 `
 
+// migration14 adds queue pauses: a paused queue's steps are not claimed until
+// the row is deleted, enforced directly in the claim predicate.
+const migration14 = `
+CREATE TABLE IF NOT EXISTS queue_pauses (
+	queue     TEXT PRIMARY KEY,
+	paused_at INTEGER NOT NULL
+);
+`
+
 var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -246,6 +255,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 11, SQL: migration11},
 	{Version: 12, SQL: migration12},
 	{Version: 13, SQL: migration13},
+	{Version: 14, SQL: migration14},
 }
 
 // init validates the built-in migration list's invariant before any Open can

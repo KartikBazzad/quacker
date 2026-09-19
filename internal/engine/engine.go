@@ -179,6 +179,9 @@ type Engine struct {
 	// (and clears) its tombstone right after registering, closing the
 	// claim/cancel race window.
 	haltSteps map[string]struct{}
+	// paused holds queue names paused locally (a fast-path skip in tick); the
+	// claim SQL is the source of truth for other engines.
+	paused map[string]struct{}
 
 	wg      sync.WaitGroup // in-flight step executions
 	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
@@ -290,6 +293,7 @@ func New(o Options) (*Engine, error) {
 		waiters:      map[string]*Waiter{},
 		cancels:      map[string]context.CancelFunc{},
 		haltSteps:    map[string]struct{}{},
+		paused:       map[string]struct{}{},
 		wake:         make(chan struct{}, 1),
 
 		middleware:      append([]Middleware(nil), o.Middleware...),
@@ -357,6 +361,13 @@ func (e *Engine) Start() {
 		for _, q := range queues {
 			e.ensureQueue(q)
 		}
+	}
+	if paused, err := e.st.PausedQueues(context.Background()); err == nil {
+		e.mu.Lock()
+		for _, name := range paused {
+			e.paused[name] = struct{}{}
+		}
+		e.mu.Unlock()
 	}
 	if e.logStorage {
 		e.logWG.Add(1)
@@ -464,6 +475,36 @@ func (e *Engine) SetRateLimit(name string, n int64, window time.Duration) {
 	}
 	q.rateLimit.Store(n)
 	q.rateWindow.Store(int64(window))
+}
+
+// PauseQueue stops claims from a queue; running steps finish and new work
+// accumulates QUEUED. Persisted, so every engine sharing the store observes
+// it.
+func (e *Engine) PauseQueue(ctx context.Context, name string) error {
+	if err := e.st.PauseQueue(ctx, name); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.paused[name] = struct{}{}
+	e.mu.Unlock()
+	return nil
+}
+
+// ResumeQueue re-enables claims for a queue and wakes the scheduler.
+func (e *Engine) ResumeQueue(ctx context.Context, name string) error {
+	if err := e.st.ResumeQueue(ctx, name); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	delete(e.paused, name)
+	e.mu.Unlock()
+	e.wakeScheduler()
+	return nil
+}
+
+// PausedQueues returns the paused queue names.
+func (e *Engine) PausedQueues(ctx context.Context) ([]string, error) {
+	return e.st.PausedQueues(ctx)
 }
 
 // ensureQueue creates a queue with default concurrency if it doesn't exist;
@@ -877,6 +918,10 @@ func (e *Engine) tick() {
 	for q, qs := range e.queues {
 		snapshot[q] = qs
 	}
+	paused := make(map[string]struct{}, len(e.paused))
+	for q := range e.paused {
+		paused[q] = struct{}{}
+	}
 	e.mu.Unlock()
 
 	now := e.now().UnixNano()
@@ -885,6 +930,9 @@ func (e *Engine) tick() {
 	var reqs []store.QueueClaim
 	budget := make(map[string]*queueState, len(snapshot))
 	for q, qs := range snapshot {
+		if _, ok := paused[q]; ok {
+			continue // paused locally; the claim SQL also blocks it cluster-wide
+		}
 		slots := int(qs.concurrency.Load()) - int(qs.inFlight.Load())
 		if slots <= 0 {
 			continue

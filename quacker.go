@@ -122,6 +122,23 @@ func (q *Quacker) Cancel(runID string) error { return q.eng.Cancel(runID) }
 // SetQueue adjusts a queue's concurrency at runtime.
 func (q *Quacker) SetQueue(name string, concurrency int) { q.eng.SetQueue(name, concurrency) }
 
+// PauseQueue stops claims from a queue until ResumeQueue. Running steps finish
+// and new runs accumulate QUEUED. The pause is persisted, so every engine on
+// the database observes it. Pausing an unknown queue is allowed.
+func (q *Quacker) PauseQueue(ctx context.Context, name string) error {
+	return q.eng.PauseQueue(ctx, name)
+}
+
+// ResumeQueue re-enables claims for a queue and wakes the scheduler.
+func (q *Quacker) ResumeQueue(ctx context.Context, name string) error {
+	return q.eng.ResumeQueue(ctx, name)
+}
+
+// PausedQueues returns the paused queue names.
+func (q *Quacker) PausedQueues(ctx context.Context) ([]string, error) {
+	return q.eng.PausedQueues(ctx)
+}
+
 // Use appends engine-wide middleware at runtime; safe before or after work
 // starts. The first registered middleware is the outermost wrapper.
 func (q *Quacker) Use(mw ...Middleware) { q.eng.Use(mw...) }

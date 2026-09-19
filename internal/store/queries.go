@@ -453,6 +453,44 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 	}}, now, workerLabels, workerID, leaseUntil)
 }
 
+// queuePausedGate excludes steps whose queue is paused. It is enforced in the
+// claim SQL (the candidate SELECT and both UPDATE arms) so a pause holds
+// across instances and restarts without an engine sync loop.
+const queuePausedGate = `NOT EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = steps.queue)`
+
+// PauseQueue stops a queue from being claimed. Enqueues, crons, and events
+// still create runs, which accumulate QUEUED until ResumeQueue.
+func (s *Store) PauseQueue(ctx context.Context, name string) error {
+	q := s.be.UpsertSQL("queue_pauses", []string{"queue", "paused_at"}, []string{"queue"}, []string{"paused_at"})
+	_, err := s.write.ExecContext(ctx, q, name, nowUnix())
+	return err
+}
+
+// ResumeQueue re-enables claims for a queue. Resuming an unpaused queue is a
+// no-op.
+func (s *Store) ResumeQueue(ctx context.Context, name string) error {
+	_, err := s.write.ExecContext(ctx, `DELETE FROM queue_pauses WHERE queue=?`, name)
+	return err
+}
+
+// PausedQueues returns the paused queue names, sorted.
+func (s *Store) PausedQueues(ctx context.Context) ([]string, error) {
+	rows, err := s.read.QueryContext(ctx, `SELECT queue FROM queue_pauses ORDER BY queue`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 // ClaimDueMulti claims due steps across several queues in one write
 // transaction — one transaction per scheduler tick rather than one per queue.
 // Each queue is capped at its own limit and rate window, and the per-key gate
@@ -559,6 +597,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			(status = ? AND run_at <= ?)
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
 		) AND `+s.keyGate+`
+		AND `+queuePausedGate+`
 		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
@@ -593,14 +632,14 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate,
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate,
 				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND `+s.keyGate,
+				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate,
 				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {

@@ -147,3 +147,11 @@ const pgMigration5 = `
 ALTER TABLE runs ADD COLUMN unique_key TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_unique ON runs (workflow, unique_key);
 `
+
+// pgMigration6 adds queue pauses.
+const pgMigration6 = `
+CREATE TABLE IF NOT EXISTS queue_pauses (
+	queue     TEXT PRIMARY KEY,
+	paused_at BIGINT NOT NULL
+);
+`

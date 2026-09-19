@@ -291,6 +291,40 @@ func TestPostgresUniqueReuse(t *testing.T) {
 	}
 }
 
+// TestPostgresQueuePause: a pause set by one engine holds claims on another,
+// and a resume from either engine releases them.
+func TestPostgresQueuePause(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	if err := a.PauseQueue(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	task := quacker.NewTask("pg.paused", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.Queue("shared"))
+	h, err := quacker.Enqueue(ctx, b, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if snap, err := a.Execution(ctx, h.RunID()); err != nil || snap.Status != quacker.StatusQueued {
+		t.Fatalf("run = %+v err=%v, want QUEUED", snap, err)
+	}
+	if paused, err := b.PausedQueues(ctx); err != nil || len(paused) != 1 {
+		t.Fatalf("b paused = %v err=%v, want [shared]", paused, err)
+	}
+	if err := b.ResumeQueue(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Result(ctx); err != nil || out != "x" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

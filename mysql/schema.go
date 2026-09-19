@@ -142,3 +142,11 @@ const myMigration2 = `
 ALTER TABLE runs ADD COLUMN unique_key VARCHAR(255) NULL;
 CREATE UNIQUE INDEX uq_runs_unique ON runs (workflow, unique_key);
 `
+
+// myMigration3 adds queue pauses.
+const myMigration3 = `
+CREATE TABLE IF NOT EXISTS queue_pauses (
+	queue     VARCHAR(255) NOT NULL PRIMARY KEY,
+	paused_at BIGINT NOT NULL
+) ENGINE=InnoDB;
+`

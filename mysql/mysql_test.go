@@ -243,6 +243,35 @@ func TestMySQLUniqueReuse(t *testing.T) {
 	}
 }
 
+func TestMySQLQueuePause(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	if err := a.PauseQueue(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	task := quacker.NewTask("my.paused", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.Queue("shared"))
+	h, err := quacker.Enqueue(ctx, b, task, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if snap, err := a.Execution(ctx, h.RunID()); err != nil || snap.Status != quacker.StatusQueued {
+		t.Fatalf("run = %+v err=%v, want QUEUED", snap, err)
+	}
+	if err := b.ResumeQueue(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Result(ctx); err != nil || out != "x" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)
