@@ -11,9 +11,11 @@ quacker follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`.
 - **From `v1.0`**, a breaking change to the public API requires a major bump;
   additive, backward-compatible changes are minor; fixes are patch.
 
-No git remote or release tags are configured yet, so nothing is published to a
-module proxy — the commit history is the record of record. Tags will start at
-`v1.0.0` once a remote exists and the API is frozen.
+Releases are published from `github.com/KartikBazzad/quacker` and tagged
+`vMAJOR.MINOR.PATCH`. The first release is **v1.0.0**, which froze the public
+API; subsequent additive changes are minor (`v1.1.0`, …) and fixes are patch.
+Tagging a commit makes it fetchable as a module version via the Go module
+proxy.
 
 ## Public API surface
 

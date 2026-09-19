@@ -9,7 +9,7 @@ primitives (unique jobs, snooze, queue pause, run pause/resume), v1.6
 v1.7 (encrypted payloads, ephemeral runs), v1.8 (concurrency cancel
 strategies), and v1.9 (multiple/shared concurrency keys). The v1.0 stability
 gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
-complete; release tags wait on a git remote.
+complete; the first release, v1.0.0, is tagged and published.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -145,7 +145,7 @@ Acceptance: sub-second cron fires repeatedly; a cron persisted by one process
 fires after a reopen with only `Register`; emit dispatches to every bound
 task with the payload, unbound emits still persist, `Off` unbinds; persisted
 bindings re-arm; retention purges events. All pass under `-race`.
-Semver tags remain pending a git remote (none is configured).
+Semver tags are now published (the first is v1.0.0).
 
 ---
 
@@ -235,12 +235,12 @@ Children are ordinary runs and are aged/purged independently.
 
 ---
 
-## v1.0 — stability (✅ DONE — release tags pending a remote)
+## v1.0 — stability (✅ DONE)
 
 - ✅ **API freeze + semver discipline** documented in
   [STABILITY.md](STABILITY.md): the public surface, storage-format
-  compatibility, and the extension points. Release tags can't be published
-  until a git remote exists.
+  compatibility, and the extension points. Published as the first release,
+  v1.0.0.
 - ✅ **Chaos suite for File mode** (`chaos_test.go`): a child process enqueues a
   workload, is SIGKILLed mid-execution, and the parent reopens the database and
   asserts every run recovers to SUCCEEDED (at-least-once, no lost terminal
