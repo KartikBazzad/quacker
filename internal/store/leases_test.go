@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"github.com/kartikbazzad/quacker/driver"
 	"testing"
 	"time"
 )
@@ -40,7 +41,7 @@ func runStatus(t *testing.T, s *Store, id string) string {
 }
 
 func TestLeaseStampHeartbeatReap(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestLeaseStampHeartbeatReap(t *testing.T) {
 }
 
 func TestInterruptWorkerIsScoped(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func TestInterruptWorkerIsScoped(t *testing.T) {
 }
 
 func TestFireCronOnce(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}

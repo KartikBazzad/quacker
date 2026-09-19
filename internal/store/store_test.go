@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/kartikbazzad/quacker/driver"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func TestMigrateBaselinesLegacyShape(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(Config{Mode: ModeFile, Path: p})
+	s, err := Open(driver.Config{Mode: driver.ModeFile, Path: p})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +67,7 @@ func TestMigrationV2Columns(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(Config{Mode: ModeFile, Path: p})
+	s, err := Open(driver.Config{Mode: driver.ModeFile, Path: p})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestMigrationV2Columns(t *testing.T) {
 // fires — ckptCount increments once per tick, so a 10ms interval must
 // produce at least one tick well inside 3s.
 func TestCheckpointLoopTicks(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral, CheckpointInterval: 10 * time.Millisecond})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral, CheckpointInterval: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +141,7 @@ func TestFileDSNRejectsMetachars(t *testing.T) {
 		":memory:",
 		"./:memory:",
 	} {
-		if _, err := Open(Config{Mode: ModeFile, Path: p}); err == nil ||
+		if _, err := Open(driver.Config{Mode: driver.ModeFile, Path: p}); err == nil ||
 			!strings.Contains(err.Error(), "invalid path") {
 			t.Fatalf("Open(%q) err = %v, want an invalid-path error", p, err)
 		}
@@ -149,7 +150,7 @@ func TestFileDSNRejectsMetachars(t *testing.T) {
 
 // TestMigrationV3Index: migration 3 creates the retention index.
 func TestMigrationV3Index(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func TestMigrationV3Index(t *testing.T) {
 
 // TestMigrationV4Tables: migration 4 creates the events tables.
 func TestMigrationV4Tables(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func TestMigrationV4Tables(t *testing.T) {
 // TestMigrationV5Journal: migration 5 adds the durable-execution columns and
 // the journal table.
 func TestMigrationV5Journal(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +205,7 @@ func TestMigrationV5Journal(t *testing.T) {
 // TestJournalRoundTripAndResumeClaim: the journal persists in call order, and
 // a SUSPENDED step is claimed again by the resume arm without a new attempt.
 func TestJournalRoundTripAndResumeClaim(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +286,7 @@ func TestDepsJSONRoundTrip(t *testing.T) {
 // TestCreateRunsAndClaimDueMulti: a batch insert, then one transaction claims
 // across two queues.
 func TestCreateRunsAndClaimDueMulti(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +330,7 @@ func TestCreateRunsAndClaimDueMulti(t *testing.T) {
 // SUSPENDED step is failed with its run rather than left orphaned.
 func TestRecoverInterruptedFailsSuspendedStep(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "suspend.db")
-	s1, err := Open(Config{Mode: ModeFile, Path: p})
+	s1, err := Open(driver.Config{Mode: driver.ModeFile, Path: p})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +351,7 @@ func TestRecoverInterruptedFailsSuspendedStep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(Config{Mode: ModeFile, Path: p, RecoverRunningOnBoot: false})
+	s2, err := Open(driver.Config{Mode: driver.ModeFile, Path: p, RecoverRunningOnBoot: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +407,7 @@ func TestMigrationV7ConvertsCommaDeps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := Open(Config{Mode: ModeFile, Path: p})
+	s, err := Open(driver.Config{Mode: driver.ModeFile, Path: p})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +424,7 @@ func TestMigrationV7ConvertsCommaDeps(t *testing.T) {
 // TestMigrationV6ParentAndListChildren: migration 6 adds parent_id, and
 // ListChildren/ListRuns(parent) find a run's children.
 func TestMigrationV6ParentAndListChildren(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +457,7 @@ func TestMigrationV6ParentAndListChildren(t *testing.T) {
 // TestDeliverEventWakesWaitersAndRespectsTimeout: DeliverEvent wakes undone
 // waits and sets them QUEUED, but never resurrects one already timed out.
 func TestDeliverEventWakesWaitersAndRespectsTimeout(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +507,7 @@ func TestDeliverEventWakesWaitersAndRespectsTimeout(t *testing.T) {
 // TestPurgeRejectsBadOptions: a non-terminal status or a zero cutoff is
 // refused, so a purge can never touch live work by accident.
 func TestPurgeRejectsBadOptions(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +525,7 @@ func TestPurgeRejectsBadOptions(t *testing.T) {
 // RUNNING is not eligible (the cancel-window guard); once the step settles it
 // is.
 func TestPurgeSkipsRunWithRunningStep(t *testing.T) {
-	s, err := Open(Config{Mode: ModeEphemeral})
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/kartikbazzad/quacker"
+	"github.com/kartikbazzad/quacker/driver"
 	"github.com/kartikbazzad/quacker/internal/store"
 )
 
@@ -251,7 +252,7 @@ func TestPostgresTwoEngines(t *testing.T) {
 func TestPostgresLeaseReap(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)
-	s, err := store.Open(store.Config{Mode: store.ModePostgres, DSN: dsn})
+	s, err := store.Open(driver.Config{Driver: "postgres", DSN: dsn})
 	if err != nil {
 		t.Fatal(err)
 	}

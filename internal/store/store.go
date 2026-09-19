@@ -14,57 +14,12 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/kartikbazzad/quacker/driver"
 )
-
-// Mode selects how the underlying database is stored.
-type Mode int
-
-const (
-	// ModeMemory keeps all state in a pure in-memory SQLite database
-	// (shared-cache). Nothing touches the filesystem. Note: WAL is not
-	// available to :memory: databases, so reads may briefly contend with
-	// writes; busy_timeout retries absorb this.
-	ModeMemory Mode = iota
-	// ModeEphemeral uses a temporary file with WAL journaling and
-	// synchronous=OFF. State is discarded (file deleted) on Close. This is
-	// the default: same zero-durability semantics as memory, but readers are
-	// truly non-blocking, because :memory: databases cannot use WAL.
-	ModeEphemeral
-	// ModeFile persists to a user-supplied path with WAL journaling.
-	ModeFile
-	// ModePostgres persists to a PostgreSQL database (requires importing the
-	// postgres driver package).
-	ModePostgres
-)
-
-// Config configures the storage backend.
-type Config struct {
-	Mode Mode
-	// Path is the database file path; required for ModeFile, ignored otherwise.
-	Path string
-	// DSN is the connection string for ModePostgres, ignored otherwise.
-	DSN string
-	// DB, when non-nil, is an existing pool owned by the caller. Dialects with
-	// a single-pool model (Postgres) reuse it instead of dialing DSN, and
-	// cleanup must leave it open. Dialects that require their own pool layout
-	// (SQLite's single writer + reader pool) reject it.
-	DB *sql.DB
-	// RecoverRunningOnBoot (persistent modes only): when true, runs left
-	// RUNNING or INTERRUPTED by a previous process are re-queued on Open; when
-	// false they are marked FAILED. Default true. In a multi-instance Postgres
-	// deployment this is unsafe until step leases land; it is single-instance
-	// recovery.
-	RecoverRunningOnBoot bool
-	// CheckpointInterval is how often WAL modes (Ephemeral, File) run a
-	// passive wal_checkpoint to bound WAL growth. <=0 uses the 60s
-	// default; values below 10ms are clamped to 10ms. ModeMemory and
-	// ModePostgres never checkpoint.
-	CheckpointInterval time.Duration
-}
 
 const (
 	// defaultCheckpointInterval bounds WAL growth when CheckpointInterval
@@ -77,7 +32,7 @@ const (
 
 // Store wraps a database. It is safe for concurrent use.
 type Store struct {
-	be      Backend
+	be      driver.Backend
 	write   *dbConn // all mutations go through here
 	read    *dbConn // introspection queries
 	cleanup func() error
@@ -91,7 +46,7 @@ type Store struct {
 }
 
 // Open opens (and migrates) the database described by cfg.
-func Open(cfg Config) (*Store, error) {
+func Open(cfg driver.Config) (*Store, error) {
 	be, err := backendFor(cfg)
 	if err != nil {
 		return nil, err
@@ -232,13 +187,17 @@ func (s *Store) ReapExpired(ctx context.Context, now int64, limit int) (int64, e
 		return 0, err
 	}
 	defer tx.Rollback()
+	// The extra SELECT layer is required by MySQL, which rejects LIMIT in a
+	// subquery of the same table being modified (error 1093); a derived table
+	// is materialized first. It is valid on every dialect.
 	res, err := tx.exec(ctx, `UPDATE steps SET
 		status=?, run_at=?, worker_id='', lease_expires_at=0
 		WHERE id IN (
-			SELECT s.id FROM steps s JOIN runs r ON r.id=s.run_id
-			WHERE s.status=? AND s.lease_expires_at > 0 AND s.lease_expires_at < ?
-			  AND r.status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')
-			LIMIT ?)`,
+			SELECT id FROM (
+				SELECT s.id AS id FROM steps s JOIN runs r ON r.id=s.run_id
+				WHERE s.status=? AND s.lease_expires_at > 0 AND s.lease_expires_at < ?
+				  AND r.status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')
+				LIMIT ?) AS reap)`,
 		StatusQueued, now, StatusRunning, now, limit)
 	if err != nil {
 		return 0, err

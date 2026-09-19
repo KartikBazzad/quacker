@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/kartikbazzad/quacker/driver"
 )
 
 // Status values shared by runs and steps.
@@ -98,14 +100,6 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_run ON logs (run_id, seq);
 `
-
-// Migration is one schema change applied atomically with its version row.
-// Migrations run in list order; each applies only when its version is ahead
-// of the database's recorded version. Version numbers are per-dialect.
-type Migration struct {
-	Version int
-	SQL     string
-}
 
 // migration 2 adds per-key concurrency and rate-limit columns. The key
 // gate counts RUNNING rows sharing a step's concurrency_key; claimed_at is
@@ -224,7 +218,7 @@ CREATE INDEX IF NOT EXISTS idx_steps_run_status ON steps (run_id, status);
 CREATE INDEX IF NOT EXISTS idx_steps_run_name   ON steps (run_id, name);
 `
 
-var sqliteMigrations = []Migration{
+var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
 	{Version: 3, SQL: migration3},
@@ -238,24 +232,11 @@ var sqliteMigrations = []Migration{
 	{Version: 11, SQL: migration11},
 }
 
-// init validates each migration list's invariant before any Open can rely on
-// it: non-empty, with strictly ascending versions. migrate assumes the last
-// entry is the maximum version and applies entries in list order — a
-// duplicate or out-of-order version would silently skip or misorder DDL, so
-// it panics at startup instead.
+// init validates the built-in migration list's invariant before any Open can
+// rely on it; drivers validate their own lists the same way.
 func init() {
-	checkMigrations(sqliteMigrations)
-}
-
-func checkMigrations(ms []Migration) {
-	if len(ms) == 0 {
-		panic("quacker: store: no schema migrations defined")
-	}
-	for i := 1; i < len(ms); i++ {
-		if ms[i].Version <= ms[i-1].Version {
-			panic(fmt.Sprintf("quacker: store: migrations out of order: version %d follows version %d",
-				ms[i].Version, ms[i-1].Version))
-		}
+	if err := driver.ValidateMigrations(sqliteMigrations); err != nil {
+		panic(err)
 	}
 }
 

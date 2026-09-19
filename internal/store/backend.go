@@ -4,68 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/kartikbazzad/quacker/driver"
 )
 
-// Backend is the dialect-specific half of the store: connection setup, SQL
-// placeholder syntax, DDL, and the few dialect-only operations. It is an
-// internal seam, not public API — driver packages (e.g. postgres) register a
-// Backend from init, and users opt in with a blank import.
-type Backend interface {
-	Name() string
-	// OpenPools establishes the writer and reader pools plus any dialect
-	// resources (file lock, keeper pool). The returned cleanup releases them
-	// in the correct order.
-	OpenPools(ctx context.Context, cfg Config) (write, read *sql.DB, cleanup func() error, err error)
-	// Rebind rewrites '?' placeholders to the dialect's form (identity for
-	// SQLite, '$n' for Postgres).
-	Rebind(query string) string
-	// Migrations returns the ordered DDL for this dialect. Version numbers are
-	// per-dialect (a database is never both SQLite and Postgres).
-	Migrations() []Migration
-	// MigrateLock serializes concurrent migrations across processes. It runs
-	// inside each per-version transaction (no-op when the database is private
-	// to one process).
-	MigrateLock(ctx context.Context, tx *sql.Tx) error
-	// ClaimLock serializes claim transactions across processes. It runs at the
-	// start of ClaimDueMulti (no-op for single-process SQLite).
-	ClaimLock(ctx context.Context, tx *sql.Tx) error
-	// RunLock locks a run row for the duration of a DAG-mutating transaction
-	// (complete/fail/cancel), serializing per-run decisions across processes
-	// (no-op for single-process SQLite).
-	RunLock(ctx context.Context, tx *sql.Tx, runID string) error
-	// SupportsLeases reports whether step leases are meaningful for this
-	// dialect (true for networked Postgres; false for single-process SQLite).
-	SupportsLeases() bool
-	// SupportsCheckpoint reports whether the WAL checkpoint loop applies.
-	SupportsCheckpoint(cfg Config) bool
-	// RecoverOnBoot reports whether boot-time recovery of RUNNING rows applies.
-	RecoverOnBoot(cfg Config) bool
-	// LabelGate is the SQL predicate (containing one '?' for the worker-labels
-	// JSON) admitting a step only when its labels are a subset of the worker's.
-	LabelGate() string
-	// BlockedDependentsSQL returns a statement ('?' placeholders: runID,
-	// blockedStatus, dependency name) selecting the BLOCKED steps of a run
-	// that depend on the named step, returning id, name, depends_on. It lets
-	// completion inspect only the direct dependents of the step that finished
-	// rather than every blocked step in the run.
-	BlockedDependentsSQL() string
-}
-
-var backends = map[string]Backend{}
-
-// RegisterBackend installs a dialect. Called by driver packages from init;
-// SQLite registers itself in this package.
-func RegisterBackend(b Backend) { backends[b.Name()] = b }
-
-func backendFor(cfg Config) (Backend, error) {
-	name := "sqlite"
-	if cfg.Mode == ModePostgres {
-		name = "postgres"
+// backendFor selects the driver for cfg: an explicit Config.Driver wins,
+// otherwise the built-in SQLite modes map to "sqlite".
+func backendFor(cfg driver.Config) (driver.Backend, error) {
+	name := cfg.Driver
+	if name == "" {
+		name = "sqlite"
 	}
-	b, ok := backends[name]
+	b, ok := driver.Lookup(name)
 	if !ok {
-		return nil, fmt.Errorf("quacker: storage backend %q is not registered; import its driver package (e.g. _ %q)",
-			name, "github.com/kartikbazzad/quacker/postgres")
+		return nil, fmt.Errorf("quacker: storage driver %q is not registered; import its driver package (e.g. _ %q)",
+			name, "github.com/kartikbazzad/quacker/"+name)
 	}
 	return b, nil
 }
@@ -74,7 +27,7 @@ func backendFor(cfg Config) (Backend, error) {
 // query layer keeps using '?' placeholders everywhere.
 type dbConn struct {
 	*sql.DB
-	be Backend
+	be driver.Backend
 }
 
 func (c *dbConn) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
@@ -92,7 +45,7 @@ func (c *dbConn) QueryRowContext(ctx context.Context, q string, args ...any) *sq
 // txn is a *sql.Tx whose statements are rebound for the dialect.
 type txn struct {
 	*sql.Tx
-	be Backend
+	be driver.Backend
 }
 
 func (t *txn) exec(ctx context.Context, q string, args ...any) (sql.Result, error) {

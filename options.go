@@ -7,14 +7,15 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/kartikbazzad/quacker/driver"
 	"github.com/kartikbazzad/quacker/internal/engine"
-	"github.com/kartikbazzad/quacker/internal/store"
 )
 
 // Storage selects where run state lives. Construct with Memory, Ephemeral,
-// File, or Postgres.
+// File, Postgres, or Driver (for a third-party storage driver).
 type Storage struct {
-	mode    store.Mode
+	driver  string // registered driver name; "" means the built-in SQLite driver
+	mode    driver.Mode
 	path    string
 	dsn     string
 	db      *sql.DB
@@ -25,41 +26,55 @@ type Storage struct {
 // written to the filesystem and everything is lost on Close. Note: SQLite
 // :memory: databases cannot use WAL journaling, so under heavy write load
 // introspection reads may briefly wait for an in-flight write transaction.
-func Memory() Storage { return Storage{mode: store.ModeMemory} }
+func Memory() Storage { return Storage{mode: driver.ModeMemory} }
 
 // Ephemeral keeps state in a temporary WAL-backed database that is deleted
 // on Close. Durability semantics are identical to Memory (nothing survives
 // the process), but readers never block the write path. This is the default.
-func Ephemeral() Storage { return Storage{mode: store.ModeEphemeral, recover: true} }
+func Ephemeral() Storage { return Storage{mode: driver.ModeEphemeral, recover: true} }
 
 // File persists state to path (WAL mode) so runs survive restarts. Runs
 // interrupted by a previous process are handled according to
 // RecoverRunningOnBoot.
-func File(path string) Storage { return Storage{mode: store.ModeFile, path: path, recover: true} }
+func File(path string) Storage { return Storage{mode: driver.ModeFile, path: path, recover: true} }
 
 // Postgres persists state to the database at dsn. It requires importing the
 // driver package for its side effect:
 //
 //	import _ "github.com/kartikbazzad/quacker/postgres"
 //
-// Without that import, Open fails with a clear "backend not registered" error.
-// Single-instance only for now: boot recovery and shutdown assume one engine
-// owns the database; multi-instance leases are a later phase.
+// Without that import, Open fails with a clear "driver not registered" error.
 func Postgres(dsn string) Storage {
-	return Storage{mode: store.ModePostgres, dsn: dsn, recover: true}
+	return Storage{driver: "postgres", dsn: dsn, recover: true}
 }
 
-// PostgresWithDB persists state to an existing database/sql pool that the
-// caller owns instead of one quacker dials from a DSN. Open it with the pgx
-// stdlib driver, e.g.:
+// Driver selects a registered storage driver by name with a connection string.
+// Register drivers from a package init (see the driver package); the built-in
+// names are "sqlite", "postgres", and "mysql". Without the driver's import,
+// Open fails with a clear "driver is not registered" error.
+//
+//	q, _ := quacker.Open(quacker.WithStorage(quacker.Driver("mysql", dsn)))
+func Driver(name, dsn string) Storage {
+	return Storage{driver: name, dsn: dsn, recover: true}
+}
+
+// WithDB hands quacker an existing database/sql pool the caller owns instead
+// of one it dials from a DSN. Supported by single-pool drivers (Postgres via
+// the pgx stdlib driver, MySQL via the go-sql-driver). quacker runs its
+// migrations on the pool but never closes it, so the caller keeps using it
+// after Quacker.Close; pool sizing and lifetime stay the caller's.
 //
 //	db, _ := sql.Open("pgx", dsn)
-//	q, _ := quacker.Open(quacker.WithStorage(quacker.PostgresWithDB(db)))
-//
-// quacker runs its migrations on the pool but never closes it, so the caller
-// keeps using it after q.Close. Pool sizing and lifetime stay the caller's.
+//	q, _ := quacker.Open(quacker.WithStorage(quacker.Postgres("").WithDB(db)))
+func (s Storage) WithDB(db *sql.DB) Storage {
+	s.db = db
+	return s
+}
+
+// PostgresWithDB persists state to an existing pgx-backed pool that the caller
+// owns; shorthand for Postgres("").WithDB(db).
 func PostgresWithDB(db *sql.DB) Storage {
-	return Storage{mode: store.ModePostgres, db: db, recover: true}
+	return Postgres("").WithDB(db)
 }
 
 // RecoverRunningOnBoot configures startup recovery for File storage: when
@@ -71,7 +86,7 @@ func (s Storage) RecoverRunningOnBoot(requeue bool) Storage {
 }
 
 type config struct {
-	storage            store.Config
+	storage            driver.Config
 	checkpointInterval time.Duration
 	queues             map[string]int
 	rates              map[string]rateConfig
@@ -102,7 +117,7 @@ type Option func(*config)
 // WithStorage selects the storage backend (default Ephemeral).
 func WithStorage(s Storage) Option {
 	return func(c *config) {
-		c.storage = store.Config{Mode: s.mode, Path: s.path, DSN: s.dsn, DB: s.db, RecoverRunningOnBoot: s.recover}
+		c.storage = driver.Config{Driver: s.driver, Mode: s.mode, Path: s.path, DSN: s.dsn, DB: s.db, RecoverRunningOnBoot: s.recover}
 	}
 }
 

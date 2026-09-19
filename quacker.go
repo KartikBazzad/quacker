@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/kartikbazzad/quacker/driver"
 	"github.com/kartikbazzad/quacker/internal/engine"
 	"github.com/kartikbazzad/quacker/internal/store"
 )
@@ -33,7 +34,7 @@ type Quacker struct {
 // Open starts an engine. State is stored per WithStorage (default
 // Ephemeral: a temp-file WAL database deleted on Close).
 func Open(opts ...Option) (*Quacker, error) {
-	cfg := config{storage: store.Config{Mode: store.ModeEphemeral, RecoverRunningOnBoot: true}}
+	cfg := config{storage: driver.Config{Mode: driver.ModeEphemeral, RecoverRunningOnBoot: true}}
 	for _, opt := range opts {
 		opt(&cfg)
 	}

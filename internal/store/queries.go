@@ -164,8 +164,11 @@ func (s *Store) purgeEvents(ctx context.Context, before int64, batch int) (int64
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Derived table: MySQL rejects LIMIT in a subquery of the same table being
+	// modified (error 1093).
 	r, err := tx.exec(ctx, `DELETE FROM events WHERE seq IN (
-		SELECT seq FROM events WHERE created_at > 0 AND created_at < ? LIMIT ?)`, before, batch)
+		SELECT seq FROM (SELECT seq FROM events WHERE created_at > 0 AND created_at < ? LIMIT ?) AS e)`,
+		before, batch)
 	if err != nil {
 		return 0, err
 	}
@@ -246,8 +249,10 @@ func (s *Store) purgeOrphanLogs(ctx context.Context, batch int) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Derived table: MySQL rejects LIMIT in a subquery of the same table being
+	// modified (error 1093).
 	r, err := tx.exec(ctx, `DELETE FROM logs WHERE seq IN (
-		SELECT seq FROM logs WHERE run_id NOT IN (SELECT id FROM runs) LIMIT ?)`, batch)
+		SELECT seq FROM (SELECT seq FROM logs WHERE run_id NOT IN (SELECT id FROM runs) LIMIT ?) AS l)`, batch)
 	if err != nil {
 		return 0, err
 	}
@@ -701,11 +706,16 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		return CompleteResult{}, err
 	}
 	res := CompleteResult{StepDone: true}
-	rows, err := tx.query(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED') AND id != ? RETURNING id, name`,
-		StatusCancelled, now, runID, stepID)
+	// SELECT then UPDATE rather than UPDATE ... RETURNING: MySQL has no
+	// UPDATE ... RETURNING. RunLock serializes concurrent completions of this
+	// run, so the rows cannot change between the two statements.
+	rows, err := tx.query(ctx, `SELECT id, name FROM steps
+		WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED') AND id != ?`,
+		runID, stepID)
 	if err != nil {
 		return CompleteResult{}, err
 	}
+	var cancelledIDs []string
 	for rows.Next() {
 		var id, name string
 		if err := rows.Scan(&id, &name); err != nil {
@@ -714,8 +724,20 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		}
 		res.CancelledSteps = append(res.CancelledSteps, name)
 		res.CancelledStepIDs = append(res.CancelledStepIDs, id)
+		cancelledIDs = append(cancelledIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return CompleteResult{}, err
 	}
 	rows.Close()
+	if len(cancelledIDs) > 0 {
+		args := append([]any{StatusCancelled, now}, argsAny(cancelledIDs)...)
+		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE id IN (`+
+			placeholders(len(cancelledIDs))+`)`, args...); err != nil {
+			return CompleteResult{}, err
+		}
+	}
 
 	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		StatusFailed, errMsg, now, runID); err != nil {
@@ -1022,9 +1044,11 @@ func (s *Store) KnownQueues(ctx context.Context) ([]string, error) {
 // Cron rows.
 
 func (s *Store) UpsertCron(ctx context.Context, c *Cron) error {
-	_, err := s.write.ExecContext(ctx, `INSERT INTO crons (id, name, spec, task, input, next_at, created_at)
-		VALUES (?,?,?,?,?,?,?)
-		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec, task=excluded.task, input=excluded.input, next_at=excluded.next_at`,
+	q := s.be.UpsertSQL("crons",
+		[]string{"id", "name", "spec", "task", "input", "next_at", "created_at"},
+		[]string{"name"},
+		[]string{"spec", "task", "input", "next_at"})
+	_, err := s.write.ExecContext(ctx, q,
 		c.Name, c.Name, c.Spec, c.Task, c.Input, c.NextAt, c.CreatedAt)
 	return err
 }
@@ -1105,10 +1129,11 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]*Event, error) {
 // UpsertEventSub persists an event→task binding (idempotent per pair).
 func (s *Store) UpsertEventSub(ctx context.Context, sub *EventSub) error {
 	id := sub.Event + "/" + sub.Task
-	_, err := s.write.ExecContext(ctx, `INSERT INTO event_subscriptions (id, event, task, created_at)
-		VALUES (?,?,?,?)
-		ON CONFLICT(event, task) DO UPDATE SET created_at=excluded.created_at`,
-		id, sub.Event, sub.Task, sub.CreatedAt)
+	q := s.be.UpsertSQL("event_subscriptions",
+		[]string{"id", "event", "task", "created_at"},
+		[]string{"event", "task"},
+		[]string{"created_at"})
+	_, err := s.write.ExecContext(ctx, q, id, sub.Event, sub.Task, sub.CreatedAt)
 	return err
 }
 

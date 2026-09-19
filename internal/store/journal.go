@@ -177,30 +177,49 @@ func (s *Store) DeliverEvent(ctx context.Context, name string, payload []byte, n
 		`INSERT INTO events (name, payload, created_at) VALUES (?,?,?)`, name, payload, now); err != nil {
 		return 0, err
 	}
-	rows, err := tx.query(ctx, `UPDATE step_journal SET payload=?, done=TRUE
+	// SELECT candidates then UPDATE one by one rather than UPDATE ...
+	// RETURNING: MySQL has no UPDATE ... RETURNING. The done=FALSE guard on
+	// each UPDATE makes the wake exactly-once even if a concurrent delivery
+	// touches the same row.
+	rows, err := tx.query(ctx, `SELECT step_id, idx FROM step_journal
 		WHERE kind=? AND done=FALSE AND event=?
 		  AND step_id IN (
 			SELECT st.id FROM steps st JOIN runs r ON r.id = st.run_id
-			WHERE r.status NOT IN (?,?,?,?))
-		RETURNING step_id`,
-		payload, JournalWait, name, StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted)
+			WHERE r.status NOT IN (?,?,?,?))`,
+		JournalWait, name, StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted)
 	if err != nil {
 		return 0, err
 	}
-	var ids []string
+	type waitRow struct {
+		id  string
+		idx int64
+	}
+	var candidates []waitRow
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var w waitRow
+		if err := rows.Scan(&w.id, &w.idx); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		ids = append(ids, id)
+		candidates = append(candidates, w)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return 0, err
 	}
 	rows.Close()
+	var ids []string
+	for _, w := range candidates {
+		res, err := tx.exec(ctx, `UPDATE step_journal SET payload=?, done=TRUE
+			WHERE step_id=? AND idx=? AND done=FALSE`, payload, w.id, w.idx)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			continue
+		}
+		ids = append(ids, w.id)
+	}
 	for _, id := range ids {
 		if _, err := tx.exec(ctx, `UPDATE steps SET status=?, resume_at=0, wait_kind='', wait_event='' WHERE id=? AND status=?`,
 			StatusQueued, id, StatusSuspended); err != nil {

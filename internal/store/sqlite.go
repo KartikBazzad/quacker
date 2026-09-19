@@ -11,9 +11,11 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" driver
+
+	"github.com/kartikbazzad/quacker/driver"
 )
 
-func init() { RegisterBackend(sqliteBackend{}) }
+func init() { driver.RegisterBackend(sqliteBackend{}) }
 
 // sqliteBackend is quacker's built-in, default backend: pure-Go SQLite with a
 // single writer connection and a read-only reader pool.
@@ -23,7 +25,7 @@ func (sqliteBackend) Name() string { return "sqlite" }
 
 func (sqliteBackend) Rebind(q string) string { return q }
 
-func (sqliteBackend) Migrations() []Migration { return sqliteMigrations }
+func (sqliteBackend) Migrations() []driver.Migration { return sqliteMigrations }
 
 func (sqliteBackend) MigrateLock(context.Context, *sql.Tx) error { return nil }
 
@@ -36,9 +38,9 @@ func (sqliteBackend) RunLock(context.Context, *sql.Tx, string) error { return ni
 // requeueing a live long-running step.
 func (sqliteBackend) SupportsLeases() bool { return false }
 
-func (sqliteBackend) SupportsCheckpoint(cfg Config) bool { return cfg.Mode != ModeMemory }
+func (sqliteBackend) SupportsCheckpoint(cfg driver.Config) bool { return cfg.Mode != driver.ModeMemory }
 
-func (sqliteBackend) RecoverOnBoot(cfg Config) bool { return cfg.Mode == ModeFile }
+func (sqliteBackend) RecoverOnBoot(cfg driver.Config) bool { return cfg.Mode == driver.ModeFile }
 
 func (sqliteBackend) LabelGate() string {
 	return `NOT EXISTS (
@@ -53,28 +55,35 @@ func (sqliteBackend) BlockedDependentsSQL() string {
 		  AND EXISTS (SELECT 1 FROM json_each(steps.depends_on) AS d WHERE d.value=?)`
 }
 
+// UpsertSQL uses the SQLite/Postgres ON CONFLICT ... DO UPDATE syntax.
+func (sqliteBackend) UpsertSQL(table string, insertCols, conflictCols, updateCols []string) string {
+	return driver.OnConflictUpsert(table, insertCols, conflictCols, updateCols)
+}
+
 var memSerial atomic.Int64
 
 // unique gives each in-memory database a distinct name so two quacker
 // instances in one process don't share a cache.
-func (c Config) unique() int64 { return memSerial.Add(1) }
+// uniqueSerial gives each in-memory database a distinct name so two quacker
+// instances in one process don't share a cache.
+func uniqueSerial() int64 { return memSerial.Add(1) }
 
 // dsn returns the writer DSN, reader DSN, and (for ModeEphemeral) the temp
 // file path to remove on Close.
-func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
+func sqliteDSN(c driver.Config) (wdsn, rdsn, tmpPath string, err error) {
 	common := "_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)"
 	switch c.Mode {
-	case ModeMemory:
+	case driver.ModeMemory:
 		// A named in-memory database with a shared cache so both pools see
 		// the same data. journal_mode defaults to MEMORY there.
 		// No _txlock=immediate here (unlike the file modes): on a shared
 		// cache an immediate write txn's RESERVED lock makes same-cache
 		// readers hit SQLITE_LOCKED, which bypasses busy_timeout. WAL/file
 		// readers don't contend, so _txlock=immediate is used only there.
-		name := fmt.Sprintf("quacker-%d-%d", os.Getpid(), c.unique())
+		name := fmt.Sprintf("quacker-%d-%d", os.Getpid(), uniqueSerial())
 		dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&%s", name, common)
 		return dsn, dsn, "", nil
-	case ModeEphemeral:
+	case driver.ModeEphemeral:
 		tmp, err := os.CreateTemp("", "quacker-*.db")
 		if err != nil {
 			return "", "", "", fmt.Errorf("quacker: create temp db: %w", err)
@@ -85,7 +94,7 @@ func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
 		}
 		dsn := fmt.Sprintf("file:%s?%s&_pragma=journal_mode(WAL)&_pragma=synchronous(0)&_txlock=immediate", path, common)
 		return dsn, dsn, path, nil
-	case ModeFile:
+	case driver.ModeFile:
 		if c.Path == "" {
 			return "", "", "", fmt.Errorf("quacker: storage.File requires a path")
 		}
@@ -121,18 +130,18 @@ func (c Config) dsn() (wdsn, rdsn, tmpPath string, err error) {
 // OpenPools opens the writer (single connection), reader (query_only), and —
 // for ModeMemory — a keeper connection that keeps the shared-cache database
 // alive. For ModeFile it takes the kernel file lock first.
-func (b sqliteBackend) OpenPools(ctx context.Context, cfg Config) (w, r *sql.DB, cleanup func() error, err error) {
+func (b sqliteBackend) OpenPools(ctx context.Context, cfg driver.Config) (w, r *sql.DB, cleanup func() error, err error) {
 	if cfg.DB != nil {
 		return nil, nil, nil, fmt.Errorf("quacker: SQLite storage does not accept an external *sql.DB; use File or Memory")
 	}
-	wdsn, rdsn, tmpPath, derr := cfg.dsn()
+	wdsn, rdsn, tmpPath, derr := sqliteDSN(cfg)
 	if derr != nil {
 		return nil, nil, nil, derr
 	}
-	wal := cfg.Mode != ModeMemory
+	wal := cfg.Mode != driver.ModeMemory
 
 	var lock *os.File
-	if cfg.Mode == ModeFile {
+	if cfg.Mode == driver.ModeFile {
 		lock, err = acquireFileLock(cfg.Path)
 		if err != nil {
 			return nil, nil, nil, err
@@ -164,7 +173,7 @@ func (b sqliteBackend) OpenPools(ctx context.Context, cfg Config) (w, r *sql.DB,
 	}
 
 	var keep *sql.DB
-	if cfg.Mode == ModeMemory {
+	if cfg.Mode == driver.ModeMemory {
 		// Pin the shared-cache in-memory database with its own dedicated
 		// pool: such a database lives only while at least one connection is
 		// open, and borrowing from the single-slot write pool would starve

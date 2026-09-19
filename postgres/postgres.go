@@ -23,10 +23,10 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 
-	"github.com/kartikbazzad/quacker/internal/store"
+	"github.com/kartikbazzad/quacker/driver"
 )
 
-func init() { store.RegisterBackend(pgBackend{}) }
+func init() { driver.RegisterBackend(pgBackend{}) }
 
 type pgBackend struct{}
 
@@ -48,8 +48,8 @@ func (pgBackend) Rebind(q string) string {
 // cache stays bounded.
 var rebindCache sync.Map
 
-func (pgBackend) Migrations() []store.Migration {
-	return []store.Migration{
+func (pgBackend) Migrations() []driver.Migration {
+	return []driver.Migration{
 		{Version: 1, SQL: pgSchema},
 		{Version: 2, SQL: pgMigration2},
 		{Version: 3, SQL: pgMigration3},
@@ -88,12 +88,12 @@ func (pgBackend) RunLock(ctx context.Context, tx *sql.Tx, runID string) error {
 // worker identity + leases are how crashed nodes' work is recovered.
 func (pgBackend) SupportsLeases() bool { return true }
 
-func (pgBackend) SupportsCheckpoint(store.Config) bool { return false }
+func (pgBackend) SupportsCheckpoint(driver.Config) bool { return false }
 
 // RecoverOnBoot is false: boot recovery that re-queues every RUNNING row would
 // steal a peer node's in-flight work. The lease reaper recovers a crashed
 // node's steps instead.
-func (pgBackend) RecoverOnBoot(store.Config) bool { return false }
+func (pgBackend) RecoverOnBoot(driver.Config) bool { return false }
 
 // LabelGate: labels are stored as JSON text; cast to jsonb and test subset
 // membership with jsonb_array_elements_text.
@@ -110,7 +110,13 @@ func (pgBackend) BlockedDependentsSQL() string {
 		  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(steps.depends_on::jsonb) AS d(value) WHERE d.value=?)`
 }
 
-func (pgBackend) OpenPools(ctx context.Context, cfg store.Config) (w, r *sql.DB, cleanup func() error, err error) {
+// UpsertSQL uses the ON CONFLICT ... DO UPDATE syntax Postgres shares with
+// SQLite.
+func (pgBackend) UpsertSQL(table string, insertCols, conflictCols, updateCols []string) string {
+	return driver.OnConflictUpsert(table, insertCols, conflictCols, updateCols)
+}
+
+func (pgBackend) OpenPools(ctx context.Context, cfg driver.Config) (w, r *sql.DB, cleanup func() error, err error) {
 	// Reuse a caller-owned pool: Postgres uses one pool for both reads and
 	// writes, so it can be shared directly. Migrations still run against it,
 	// but cleanup must leave it open for the caller.

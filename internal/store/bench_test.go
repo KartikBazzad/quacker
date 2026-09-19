@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"github.com/kartikbazzad/quacker/driver"
 	"testing"
 )
 
@@ -21,7 +22,7 @@ func BenchmarkWideDAGComplete(b *testing.B) {
 				// this run's n rows (a shared store would accumulate rows and
 				// distort the measurement). Setup is outside the timer.
 				b.StopTimer()
-				s, err := Open(Config{Mode: ModeEphemeral})
+				s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -65,7 +66,7 @@ func chainRun(n int, now int64, seq int) (*Run, []*Step) {
 func BenchmarkCreateRunsBatch(b *testing.B) {
 	for _, n := range []int{1, 10, 100} {
 		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			s, err := Open(Config{Mode: ModeEphemeral})
+			s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
 			if err != nil {
 				b.Fatal(err)
 			}
