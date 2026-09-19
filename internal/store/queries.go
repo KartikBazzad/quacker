@@ -458,6 +458,10 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 // across instances and restarts without an engine sync loop.
 const queuePausedGate = `NOT EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = steps.queue)`
 
+// runNotPausedGate excludes steps whose run is paused. Like the queue gate it
+// lives in the claim SQL so a run pause holds across instances.
+const runNotPausedGate = `NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = steps.run_id AND r.status = 'PAUSED')`
+
 // PauseQueue stops a queue from being claimed. Enqueues, crons, and events
 // still create runs, which accumulate QUEUED until ResumeQueue.
 func (s *Store) PauseQueue(ctx context.Context, name string) error {
@@ -598,6 +602,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
 		) AND `+s.keyGate+`
 		AND `+queuePausedGate+`
+		AND `+runNotPausedGate+`
 		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
@@ -632,14 +637,14 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate,
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate,
 				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate,
+				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate,
 				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {
@@ -1037,6 +1042,106 @@ func (s *Store) Snooze(ctx context.Context, runID string, until int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// PauseRun marks a non-terminal run PAUSED so its steps are not claimed until
+// ResumeRun. It returns the ids of still-RUNNING steps (for the engine to
+// interrupt) and the previous status; changed is false when the run was
+// already paused. A terminal run returns ErrRunTerminal.
+func (s *Store) PauseRun(ctx context.Context, runID string, now int64) (running []string, prevStatus string, changed bool, err error) {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer tx.Rollback()
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return nil, "", false, err
+	}
+	var status string
+	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", false, ErrNotFound
+	}
+	if err != nil {
+		return nil, "", false, err
+	}
+	if IsTerminal(status) {
+		return nil, status, false, ErrRunTerminal
+	}
+	if status == StatusPaused {
+		return nil, status, false, nil
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, paused_at=? WHERE id=?`,
+		StatusPaused, now, runID); err != nil {
+		return nil, "", false, err
+	}
+	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, "", false, err
+		}
+		running = append(running, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", false, err
+	}
+	return running, status, true, tx.Commit()
+}
+
+// ResumeRun clears a run's PAUSED status, returning it to QUEUED so its steps
+// are claimable again. A non-paused run is a no-op; a terminal run returns
+// ErrRunTerminal.
+func (s *Store) ResumeRun(ctx context.Context, runID string, now int64) error {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return err
+	}
+	var status string
+	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if IsTerminal(status) {
+		return ErrRunTerminal
+	}
+	if status != StatusPaused {
+		return tx.Commit()
+	}
+	// Resume means "continue now": reset the run and its QUEUED steps to the
+	// current time so a run paused while scheduled ahead starts immediately.
+	if _, err := tx.exec(ctx, `UPDATE steps SET run_at=? WHERE run_id=? AND status=?`,
+		now, runID, StatusQueued); err != nil {
+		return err
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, run_at=?, paused_at=0 WHERE id=?`,
+		StatusQueued, now, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RequeuePausedStep returns a step whose execution was interrupted by a run
+// pause to QUEUED, refunding its attempt (a pause is not a real attempt). The
+// run stays PAUSED, so the step is not claimed until ResumeRun.
+func (s *Store) RequeuePausedStep(ctx context.Context, stepID string, now int64) error {
+	_, err := s.write.ExecContext(ctx, `UPDATE steps SET
+		status=?, claimed_at=0, worker_id='', lease_expires_at=0,
+		attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE attempts END
+		WHERE id=? AND status=?`,
+		StatusQueued, stepID, StatusRunning)
+	return err
 }
 
 // ---------------------------------------------------------------------------

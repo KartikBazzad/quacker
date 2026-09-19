@@ -182,6 +182,9 @@ type Engine struct {
 	// paused holds queue names paused locally (a fast-path skip in tick); the
 	// claim SQL is the source of truth for other engines.
 	paused map[string]struct{}
+	// pauseSteps marks steps whose run was paused while they ran: the executor
+	// requeues them (refunding the attempt) instead of failing or retrying.
+	pauseSteps map[string]struct{}
 
 	wg      sync.WaitGroup // in-flight step executions
 	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
@@ -294,6 +297,7 @@ func New(o Options) (*Engine, error) {
 		cancels:      map[string]context.CancelFunc{},
 		haltSteps:    map[string]struct{}{},
 		paused:       map[string]struct{}{},
+		pauseSteps:   map[string]struct{}{},
 		wake:         make(chan struct{}, 1),
 
 		middleware:      append([]Middleware(nil), o.Middleware...),
@@ -475,6 +479,60 @@ func (e *Engine) SetRateLimit(name string, n int64, window time.Duration) {
 	}
 	q.rateLimit.Store(n)
 	q.rateWindow.Store(int64(window))
+}
+
+// PauseRun pauses a run: its steps stop being claimed and a currently-running
+// step is interrupted and re-queued on resume. Idempotent; a terminal run
+// returns store.ErrRunTerminal, an unknown run store.ErrNotFound.
+func (e *Engine) PauseRun(ctx context.Context, runID string) error {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	now := e.now().UnixNano()
+	running, prev, changed, err := e.st.PauseRun(ctx, runID, now)
+	if err != nil || !changed {
+		return err
+	}
+	e.mu.Lock()
+	var cancels []context.CancelFunc
+	for _, id := range running {
+		e.pauseSteps[id] = struct{}{}
+		if c := e.cancels[id]; c != nil {
+			cancels = append(cancels, c)
+		}
+	}
+	e.mu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	e.publish(runID, "", prev, store.StatusPaused, "", now)
+	return nil
+}
+
+// ResumeRun returns a paused run to QUEUED and wakes the scheduler. A run that
+// is not paused is a no-op; a terminal run returns store.ErrRunTerminal.
+func (e *Engine) ResumeRun(ctx context.Context, runID string) error {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	now := e.now().UnixNano()
+	if err := e.st.ResumeRun(ctx, runID, now); err != nil {
+		return err
+	}
+	e.publish(runID, "", store.StatusPaused, store.StatusQueued, "", now)
+	e.wakeScheduler()
+	return nil
+}
+
+// consumePause reports whether stepID was pause-marked, clearing the mark.
+func (e *Engine) consumePause(stepID string) bool {
+	e.mu.Lock()
+	_, ok := e.pauseSteps[stepID]
+	if ok {
+		delete(e.pauseSteps, stepID)
+	}
+	e.mu.Unlock()
+	return ok
 }
 
 // PauseQueue stops claims from a queue; running steps finish and new work
@@ -1038,6 +1096,14 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusCancelled, "", now)
 		return
 	}
+	if e.consumePause(st.ID) {
+		// The run was paused between claim and registration: never start the
+		// task's side effects; requeue (refunding the attempt).
+		now := e.now().UnixNano()
+		_ = e.st.RequeuePausedStep(bg, st.ID, now)
+		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusQueued, "", now)
+		return
+	}
 
 	var out json.RawMessage
 	var err error
@@ -1109,6 +1175,17 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 
 	now := e.now()
 	errStr := truncateErr(err)
+	// A pause that interrupted this step: the task honored ctx, so requeue it
+	// without consuming an attempt. A task that finished (err == nil) or that
+	// failed for a real reason falls through to normal handling; the run stays
+	// PAUSED either way, so nothing is claimed until ResumeRun.
+	if e.consumePause(st.ID) && errors.Is(err, context.Canceled) && !vetoed && !e.runTerminal(st.RunID) {
+		if cerr := e.st.RequeuePausedStep(bg, st.ID, now.UnixNano()); cerr != nil {
+			e.log.Error("quacker: requeue paused step", "run", st.RunID, "step", st.Name, "err", cerr)
+		}
+		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusQueued, "", now.UnixNano())
+		return
+	}
 	switch {
 	case vetoed:
 		// A BeforeStep hook rejected the step: fail immediately, no retries.

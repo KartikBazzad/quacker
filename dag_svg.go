@@ -21,8 +21,8 @@ const (
 // dagNodes returns the standard legend order.
 func dagLegendStatuses() []Status {
 	return []Status{
-		StatusQueued, StatusRunning, StatusSucceeded, StatusFailed,
-		StatusCancelled, StatusSuspended, StatusInterrupted,
+		StatusQueued, StatusRunning, StatusBlocked, StatusSucceeded, StatusFailed,
+		StatusCancelled, StatusSuspended, StatusPaused, StatusInterrupted,
 	}
 }
 
@@ -228,6 +228,8 @@ func dagStatusColors(s Status) (fill, stroke, text string) {
 		return "#fef7e0", "#f9ab00", "#b06000"
 	case StatusSuspended:
 		return "#f3e8fd", "#9334e6", "#6a1b9a"
+	case StatusPaused:
+		return "#e0f2f1", "#00897b", "#00695c"
 	case StatusFailed:
 		return "#fce8e6", "#d93025", "#a50e0e"
 	case StatusCancelled:

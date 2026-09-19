@@ -16,6 +16,7 @@ const (
 	StatusRunning     Status = store.StatusRunning
 	StatusBlocked     Status = store.StatusBlocked
 	StatusSuspended   Status = store.StatusSuspended
+	StatusPaused      Status = store.StatusPaused
 	StatusSucceeded   Status = store.StatusSucceeded
 	StatusFailed      Status = store.StatusFailed
 	StatusCancelled   Status = store.StatusCancelled

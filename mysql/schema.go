@@ -150,3 +150,8 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 	paused_at BIGINT NOT NULL
 ) ENGINE=InnoDB;
 `
+
+// myMigration4 adds run-level pause.
+const myMigration4 = `
+ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
+`

@@ -272,6 +272,37 @@ func TestMySQLQueuePause(t *testing.T) {
 	}
 }
 
+func TestMySQLRunPause(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	task := quacker.NewTask("my.runpause", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	})
+	h, err := quacker.Enqueue(ctx, a, task, "x", quacker.WithRunAt(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PauseRun(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	if snap, err := a.Execution(ctx, h.RunID()); err != nil || snap.Status != quacker.StatusPaused {
+		t.Fatalf("status = %+v err=%v, want PAUSED", snap, err)
+	}
+	if err := b.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ResumeRun(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := h.Result(ctx); err != nil || out != "x" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)

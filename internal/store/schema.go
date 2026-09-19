@@ -14,6 +14,7 @@ const (
 	StatusRunning     = "RUNNING"
 	StatusBlocked     = "BLOCKED"   // DAG step waiting on dependencies
 	StatusSuspended   = "SUSPENDED" // durable sleep/wait: not holding a slot
+	StatusPaused      = "PAUSED"    // run-level pause: claims held until resume
 	StatusSucceeded   = "SUCCEEDED"
 	StatusFailed      = "FAILED"
 	StatusCancelled   = "CANCELLED"
@@ -241,6 +242,12 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 );
 `
 
+// migration15 adds run-level pause: a run paused by the user holds its claims
+// until resumed (paused_at is informational).
+const migration15 = `
+ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
+`
+
 var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -256,6 +263,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 12, SQL: migration12},
 	{Version: 13, SQL: migration13},
 	{Version: 14, SQL: migration14},
+	{Version: 15, SQL: migration15},
 }
 
 // init validates the built-in migration list's invariant before any Open can

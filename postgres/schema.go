@@ -155,3 +155,8 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 	paused_at BIGINT NOT NULL
 );
 `
+
+// pgMigration7 adds run-level pause.
+const pgMigration7 = `
+ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
+`

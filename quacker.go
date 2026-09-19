@@ -102,6 +102,19 @@ func (q *Quacker) Close(ctx context.Context) error {
 	return err
 }
 
+// PauseRun pauses a run: its steps stop being claimed, and a currently-running
+// step is interrupted and re-queued on resume. Idempotent; a terminal run
+// returns ErrRunTerminal and an unknown run ErrNotFound.
+func (q *Quacker) PauseRun(ctx context.Context, runID string) error {
+	return q.eng.PauseRun(ctx, runID)
+}
+
+// ResumeRun returns a paused run to QUEUED. A run that is not paused is a
+// no-op; a terminal run returns ErrRunTerminal.
+func (q *Quacker) ResumeRun(ctx context.Context, runID string) error {
+	return q.eng.ResumeRun(ctx, runID)
+}
+
 // Snooze reschedules a non-running run to start no earlier than until. A run
 // with a RUNNING step returns ErrRunRunning (cancel or pause it first); a
 // terminal run returns ErrRunTerminal.
