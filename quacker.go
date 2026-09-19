@@ -431,6 +431,9 @@ func EnqueueWorkflowChild[O any, I any](ctx context.Context, q *Quacker, wf *Wor
 }
 
 func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow[I], input I, parent string, opts ...EnqueueOption) (*RunHandle[O], error) {
+	if wf.err != nil {
+		return nil, wf.err
+	}
 	ec := enqueueConfig{}
 	for _, opt := range opts {
 		opt(&ec)

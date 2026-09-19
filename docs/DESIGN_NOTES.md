@@ -900,6 +900,33 @@ The concurrency design matters more than the batching itself:
 The remaining gap to a bulk completer is per-row queries inside the batch; a
 future change could collapse the step/run updates into set-based statements.
 
+### 41. Task identity is the name; dependencies may reference a task
+
+A task's identity is its **name**. There is deliberately no separate,
+auto-generated task id: the identity is persisted on every step (`steps.task`)
+and must be stable across processes, because a restarted engine resolves a
+recovered run's task by name and re-arms crons/event subscriptions by name. An
+id generated per `NewTask` call could not survive a restart; an id supplied by
+the caller would just be the name under a different field. `Task.ID()` therefore
+returns the name, and remains the handle if a distinct display name is ever
+added.
+
+The footgun this exposes: `NewTask("extract", …)` twice with different closures
+registers one name, so the last definition wins and every `extract` step runs
+it. The fix is not a second identifier (the closures share a code pointer, so
+even a func-identity guard cannot tell them apart) but a pattern: for fan-out,
+use **one** task per stage and derive the shard from `StepFromContext(ctx).Step`
+(see `examples/eltdag`); for genuinely distinct behavior, give the tasks
+distinct names.
+
+v1.10 adds **`StepOn`**, which accepts a `*Task` as a dependency and resolves it
+to the step that runs that task (a sealed `TaskRef` interface keeps it to
+quacker tasks). String step names still work in `Step`, and mixing is allowed:
+`StepOn("ship", ship, "charge", refund)`. A task reference is ambiguous when the
+same task backs more than one step, and is rejected with a clear error rather
+than guessing. This is purely additive, so it does not disturb the frozen
+`Step` signature.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

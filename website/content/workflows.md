@@ -75,3 +75,18 @@ dashboards; `DAGSVG` renders an embeddable picture (see
 - Workflow input fans out to every step — keep it small; pass bulk data by
   reference (ids, keys) rather than embedding it.
 - Retries and timeouts are per task, not per workflow.
+
+## Dependencies by task
+
+Steps depend on step names, but you can also pass the `*Task` itself with
+`StepOn`; it resolves to the step that runs the task:
+
+```go
+wf := quacker.NewWorkflow[In]("fulfill",
+    quacker.Step("charge", charge),
+    quacker.StepOn("ship", ship, charge),   // depends on the charge step
+)
+```
+
+A task that runs more than one step is ambiguous to reference by task — depend
+by step name there. Names and tasks may be mixed in one call.
