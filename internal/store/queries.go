@@ -958,6 +958,48 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 	return runningSteps, status, true, tx.Commit()
 }
 
+// Snooze moves a non-running run's start time to until (unix nanos): its
+// QUEUED steps and the run row are pushed forward. A run with a RUNNING step
+// returns ErrRunRunning (cancel or pause it first); a terminal run returns
+// ErrRunTerminal; an unknown run returns ErrNotFound. SUSPENDED steps keep
+// their resume_at — snoozing never wakes a durable wait early.
+func (s *Store) Snooze(ctx context.Context, runID string, until int64) error {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
+		return err
+	}
+	var status string
+	err = tx.queryRow(ctx, `SELECT status FROM runs WHERE id=?`, runID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if IsTerminal(status) {
+		return ErrRunTerminal
+	}
+	var running int
+	if err := tx.queryRow(ctx, `SELECT COUNT(*) FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning).Scan(&running); err != nil {
+		return err
+	}
+	if running > 0 {
+		return ErrRunRunning
+	}
+	if _, err := tx.exec(ctx, `UPDATE steps SET run_at=? WHERE run_id=? AND status=?`,
+		until, runID, StatusQueued); err != nil {
+		return err
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET run_at=? WHERE id=?`, until, runID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ---------------------------------------------------------------------------
 // Introspection (read pool; never blocks the writer in WAL mode).
 

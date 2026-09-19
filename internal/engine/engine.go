@@ -811,6 +811,15 @@ func (e *Engine) Cancel(runID string) error {
 	return nil
 }
 
+// Snooze moves a non-running run's start time to until. A run with a RUNNING
+// step returns store.ErrRunRunning; a terminal run store.ErrRunTerminal.
+func (e *Engine) Snooze(ctx context.Context, runID string, until time.Time) error {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	return e.st.Snooze(ctx, runID, until.UnixNano())
+}
+
 // interruptLocal cancels the contexts of a run's running steps, releases its
 // waiter with ErrRunCancelled, and publishes the transition. It is the
 // in-memory half of Cancel, shared with UniqueReplace.

@@ -10,6 +10,15 @@ import (
 // ErrNotFound is returned when a run does not exist.
 var ErrNotFound = errors.New("quacker: run not found")
 
+// Sentinel errors for run-level operations.
+var (
+	// ErrRunRunning reports that a run has a RUNNING step and cannot be
+	// snoozed or paused in place.
+	ErrRunRunning = errors.New("quacker: run is running")
+	// ErrRunTerminal reports that a run has already finished.
+	ErrRunTerminal = errors.New("quacker: run is terminal")
+)
+
 // Run is a row in the runs table. All timestamps are unix nanoseconds
 // (0 means unset).
 type Run struct {

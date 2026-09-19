@@ -102,6 +102,18 @@ func (q *Quacker) Close(ctx context.Context) error {
 	return err
 }
 
+// Snooze reschedules a non-running run to start no earlier than until. A run
+// with a RUNNING step returns ErrRunRunning (cancel or pause it first); a
+// terminal run returns ErrRunTerminal.
+func (q *Quacker) Snooze(ctx context.Context, runID string, until time.Time) error {
+	return q.eng.Snooze(ctx, runID, until)
+}
+
+// SnoozeFor is Snooze(now + d).
+func (q *Quacker) SnoozeFor(ctx context.Context, runID string, d time.Duration) error {
+	return q.eng.Snooze(ctx, runID, time.Now().Add(d))
+}
+
 // Cancel cancels a run. Queued/blocked steps become CANCELLED immediately;
 // running steps have their contexts cancelled. Waiters receive
 // ErrRunCancelled. Cancelling an unknown or finished run is a no-op.

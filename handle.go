@@ -31,6 +31,10 @@ var (
 	ErrNotFound = store.ErrNotFound
 	// ErrClosed is returned by enqueue calls after Close has begun.
 	ErrClosed = engine.ErrClosed
+	// ErrRunRunning is returned by Snooze for a run with a RUNNING step.
+	ErrRunRunning = store.ErrRunRunning
+	// ErrRunTerminal is returned by Snooze (and PauseRun) for a finished run.
+	ErrRunTerminal = store.ErrRunTerminal
 )
 
 // RunHandle tracks an enqueued run.
