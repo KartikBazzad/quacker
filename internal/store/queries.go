@@ -1067,6 +1067,14 @@ type CompleteResult struct {
 // the output of the last step (highest ord). Guards prevent overwriting a run
 // that is already terminal (e.g. cancelled mid-flight) and refuse to
 // resurrect a step that was cancelled or failed by another path.
+// Completion is one step success to record in a batch.
+type Completion struct {
+	StepID string
+	RunID  string
+	Output []byte
+	Now    int64
+}
+
 func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output []byte, now int64) (CompleteResult, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
@@ -1077,7 +1085,44 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
 		return CompleteResult{}, err
 	}
+	res, err := s.completeStepTx(ctx, tx, stepID, runID, output, now)
+	if err != nil {
+		return CompleteResult{}, err
+	}
+	return res, tx.Commit()
+}
 
+// CompleteSteps records several step completions in one transaction, in order,
+// returning one result per completion. Batching amortizes the commit and the
+// per-completion round trips; a batch is atomic, so on error the caller should
+// retry the completions individually.
+func (s *Store) CompleteSteps(ctx context.Context, comps []Completion) ([]CompleteResult, error) {
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	out := make([]CompleteResult, len(comps))
+	for i, c := range comps {
+		if err := s.be.RunLock(ctx, tx.Tx, c.RunID); err != nil {
+			return nil, err
+		}
+		res, err := s.completeStepTx(ctx, tx, c.StepID, c.RunID, c.Output, c.Now)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = res
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// completeStepTx is the body of CompleteStep (and each entry of CompleteSteps):
+// it must run inside a transaction that already holds the run lock, and it does
+// not commit.
+func (s *Store) completeStepTx(ctx context.Context, tx *txn, stepID, runID string, output []byte, now int64) (CompleteResult, error) {
 	// A run that is already terminal (cancelled/failed/interrupted) must not
 	// gain SUCCEEDED steps from executors that raced the transition.
 	var runStatus string
@@ -1090,7 +1135,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 		// the run's outcome was decided by Cancel/failure, not this task.
 		_, _ = tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
 			StatusCancelled, now, stepID)
-		return CompleteResult{StepDone: false}, tx.Commit()
+		return CompleteResult{StepDone: false}, nil
 	}
 
 	upd, err := tx.exec(ctx, `UPDATE steps SET status=?, output=?, error='', completed_at=? WHERE id=? AND status IN ('QUEUED','RUNNING')`,
@@ -1100,7 +1145,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	}
 	if n, _ := upd.RowsAffected(); n == 0 {
 		// Already terminal (cancelled, failed, interrupted): keep it that way.
-		return CompleteResult{StepDone: false}, tx.Commit()
+		return CompleteResult{StepDone: false}, nil
 	}
 
 	var stepName string
@@ -1123,7 +1168,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	var one int
 	switch err := tx.queryRow(ctx, `SELECT 1 FROM steps WHERE run_id=? AND status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED') LIMIT 1`, runID).Scan(&one); {
 	case err == nil:
-		return res, tx.Commit() // still active
+		return res, nil // still active
 	case errors.Is(err, sql.ErrNoRows):
 		// terminal, fall through
 	default:
@@ -1155,7 +1200,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 			return CompleteResult{}, err
 		}
 	}
-	return res, tx.Commit()
+	return res, nil
 }
 
 // unblockReadyTx queues the BLOCKED steps of runID whose dependencies have all

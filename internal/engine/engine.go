@@ -215,6 +215,18 @@ type Engine struct {
 	// requeues them (refunding the attempt) instead of failing or retrying.
 	pauseSteps map[string]struct{}
 
+	// Step successes are batched into one transaction per flush. submitCompletion
+	// appends under cmplMu (so a completion never races the shutdown flip) and
+	// wakes the completer; the completer drains and records them with
+	// Store.CompleteSteps, then does the publish/finish work.
+	cmplMu      sync.Mutex
+	cmplPending []completionReq
+	cmplStopped bool
+	cmplWake    chan struct{}
+	cmplStop    chan struct{}
+	cmplDone    chan struct{}
+	cmplStarted atomic.Bool
+
 	wg      sync.WaitGroup // in-flight step executions
 	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
 	wake    chan struct{}
@@ -328,6 +340,9 @@ func New(o Options) (*Engine, error) {
 		haltSteps:    map[string]struct{}{},
 		paused:       map[string]struct{}{},
 		pauseSteps:   map[string]struct{}{},
+		cmplWake:     make(chan struct{}, 1),
+		cmplStop:     make(chan struct{}),
+		cmplDone:     make(chan struct{}),
 		wake:         make(chan struct{}, 1),
 
 		middleware:      append([]Middleware(nil), o.Middleware...),
@@ -407,6 +422,8 @@ func (e *Engine) Start() {
 		e.logWG.Add(1)
 		go e.flushLogs()
 	}
+	e.cmplStarted.Store(true)
+	go e.completerLoop()
 	e.loopWG.Add(2)
 	go func() { defer e.loopWG.Done(); e.schedulerLoop() }()
 	go func() { defer e.loopWG.Done(); e.cronLoop() }()
@@ -445,6 +462,9 @@ func (e *Engine) Close(ctx context.Context) error {
 	case <-done:
 	case <-ctx.Done():
 	}
+	// Record any batched completions, then flip late finishers to direct
+	// writes, so finished work is persisted before the interrupt sweep.
+	e.stopCompleter()
 	now := e.now().UnixNano()
 	// Steps still RUNNING (drain timeout or forced close) become INTERRUPTED.
 	_ = e.interruptAll(now)
@@ -1375,28 +1395,13 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 			e.recordFinalFailure(st, errStr, now)
 		}
 	case err == nil:
-		res, cerr := e.st.CompleteStep(bg, st.ID, st.RunID, out, now.UnixNano())
-		if cerr != nil {
-			e.log.Error("quacker: record success", "run", st.RunID, "step", st.Name, "err", cerr)
-			return
-		}
-		if !res.StepDone {
-			// Another path (Cancel / run failure) already made this step
-			// terminal; its outcome must not be resurrected to SUCCEEDED.
-			// The CompleteStep tx converged it to CANCELLED, so publish that
-			// transition — subscribers would otherwise see it stuck RUNNING.
-			e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusCancelled, "", now.UnixNano())
-			return
-		}
-		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSucceeded, "", now.UnixNano())
-		for _, name := range res.ReadySteps {
-			e.publish(st.RunID, name, store.StatusBlocked, store.StatusQueued, "", now.UnixNano())
-		}
-		if res.RunTerminal {
-			e.finishRun(st.RunID, res.RunStatus, res.RunOutput, res.RunError, now.UnixNano())
-		} else {
-			e.wakeScheduler()
-		}
+		// Hand the success to the batched completer; it records the completion
+		// (possibly coalesced with others) and publishes/finishes the run.
+		e.submitCompletion(completionReq{
+			comp: store.Completion{StepID: st.ID, RunID: st.RunID, Output: out, Now: now.UnixNano()},
+			name: st.Name,
+		})
+		return
 	case e.runTerminal(st.RunID):
 		// Run reached a terminal state (cancelled by the user, failed via a
 		// sibling, interrupted): record this step CANCELLED rather than

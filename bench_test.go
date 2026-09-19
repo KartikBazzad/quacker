@@ -2,6 +2,8 @@ package quacker
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,10 +154,17 @@ func BenchmarkExecutionSnapshot(b *testing.B) {
 // ceiling. Ephemeral (WAL) is used because Memory cannot use WAL and is
 // markedly slower under this read/write mix.
 func BenchmarkSaturatedThroughput(b *testing.B) {
-	const (
-		saturatedN = 5000
-		workers    = 64
-	)
+	saturatedN, workers := 5000, 64
+	if v := os.Getenv("QUACKER_SAT_N"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			saturatedN = n
+		}
+	}
+	if v := os.Getenv("QUACKER_SAT_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
 	q, err := Open(
 		WithStorage(Ephemeral()),
 		WithPollInterval(time.Millisecond),

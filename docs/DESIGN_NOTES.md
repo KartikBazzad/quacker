@@ -872,6 +872,34 @@ like `KeyGate` and `SequenceGate`. The legacy single key (`WithKey`) stays on
 `steps.concurrency_key` so cancel strategies and introspection are unchanged;
 `WithKeyLimit` is purely additive, and a run may use both.
 
+### 40. v1.10: batched completion amortizes the commit
+
+Every step success used to open its own transaction (`CompleteStep`). Under load
+that is one BEGIN/COMMIT plus the per-row queries per run. v1.10 adds a
+completer goroutine and `Store.CompleteSteps`: the executor hands its success to
+a shared queue, and the completer records everything pending in **one
+transaction**, then does the publish/run-finish work. Measured ~1.4× on
+saturated throughput (Ephemeral, 64 workers), scaling to ~2× at 256 workers
+because more in-flight work forms larger batches; sequential per-job latency is
+unchanged, since a lone completion still flushes immediately.
+
+The concurrency design matters more than the batching itself:
+
+- **A mutex + slice, not a channel, for the handoff.** A channel-based queue can
+  lose a completion that races shutdown (`select` may pick a send on a
+  post-stop buffer). Under `cmplMu`, `submitCompletion` either appends or, once
+  `cmplStopped` is set, writes through directly — so a late finisher is never
+  dropped.
+- **The completer is not in `loopWG`.** It only stops on an explicit signal,
+  which `Close` sends *after* all executions have drained and *before* the
+  interrupt sweep, so finished work is persisted before RUNNING rows are
+  swept.
+- **A batch is atomic.** On error the completer falls back to one-by-one, so a
+  single bad completion cannot drop the rest.
+
+The remaining gap to a bulk completer is per-row queries inside the batch; a
+future change could collapse the step/run updates into set-based statements.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

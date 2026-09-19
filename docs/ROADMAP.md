@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: **v1.0–v1.9 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.10 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
 storage-driver contract with a MySQL/MariaDB driver, v1.5 job-control
@@ -556,6 +556,13 @@ limit expressions (all documented below).
   MySQL 8.
 
 Still open on concurrency: per-worker slots and dynamic limit expressions.
+
+## v1.10 — batched completion (✅ DONE)
+
+- ✅ Step successes are coalesced into one transaction per flush
+  (`Store.CompleteSteps` + a completer goroutine), lifting saturated throughput
+  ~1.4× and making it scale with worker count. Sequential latency unchanged.
+  See DESIGN_NOTES §40 and BENCHMARKS.md.
 
 ## Backlog
 - Custom storage backends

@@ -12,7 +12,7 @@ Machine: **Apple M4, 10 cores** (darwin/arm64), Go 1.26.5, `modernc.org/sqlite`
 ```
 BenchmarkEnqueueRun-10        426,655 ns/op  ~2,300 enqueues/s (contended)
 BenchmarkThroughput-10        458,678 ns/op  ~2,180 runs/s (enqueue→execute→Result)
-BenchmarkSaturatedThroughput  2,713,627,250 ns/op for n=5000  ~1,840 runs/s
+BenchmarkSaturatedThroughput  ~1,970,000,000 ns/op for n=5000  ~2,540 runs/s
 ```
 
 - **`BenchmarkEnqueueRun`** is `Enqueue` in a loop while the scheduler and
@@ -20,11 +20,14 @@ BenchmarkSaturatedThroughput  2,713,627,250 ns/op for n=5000  ~1,840 runs/s
   not clean insert latency.
 - **`BenchmarkThroughput`** awaits each run before enqueuing the next, so it is
   per-job round-trip latency (~460 µs), *not* saturated throughput.
-- **`BenchmarkSaturatedThroughput`** (Ephemeral/WAL, 64 workers, n=5000) is the
-  real ceiling: enqueue a batch, then wait for all runs. It is the number to
-  compare against a queue's "jobs/sec". At n=1000 it is ~2,460 runs/s (less
-  index depth); on `Memory()` (no WAL) it collapses to ~440 runs/s — use
-  `Ephemeral`/`File` for throughput benchmarks, never `Memory`.
+- **`BenchmarkSaturatedThroughput`** (Ephemeral/WAL, n=5000) is the real
+  ceiling: enqueue a batch, then wait for all runs. It is the number to compare
+  against a queue's "jobs/sec". It scales with queue concurrency — ~2,540
+  runs/s at 64 workers, ~3,230 at 128, ~3,790 at 256 (`QUACKER_SAT_WORKERS`) —
+  because more in-flight work lets the batched completer form larger batches.
+  At n=1000 it is ~2,460 runs/s (less index depth); on `Memory()` (no WAL) it
+  collapses to ~440 runs/s — use `Ephemeral`/`File` for throughput benchmarks,
+  never `Memory`.
 
 ## Producer throughput (insert-only)
 
@@ -73,14 +76,16 @@ transaction per completion, single writer):
 | Units | work/s (batch completion) | jobs/s (insert + work + persist) |
 | Storage | Postgres, many connections | SQLite (embedded) or Postgres |
 | Machine | M2 Air, 8 cores | M4, 10 cores |
-| Figure | ~46,000/s | ~1,800/s (Ephemeral, 64 workers) |
+| Figure | ~46,000/s | ~2,500/s (Ephemeral, 64 workers; ~3,800 at 256) |
 
-So River is roughly **20–25× higher** at completion throughput. The reasons are
+So River is roughly **18× higher** at completion throughput. The reasons are
 structural, not a constant factor:
 
-- **One completion transaction per run.** River completes jobs in bulk
-  (`UPDATE … WHERE id = ANY`); quacker runs `CompleteStep` per run on SQLite's
-  single writer. This is the dominant cost.
+- **Batched completion, but still per-row queries.** quacker coalesces step
+  successes into one transaction per flush (`CompleteSteps`, v1.10), which
+  lifted saturated throughput ~1.4× and made it scale with worker count; River
+  additionally collapses the row updates into one statement
+  (`UPDATE … WHERE id = ANY`), which quacker has not done.
 - **Batch insert via `COPY`.** River's `InsertManyFast` uses Postgres `COPY`;
   quacker issues one Exec per run for `runs` and one for `steps`.
 - **Concurrency.** River fans work across pooled connections; SQLite permits a
