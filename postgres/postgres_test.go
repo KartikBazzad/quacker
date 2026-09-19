@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -390,6 +392,112 @@ func TestPostgresRunPauseCrossEngineBoundary(t *testing.T) {
 	}
 	if out, err := h.Result(ctx); err != nil || out != "B" {
 		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+// TestPostgresUniqueReplaceCrossEngine: engine A replaces a unique run that
+// engine B is executing. The store cancels the old run and inserts the new one;
+// A cannot interrupt B's in-flight step, but the old run ends CANCELLED and the
+// replacement runs.
+func TestPostgresUniqueReplaceCrossEngine(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn, quacker.WithWorkerLabels("observer"))
+	b := openQ(t, dsn, quacker.WithWorkerLabels("worker-b"))
+	ctx := context.Background()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	task := quacker.NewTask("pg.repl", func(ctx context.Context, in string) (string, error) {
+		if calls.Add(1) == 1 {
+			once.Do(func() { close(started) })
+			<-release
+		}
+		return "ok", nil
+	}, quacker.WithUnique(func(in string) string { return in }),
+		quacker.WithUniqueConflict(quacker.UniqueReplace),
+		quacker.WithLabels("worker-b"))
+
+	old, err := quacker.Enqueue(ctx, b, task, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old run never started")
+	}
+	repl, err := quacker.Enqueue(ctx, a, task, "k") // replace from the other engine
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repl.RunID() == old.RunID() {
+		t.Fatal("replace reused the old run id")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := a.Execution(ctx, old.RunID())
+		return err == nil && s.Status == quacker.StatusCancelled
+	})
+	close(release)
+	waitFor(t, 5*time.Second, func() bool {
+		s, err := a.Execution(ctx, repl.RunID())
+		return err == nil && s.Status == quacker.StatusSucceeded
+	})
+}
+
+// TestPostgresUniqueRaceCrossEngine: two engines enqueue the same unique key
+// concurrently under UniqueError; exactly one wins and one run is persisted.
+func TestPostgresUniqueRaceCrossEngine(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	release := make(chan struct{})
+	defer close(release)
+	task := quacker.NewTask("pg.race", func(ctx context.Context, in string) (string, error) {
+		<-release
+		return in, nil
+	}, quacker.WithUnique(func(in string) string { return in }),
+		quacker.WithUniqueConflict(quacker.UniqueError))
+
+	start := make(chan struct{})
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i, q := range []*quacker.Quacker{a, b} {
+		wg.Add(1)
+		go func(i int, q *quacker.Quacker) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = quacker.Enqueue(ctx, q, task, "same")
+		}(i, q)
+	}
+	close(start)
+	wg.Wait()
+
+	var ok, dup int
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, quacker.ErrDuplicateJob):
+			dup++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 || dup != 1 {
+		t.Fatalf("ok=%d dup=%d, want 1/1 (errs=%v)", ok, dup, errs)
+	}
+	runs, err := a.Runs(ctx, quacker.RunFilter{Workflow: "pg.race"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("persisted %d runs, want 1", len(runs))
 	}
 }
 
