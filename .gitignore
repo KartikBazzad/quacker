@@ -13,3 +13,8 @@
 
 # Agent/tool session state
 .zcode/
+
+# Generated docs site output
+website/public/
+/website/website
+/website/quacker-website
