@@ -48,6 +48,7 @@ reference implementations):
 | `RunLock` | Lock a run row for DAG-mutating transactions |
 | `SupportsLeases` / `SupportsCheckpoint` / `RecoverOnBoot` | Capability flags |
 | `KeyGate` | Per-key concurrency predicate (see below) |
+| `SequenceGate` | Per-sequence ordering predicate (see below) |
 | `LabelGate` | Worker-label subset predicate |
 | `BlockedDependentsSQL` | Direct dependents of a finished step |
 | `UpsertSQL` | `ON CONFLICT` vs `ON DUPLICATE KEY` |
@@ -81,11 +82,15 @@ once. A driver must satisfy these:
 - **DDL must match the query layer's column names** (types are the driver's
   choice). `postgres/schema.go` and `mysql/schema.go` are the reference.
 - **Self-referencing subqueries.** Postgres/SQLite accept the correlated
-  `KeyGate` from `driver.CorrelatedKeyGate()`; MySQL does not (error 1093) and
-  routes the count through a derived table that the optimizer merges back into
-  a covering index lookup. If your dialect rejects reading the table being
-  updated, wrap the source in a derived table the same way; keep it
-  merge-friendly (no `GROUP BY`) so it does not materialize.
+  `KeyGate`/`SequenceGate` (`driver.CorrelatedKeyGate`,
+  `driver.CorrelatedSequenceGate`); MySQL does not (error 1093) and routes the
+  source through a derived table that the optimizer merges back into an index
+  lookup. If your dialect rejects reading the table being updated, wrap the
+  source in a derived table the same way; keep it merge-friendly (no `GROUP BY`)
+  so it does not materialize.
+- **Sequences use a `counters` table** for insertion order; a driver's
+  migrations must create it (and seed `('run', 0)`) and index
+  `steps(sequence_key, seq)`.
 - **Migrations are split on `;`** and each statement runs separately, so a
   migration script must not contain a semicolon inside a string literal.
 

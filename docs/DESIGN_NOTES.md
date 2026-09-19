@@ -764,6 +764,41 @@ A recurring theme: three of the four are enforced by a predicate in the claim
 transaction (unique index, `queuePauses`, `runNotPausedGate`), so multi-instance
 correctness is the database's job and the engine keeps no authoritative state.
 
+### 36. v1.6: retention, caller transactions, DLQ, sequences
+
+Four more job-control features, each with one load-bearing decision:
+
+- **Per-queue retention is a policy list, not a config map.** `WithRetention`
+  appends, so a global policy plus per-queue overrides with different cutoffs
+  coexist; each runs its own loop. The alternative (one policy with a queue
+  filter) cannot express "keep queue A for a day, queue B for a week".
+- **Caller transactions are insert-only.** `EnqueueTx` builds and inserts a run
+  on the caller's `*sql.Tx` and returns its id — **no waiter** — because the
+  caller owns commit and the run may execute on any engine afterward. SQLite is
+  rejected outright: quacker owns the single writer and `.quacker.lock`, so a
+  caller transaction on the same file is not safe. This is the outbox pattern,
+  and it only ever needed the insert path.
+- **Dead letters are opt-in and retried in place.** A `dead_lettered_at` flag
+  (not a new status) keeps terminal/purge/metrics semantics untouched, and
+  `RetryDeadLetter` reopens the same run under the run lock, restoring
+  QUEUED/BLOCKED from `depends_on`.
+- **Sequences get their own counter, not `created_at`.** A batch enqueue stamps
+  every run with the same `now`, so `created_at` cannot order runs within a
+  batch; `id` has a random suffix. A `counters` row allocated inside the insert
+  transaction gives an exact, engine-independent insertion order (the `UPDATE`
+  row-locks on Postgres/MySQL; SQLite is single-writer). The claim gate is the
+  same shape as `KeyGate` — a correlated predicate on SQLite/Postgres, a
+  derived-table form on MySQL — so sequences reuse the pattern rather than
+  inventing one.
+
+The DLQ work surfaced a real bug worth recording: `FinalFailStep` cancels a
+failed run's sibling steps and, for any whose executor had not yet registered a
+cancel func, leaves a `haltSteps` tombstone. When `RetryDeadLetter` revived the
+run, the first claim of a sibling saw the stale tombstone and cancelled itself.
+A halt tombstone is only meaningful while the run is terminal, so the executor
+now checks `runTerminal` before honoring one. Any feature that revives terminal
+runs (DLQ retry, and future replay) must keep this in mind.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

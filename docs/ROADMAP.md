@@ -1,12 +1,13 @@
 # Roadmap
 
-Status: **v1.0–v1.5 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.6 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
-storage-driver contract with a MySQL/MariaDB driver, plus v1.5 job-control
-primitives (unique jobs, snooze, queue pause, run pause/resume). The v1.0 stability gates
-(semver policy, chaos, fuzzing, pkg.go.dev examples) are complete; release tags
-wait on a git remote.
+storage-driver contract with a MySQL/MariaDB driver, v1.5 job-control
+primitives (unique jobs, snooze, queue pause, run pause/resume), and v1.6
+(retention per queue, enqueue-on-`*sql.Tx`, dead-letter queue, sequences). The
+v1.0 stability gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
+complete; release tags wait on a git remote.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -497,6 +498,27 @@ combined version per dialect), `driver.IsUniqueViolation` is a small addition to
 the public contract (documented in DRIVERS.md), and all three get integration
 coverage in the Postgres and MySQL suites plus the root File/Memory suite.
 
+## v1.6 — retention, transactions, DLQ, sequences (✅ DONE)
+
+- ✅ **Per-queue retention**: `Queue` on `PurgeOptions`/`RetentionPolicy`, and
+  several `WithRetention` policies (global + per-queue), each on its own
+  interval. No migration.
+- ✅ **EnqueueTx / EnqueueBatchTx** on a caller `*sql.Tx` (Postgres/MySQL):
+  atomic with the caller's business writes; returns run id(s), no waiter;
+  SQLite returns `ErrExternalTxUnsupported`. No migration.
+- ✅ **Dead-letter queue**: opt-in `WithDeadLetter`; `DeadLetters`,
+  `RetryDeadLetter` (reopens the run in place), `DismissDeadLetter`, and
+  `ExcludeDeadLettered` retention. Migrations: SQLite 16, Postgres 8, MySQL 5.
+- ✅ **Sequences**: `WithSequence` gives strict insertion order per sequence
+  key, parallel across keys, with head-of-line blocking across retries. A
+  `counters` table allocates `seq` in the insert transaction; a
+  `driver.SequenceGate()` hook gates claims across dialects. Migrations:
+  SQLite 17, Postgres 9, MySQL 6.
+
+The dead-letter work also fixed a latent bug: `FinalFailStep`'s sibling-cancel
+left a `haltSteps` tombstone that later cancelled a revived (retried) step; a
+halt tombstone is now honored only while the run is terminal.
+
 ## Backlog
 - Custom storage backends
 - Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
@@ -513,7 +535,7 @@ names the closest API today.
 | Cancelling jobs | ✅ | `q.Cancel(runID)`: QUEUED/BLOCKED/SUSPENDED → CANCELLED, RUNNING gets ctx cancel. No bulk/by-filter cancel. |
 | Concurrency limits | 🟡 | Queue (`WithQueue`), per-key (`WithKey`/`WithKeyConcurrency`), sliding-window rate (`WithRate`). Missing: cancel strategies, multiple/shared keys, per-worker slots, dynamic limits. |
 | Getting the client within workers | 🟡 | Go tasks close over `q`; context exposes `RunIDFromContext`/`StepFromContext` only — no engine accessor (trivial for embedded use). |
-| Dead letter queue | ❌ | Failed runs stay `FAILED` with their error; no DLQ. Query with `q.Runs(RunFilter{Status: StatusFailed})`. |
+| Dead letter queue | ✅ | Opt-in `WithDeadLetter`; `DeadLetters`/`RetryDeadLetter`/`DismissDeadLetter` (v1.6). |
 | Durable periodic jobs | ✅ | `Cron` persists and re-arms on `Register`; fires once per occurrence across instances. |
 | Encrypted jobs | ❌ | No payload encryption. `WithCodec` can plug an encrypting codec for user payloads (schema JSON stays plaintext). |
 | Ephemeral jobs | ❌ | Storage is engine-wide (`Memory`/`Ephemeral`); no per-run "don't persist". |
@@ -521,37 +543,34 @@ names the closest API today.
 | Job-persisted logging | ✅ | `WithLogStorage(true)` + `q.Logs`; sink chain via `WithTaskLogSink`. |
 | Multiple queues | ✅ | `Queue(name)` per task + `WithQueue(name, n)`. |
 | Pausing queues | ✅ | `PauseQueue`/`ResumeQueue`/`PausedQueues`, enforced in the claim SQL. |
-| Per-queue job retention | 🟡 | `WithRetention`/`q.Purge` are global, filtered by status — not per queue. |
+| Per-queue job retention | ✅ | `Queue` on `PurgeOptions`/`RetentionPolicy`; multiple `WithRetention` (v1.6). |
 | Periodic and cron jobs | ✅ | `Cron` with 5-field specs, descriptors, and sub-second `@every`. |
 | Recorded output | ✅ | Run/step `output` persisted; `q.Execution(...).Output`, `DepOutput[T]`. |
 | Resumable jobs | ✅ | Durable replay (`SleepDurable`/`WaitFor`/`RunOnce`) + File restart recovery. |
 | Scheduled jobs | ✅ | `WithRunAt(t)` / `WithDelay(d)` on enqueue. |
-| Sequences | ❌ | No sequence primitive; DAG deps order within a workflow. Strict per-key ordering is still future work. |
+| Sequences | ✅ | `WithSequence`: strict insertion order per key, parallel across keys (v1.6). |
 | Snoozing jobs | ✅ | `Snooze`/`SnoozeFor` move a non-running run's `run_at` forward. |
 | Subscriptions | ✅ | `On`/`Emit` bindings, durable `WaitFor`, and a live `q.Subscribe(runID)` stream. |
 | Testing | ✅ | `Memory()`/`Ephemeral()` + `WithPollInterval` for fast deterministic tests, examples, and `example_test.go`. No assertion harness. |
-| Transactional job completion | 🟡 | Completion is atomic inside the engine, but there is no API to enlist an enqueue in the caller's business DB transaction (`WithDB` shares a pool, not a tx). |
+| Transactional job completion | ✅ | `EnqueueTx`/`EnqueueBatchTx` on a caller `*sql.Tx` (Postgres/MySQL) (v1.6). |
 | Unique jobs | ✅ | `WithUnique`/`WithUniqueKey` + `UniqueConflict{Reuse,Error,Replace}`. |
 | Work functions | ✅ | Tasks are plain Go functions (`NewTask`). |
 | Pause/resume jobs & workflows | ✅ | `PauseRun`/`ResumeRun` (v1.5); running steps requeue on resume. |
 | Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
 
-Tally: 18 shipped, 4 partial, 4 missing (unique jobs, queue pause, snooze, and
-run pause/resume shipped in v1.5).
+Tally: 22 shipped, 2 partial, 0 missing — v1.6 added the dead-letter queue,
+sequences, per-queue retention, and enqueue-on-`*sql.Tx`. The remaining partial
+items are concurrency-limit cancel strategies and the client-in-context
+accessor.
 
 ### Missing / partial — suggested follow-ups
 
 Addable within the embedded model, roughly by value:
 
-1. **Sequences / strict per-key order** — already named as future work in v0.2 notes.
-2. **Per-queue retention** — add a `Queue` field to `RetentionPolicy`/`PurgeOptions`.
-3. **Dead letter queue** — mark terminal-failed runs as DLQ-eligible; list/replay from there.
-4. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
-5. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
-6. **Transactional completion** — expose enqueue-on-`*sql.Tx` for Postgres/MySQL (real value for outbox patterns).
-7. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
+1. **Ephemeral jobs** — per-run "do not persist" would fight the durable-by-default design; needs a decision.
+2. **Encrypted jobs** — ship an encrypting `Codec` example, or a `WithPayloadKey` option.
+3. **Cancel strategies + multiple/shared concurrency keys** — the overlap with Hatchet's headline features; see the gap analysis.
+4. **Client in context** — an engine accessor inside a task (Go closures usually suffice).
 
-Overlaps with the Hatchet comparison: concurrency strategies, per-queue
-retention, DLQ, sequences. This list also reads like a Postgres-backed
-job-library matrix (River/Oban-shaped), so it is a useful parity target beyond
-Hatchet.
+The list reads like a Postgres-backed job-library matrix (River/Oban-shaped),
+which is a useful parity target beyond Hatchet.

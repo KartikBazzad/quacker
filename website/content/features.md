@@ -109,6 +109,16 @@ across processes sharing a database.
 - **Pause runs** — `q.PauseRun(ctx, runID)` interrupts a running step and holds
   the run; `ResumeRun` replays it. Durable tasks resume cleanly from their
   journal; non-durable steps re-run from the top.
+- **Sequences** — `WithSequence(func(in) string)` runs jobs sharing a key
+  strictly one-at-a-time in insertion order (parallel across keys), with
+  head-of-line blocking across retries.
+- **Dead-letter queue** — `WithDeadLetter()` opts a task in; exhausted failures
+  appear in `q.DeadLetters`, and `RetryDeadLetter` reopens one in place.
+- **Per-queue retention** — call `WithRetention` with a `Queue` to purge queues
+  on different cutoffs.
+- **Transactional enqueue** — `EnqueueTx(ctx, tx, q, task, in)` inserts a run
+  on your own `*sql.Tx` (Postgres/MySQL), atomic with your business writes —
+  the outbox pattern.
 
 ```go
 task := quacker.NewTask("sync", syncFn,
