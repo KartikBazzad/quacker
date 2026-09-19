@@ -2,6 +2,7 @@ package quacker
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -22,8 +23,8 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 	out := &DAG{}
 	seen := map[string]bool{}
 
-	var add func(id, prefix, from string, depth int) error
-	add = func(id, prefix, from string, depth int) error {
+	var add func(id, prefix, from, label string, depth int) error
+	add = func(id, prefix, from, label string, depth int) error {
 		if depth > maxDepth || seen[id] || len(out.Nodes) >= maxNodes {
 			return nil
 		}
@@ -36,10 +37,14 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 			out.RunID, out.Workflow, out.Kind, out.Status, out.Queue =
 				ex.RunID, ex.Workflow, ex.Kind, ex.Status, ex.Queue
 		}
+		if label == "" {
+			label = ex.Workflow
+		}
+		out.Groups = append(out.Groups, DAGGroup{Name: id, Label: label, Status: ex.Status})
 		for _, s := range ex.Steps {
 			name := prefix + s.Name
 			node := DAGNode{
-				Name: name, Task: s.Task, Status: s.Status,
+				Name: name, Task: s.Task, Status: s.Status, Group: id,
 				Attempts: s.Attempts, MaxAttempts: s.MaxAttempts, Error: s.Error,
 			}
 			for _, d := range s.Deps {
@@ -60,19 +65,20 @@ func (q *Quacker) DAGTree(ctx context.Context, runID string) (*DAG, error) {
 		if err != nil {
 			return err
 		}
-		for _, k := range kids {
+		for i, k := range kids {
 			childPrefix := prefix + shortRunID(k.RunID) + "/"
 			childFrom := ""
 			if k.ParentStep != "" {
 				childFrom = prefix + k.ParentStep
 			}
-			if err := add(k.RunID, childPrefix, childFrom, depth+1); err != nil {
+			childLabel := fmt.Sprintf("%s #%d", k.Workflow, i+1)
+			if err := add(k.RunID, childPrefix, childFrom, childLabel, depth+1); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	if err := add(runID, "", "", 0); err != nil {
+	if err := add(runID, "", "", "", 0); err != nil {
 		return nil, err
 	}
 	return out, nil

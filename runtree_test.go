@@ -88,6 +88,35 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 		}
 	}
 
+	// Runs are grouped: the root plus each child, labelled.
+	if len(tree.Groups) != 4 {
+		t.Fatalf("groups = %d, want 4 (root + 3 children)", len(tree.Groups))
+	}
+	groupNames := map[string]bool{}
+	for _, g := range tree.Groups {
+		groupNames[g.Name] = true
+		if g.Label == "" {
+			t.Fatalf("group %s has no label", g.Name)
+		}
+	}
+	for _, n := range tree.Nodes {
+		if !groupNames[n.Group] {
+			t.Fatalf("node %s group %q is not a declared group", n.Name, n.Group)
+		}
+	}
+	var rootGroup, childGroups int
+	for _, g := range tree.Groups {
+		switch {
+		case g.Label == "tree.parent":
+			rootGroup++
+		case strings.HasPrefix(g.Label, "tree.child.wf #"):
+			childGroups++
+		}
+	}
+	if rootGroup != 1 || childGroups != 3 {
+		t.Fatalf("group labels: root=%d children=%d (groups: %v)", rootGroup, childGroups, tree.Groups)
+	}
+
 	// The plain DAG (one run) does NOT include the children.
 	plain, err := q.DAG(ctx, h.RunID())
 	if err != nil {
@@ -115,6 +144,9 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 	}
 	if !strings.Contains(string(svg), "fan") || !strings.Contains(string(svg), "/job") {
 		t.Fatal("tree SVG missing parent step or child step")
+	}
+	if !strings.Contains(string(svg), "tree.child.wf #1") {
+		t.Fatal("tree SVG missing a group label")
 	}
 }
 

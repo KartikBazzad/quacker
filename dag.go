@@ -16,6 +16,18 @@ type DAGNode struct {
 	Attempts    int      `json:"attempts"`
 	MaxAttempts int      `json:"max_attempts"`
 	Error       string   `json:"error,omitempty"`
+	// Group is the run this node belongs to, when the DAG spans several runs
+	// (a DAGTree). Empty for a single-run DAG.
+	Group string `json:"group,omitempty"`
+}
+
+// DAGGroup is one run's cluster of nodes within a DAGTree — the root run or a
+// child run — drawn as a labelled box behind its nodes. A plain single-run DAG
+// has no groups.
+type DAGGroup struct {
+	Name   string `json:"name"`  // run id
+	Label  string `json:"label"` // human label, e.g. "partition_jobs #3"
+	Status Status `json:"status"`
 }
 
 // DAGEdge is a dependency edge: From must succeed before To runs.
@@ -28,13 +40,14 @@ type DAGEdge struct {
 // point-in-time snapshot: reads never pause execution, so a later call sees
 // later states.
 type DAG struct {
-	RunID    string    `json:"run_id"`
-	Workflow string    `json:"workflow"`
-	Kind     Kind      `json:"kind"`
-	Status   Status    `json:"status"`
-	Queue    string    `json:"queue"`
-	Nodes    []DAGNode `json:"nodes"`
-	Edges    []DAGEdge `json:"edges"`
+	RunID    string     `json:"run_id"`
+	Workflow string     `json:"workflow"`
+	Kind     Kind       `json:"kind"`
+	Status   Status     `json:"status"`
+	Queue    string     `json:"queue"`
+	Nodes    []DAGNode  `json:"nodes"`
+	Edges    []DAGEdge  `json:"edges"`
+	Groups   []DAGGroup `json:"groups,omitempty"`
 }
 
 // DAG returns the step graph of a run with the current state of every node.

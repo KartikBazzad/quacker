@@ -51,7 +51,11 @@ func renderDAGSVG(d *DAG) []byte {
 	}
 
 	nodeW := dagNodeWidth(d.Nodes)
-	rowsH := float64(maxRows)*dagNodeH + float64(maxRows-1)*dagVGap
+	vgap := dagVGap
+	if len(d.Groups) > 0 {
+		vgap = 44 // room for a group label between stacked boxes
+	}
+	rowsH := float64(maxRows)*dagNodeH + float64(maxRows-1)*vgap
 	if maxRows <= 0 {
 		rowsH = 0
 	}
@@ -70,10 +74,10 @@ func renderDAGSVG(d *DAG) []byte {
 	pos := map[string][2]float64{}
 	for l, idxs := range byLevel {
 		x := dagPadX + float64(l)*(nodeW+dagHGap)
-		stackH := float64(len(idxs))*dagNodeH + float64(len(idxs)-1)*dagVGap
+		stackH := float64(len(idxs))*dagNodeH + float64(len(idxs)-1)*vgap
 		top := dagTitleH + dagPadY + (rowsH-stackH)/2
 		for i, ni := range idxs {
-			pos[d.Nodes[ni].Name] = [2]float64{x, top + float64(i)*(dagNodeH+dagVGap)}
+			pos[d.Nodes[ni].Name] = [2]float64{x, top + float64(i)*(dagNodeH+vgap)}
 		}
 	}
 
@@ -87,6 +91,46 @@ func renderDAGSVG(d *DAG) []byte {
 		dagPadX, escapeXML(d.Workflow))
 	fmt.Fprintf(&b, `<text x="%.0f" y="47" font-size="12" fill="#5f6368">%s · %s · %s</text>`,
 		dagPadX, escapeXML(string(d.Kind)), escapeXML(string(d.Status)), escapeXML(d.RunID))
+
+	// Run groups (a DAGTree): a labelled box behind each run's nodes.
+	if len(d.Groups) > 0 {
+		type gbox struct{ x0, y0, x1, y1 float64 }
+		boxes := map[string]*gbox{}
+		for _, n := range d.Nodes {
+			if n.Group == "" {
+				continue
+			}
+			bx := boxes[n.Group]
+			if bx == nil {
+				bx = &gbox{1e9, 1e9, -1e9, -1e9}
+				boxes[n.Group] = bx
+			}
+			p := pos[n.Name]
+			if p[0] < bx.x0 {
+				bx.x0 = p[0]
+			}
+			if p[1] < bx.y0 {
+				bx.y0 = p[1]
+			}
+			if p[0]+nodeW > bx.x1 {
+				bx.x1 = p[0] + nodeW
+			}
+			if p[1]+dagNodeH > bx.y1 {
+				bx.y1 = p[1] + dagNodeH
+			}
+		}
+		const gp = 16.0
+		for _, g := range d.Groups {
+			bx := boxes[g.Name]
+			if bx == nil {
+				continue
+			}
+			fmt.Fprintf(&b, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="12" fill="#fafaf9" stroke="#d6d3d1" stroke-dasharray="4 4"/>`,
+				bx.x0-gp, bx.y0-gp, bx.x1-bx.x0+gp*2, bx.y1-bx.y0+gp*2)
+			fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" font-size="11" font-weight="600" fill="#78716c">%s</text>`,
+				bx.x0-gp+10, bx.y0-gp+14, escapeXML(g.Label))
+		}
+	}
 
 	// Edges first, so boxes cover their endpoints.
 	for _, e := range d.Edges {
