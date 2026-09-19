@@ -1,9 +1,9 @@
 # Roadmap
 
-Status: **v0.3 in progress** — v0.2 is fully shipped; durable execution is
-complete (slices A/B/C: substrate + durable sleep, durable event waits, child
-runs), the DAG visualizer, and the embedded debug logger. Remaining v0.3:
-perf. Then worker labels, OTel, and the Postgres/multi-instance epic.
+Status: **v0.3 shipped** — durable execution (slices A/B/C: substrate +
+durable sleep, durable event waits, child runs), the DAG visualizer, the
+embedded debug logger, and the perf pass are all done. Next: worker labels,
+OTel, and the Postgres/multi-instance epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -193,7 +193,7 @@ join, a failed child does not fail the parent, and there is no foreign key,
 so a purged parent leaves its children with a dangling id (documented).
 Children are ordinary runs and are aged/purged independently.
 
-### Slice D — visibility & perf (in progress)
+### Slice D — visibility & perf (✅ DONE)
 
 - ✅ **DAG Visualizer** (`q.DAG`/`q.DAGJSON`/`q.DAGSVG`): a run's step graph
   with the **current state** of every node, as a structured model, indented
@@ -202,8 +202,11 @@ Children are ordinary runs and are aged/purged independently.
 - ✅ **Embedded debug logger**: `q.DebugLogs()` streams engine activity
   (claims, retries, suspensions, completions) plus anything logged via
   `q.DebugLogger()`, bounded and drop-on-full; the engine never serves HTTP.
-- **Perf**: batch enqueue, multi-queue claim batching in one transaction,
-  `-cpu` parallel benchmarks.
+- ✅ **Perf**: `quacker.EnqueueBatch` inserts many runs in one transaction;
+  `ClaimDueMulti` claims across every queue in a single transaction per tick
+  (was one per queue); parallel `-cpu` benchmarks added. Measured roughly
+  ~58µs/run batched vs per-call enqueue, and the single-writer contention
+  curve is visible with `-cpu 1,4,10` (see BENCHMARKS.md).
 
 ---
 

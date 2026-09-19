@@ -444,6 +444,28 @@ user pulls records and forwards them wherever — while the task-log sink chain
 are the engine's narration. `debugSend` checks a mutex-guarded closed flag, so
 a log emitted after `Close` drops instead of panicking on a closed channel.
 
+### 26. Batching amortizes the single writer without changing semantics
+
+Two hot paths paid a transaction per item: enqueue (one `CreateRun` per run)
+and claim (one `ClaimDue` per queue). Both now have batched forms —
+`CreateRuns`/`EnqueueBatch` (N runs, one tx) and `ClaimDueMulti` (all queues,
+one tx per tick). The semantics are intentionally unchanged:
+
+- **All-or-nothing enqueue.** A batch validates and inserts together; a bad
+  input or DAG leaves zero runs, matching the caller's expectation that a
+  batch either lands or doesn't. Waiters are registered under one lock and
+  removed together on failure, so a partial batch can't strand a waiter.
+- **Claims stay guarded and gated per queue.** `ClaimDueMulti` loops the same
+  `claimQueueTx` used by single-queue `ClaimDue` (which is now a one-element
+  wrapper), so the key gate, the rate-window budget, the resume arm, and the
+  per-step rows-affected check are byte-for-byte the same. Batching moves the
+  transaction boundary, not the admission rules.
+
+The trade is explicit: SQLite allows one writer, so parallel producers
+serialize and per-op latency rises with `-cpu` (see BENCHMARKS.md). Batching
+is the lever — amortize N runs over one commit rather than pretending the
+writer parallelizes.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

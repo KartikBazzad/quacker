@@ -1,7 +1,8 @@
 # Benchmarks
 
-Numbers from the v0.1 benchmark suite (`bench_test.go`). All values are
-single-process, embedded SQLite — there is no network anywhere in the loop.
+Numbers from the benchmark suite (`bench_test.go`, `internal/store/bench_test.go`).
+All values are single-process, embedded SQLite — there is no network anywhere
+in the loop.
 
 ## Results
 
@@ -35,10 +36,34 @@ write load against the same database.
   distributed system over Postgres and HTTP; quacker trades distribution for
   being ~free to embed.
 
+## Batching & parallelism (v0.3)
+
+`EnqueueBatch` inserts N runs in one transaction, and `ClaimDueMulti` claims
+across every queue in one transaction per scheduler tick (was one per queue).
+The insert win, isolated at the store layer so background execution doesn't
+pollute it (`BenchmarkCreateRunsBatch`, `ModeEphemeral`):
+
+```
+BenchmarkCreateRunsBatch/n=1-10      78,816 ns/op   (~79 µs/run)
+BenchmarkCreateRunsBatch/n=10-10    356,588 ns/op   (~36 µs/run)
+BenchmarkCreateRunsBatch/n=100-10  3,183,910 ns/op  (~32 µs/run)
+```
+
+A 100-run batch is ~2.5× cheaper per run than one run per transaction — the
+fixed commit cost is amortized. The scheduler wakes once per batch.
+
+Parallel producers do **not** scale linearly: SQLite allows one writer, so
+`BenchmarkEnqueueParallel` shows per-op latency *rising* with `-cpu` as
+producers serialize on the writer. That is the intended trade — embeddable
+and dependency-free over write parallelism — and the reason `EnqueueBatch`
+exists for fan-out.
+
 ## Reproduce
 
 ```sh
 go test -run XXX -bench . -benchtime 3000x ./...
+go test -run XXX -bench 'BenchmarkEnqueueParallel' -benchtime 3000x -cpu 1,4,10 .
+go test -run XXX -bench 'BenchmarkCreateRunsBatch' -benchtime 3000x ./internal/store/
 ```
 
 Drop `-benchtime` for quicker runs; raise it for stable numbers. Run with
@@ -49,7 +74,7 @@ backends; `File` on an SSD should be close to `Ephemeral` since
 
 ## What's not yet measured (follow-up candidates)
 
-- Parallel benchmark (`-cpu 1,4,10`) — scheduler contention above 1 producer.
-- `Ephemeral` vs `Memory` delta (expect: memory slightly faster per write,
-  at the cost of reader/writer lock contention).
-- Step fan-out cost for wide DAGs (claim loop batches per queue).
+- `Ephemeral` vs `Memory` vs `File` delta (expect: memory slightly faster per
+  write, at the cost of reader/writer lock contention).
+- Cost of a durable suspend/resume round-trip vs a plain retry.
+- Wide-DAG claim cost as the step count grows (the batch is one tx per tick).

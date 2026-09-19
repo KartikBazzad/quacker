@@ -155,6 +155,41 @@ func Enqueue[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], input
 	return enqueueTask(ctx, q, t, input, "", opts...)
 }
 
+// EnqueueBatch enqueues one run of task per input in a single write
+// transaction, returning handles in input order. It is all-or-nothing: a
+// validation or insert failure creates no runs. Use it to fan out many runs
+// cheaply instead of calling Enqueue in a loop.
+func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], inputs []I, opts ...EnqueueOption) ([]*RunHandle[O], error) {
+	ec := enqueueConfig{}
+	for _, opt := range opts {
+		opt(&ec)
+	}
+	reqs := make([]*engine.EnqueueRequest, len(inputs))
+	for i, in := range inputs {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return nil, err
+		}
+		reqs[i] = &engine.EnqueueRequest{
+			Workflow: t.name,
+			Kind:     store.KindTask,
+			Input:    b,
+			Priority: ec.priority,
+			RunAt:    ec.runAt,
+			Steps:    []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+		}
+	}
+	ws, err := q.eng.EnqueueBatch(ctx, reqs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*RunHandle[O], len(ws))
+	for i, w := range ws {
+		out[i] = &RunHandle[O]{runID: w.RunID, w: w}
+	}
+	return out, nil
+}
+
 // EnqueueChild enqueues one run of task as a child of the run currently
 // executing (from RunIDFromContext). It is only valid inside a task or
 // workflow step; the child runs independently (no implicit join), and

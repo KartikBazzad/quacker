@@ -150,16 +150,18 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
 
 1. **Enqueue** validates the DAG (unique names, deps exist, acyclic via
    Kahn's), inserts the run + steps in one write transaction, registers a
-   `Waiter`, and signals the scheduler's wake channel.
-2. **Claim**: the scheduler loop (50ms tick + wake) checks each queue's free
-   slots (`concurrency - inFlight`), then claims due steps — either
+   `Waiter`, and signals the scheduler's wake channel. `EnqueueBatch` does the
+   same for many runs in one transaction — all-or-nothing, one wake.
+2. **Claim**: the scheduler loop (50ms tick + wake) computes each queue's
+   free slots (`concurrency - inFlight`), then calls `ClaimDueMulti`, which
+   claims across **all** queues in a single immediate transaction (one tx per
+   tick, not one per queue). Per queue it claims due steps — either
    `status='QUEUED' AND run_at <= now` or `status='SUSPENDED' AND
    resume_at > 0 AND resume_at <= now` (a durable resume), ordered
-   `priority DESC, run_at ASC` — in one immediate transaction: `UPDATE steps
-   ... WHERE id=? AND status=...` with a rows-affected check, plus
-   `QUEUED→RUNNING` on the parent run for fresh claims. A resume stamps
-   `claimed_at` but not `attempts`. Two extra gates apply inside the same
-   transaction — a
+   `priority DESC, run_at ASC` — with `UPDATE steps ... WHERE id=? AND
+   status=...` and a rows-affected check, plus `QUEUED→RUNNING` on the parent
+   run for fresh claims. A resume stamps `claimed_at` but not `attempts`. Two
+   extra gates apply inside the same transaction — a
    **per-key gate** (`RUNNING` count sharing the step's `concurrency_key`
    must be below `key_limit`, re-checked per UPDATE so a batch of same-key
    candidates can't over-claim) and a **rate gate** (when the queue has a
@@ -294,7 +296,8 @@ does not fail the parent. See DESIGN_NOTES §22.
   RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
   restart-mid-sleep, durable WaitFor delivery/broadcast/timeout/restart and
   subscription semantics, child-run lineage/independence, DAG JSON/SVG and
-  XML-escaping, debug-log capture/close, recovery of suspended steps).
+  XML-escaping, debug-log capture/close, recovery of suspended steps,
+  batch enqueue and multi-queue claim).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
   keep-logs + orphan sweep, batching), the migration-v3 index, the
   migration-v4 event tables, and the migration-v5 journal/resume-claim path

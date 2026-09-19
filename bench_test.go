@@ -2,6 +2,7 @@ package quacker
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -29,6 +30,58 @@ func BenchmarkEnqueueRun(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkEnqueueBatch measures the cost of enqueuing 100 runs in one
+// transaction (per-op = 100 runs).
+func BenchmarkEnqueueBatch(b *testing.B) {
+	q, err := Open(WithStorage(Memory()), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	defer q.Close(ctx)
+
+	task := NewTask("batch", func(ctx context.Context, in benchIn) (benchOut, error) {
+		return benchOut{N: in.N}, nil
+	})
+	inputs := make([]benchIn, 100)
+	for i := range inputs {
+		inputs[i] = benchIn{N: i}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := EnqueueBatch(context.Background(), q, task, inputs); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEnqueueParallel measures enqueue contention from concurrent
+// producers; run with -cpu 1,4,10 to see the single-writer effect.
+func BenchmarkEnqueueParallel(b *testing.B) {
+	q, err := Open(WithStorage(Memory()), WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	defer q.Close(ctx)
+
+	task := NewTask("parallel-bench", func(ctx context.Context, in benchIn) (benchOut, error) {
+		return benchOut{N: in.N}, nil
+	})
+	var n atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := int(n.Add(1))
+			if _, err := Enqueue(context.Background(), q, task, benchIn{N: i}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 // BenchmarkThroughput measures end-to-end executions per second with results

@@ -282,6 +282,49 @@ func TestDepsJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCreateRunsAndClaimDueMulti: a batch insert, then one transaction claims
+// across two queues.
+func TestCreateRunsAndClaimDueMulti(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	mk := func(id, queue string) (*Run, []*Step) {
+		run := &Run{ID: id, Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: queue, RunAt: now, CreatedAt: now, MaxAttempts: 1}
+		step := &Step{ID: id + "/s", RunID: id, Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: queue, RunAt: now, CreatedAt: now, MaxAttempts: 1}
+		return run, []*Step{step}
+	}
+	r1, st1 := mk("r1", "q1")
+	r2, st2 := mk("r2", "q2")
+	if err := s.CreateRuns(ctx, []*Run{r1, r2}, [][]*Step{st1, st2}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimDueMulti(ctx, []QueueClaim{
+		{Name: "q1", Limit: 10},
+		{Name: "q2", Limit: 10},
+		{Name: "q3", Limit: 0}, // zero budget: skipped
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("claims = %d, want 2", len(claims))
+	}
+	got := map[string]bool{}
+	for _, c := range claims {
+		got[c.Step.Queue] = true
+		if c.Step.Status != StatusRunning {
+			t.Fatalf("claimed step %s status = %s", c.Step.ID, c.Step.Status)
+		}
+	}
+	if !got["q1"] || !got["q2"] {
+		t.Fatalf("claimed queues = %v, want q1 and q2", got)
+	}
+}
+
 // TestRecoverInterruptedFailsSuspendedStep: on RecoverRunningOnBoot(false), a
 // SUSPENDED step is failed with its run rather than left orphaned.
 func TestRecoverInterruptedFailsSuspendedStep(t *testing.T) {

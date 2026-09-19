@@ -56,6 +56,8 @@ is the wrong amount of infrastructure.
   with the current state of every node
 - **Child runs** — `quacker.EnqueueChild` from inside a task records lineage;
   `Execution` exposes a run's children
+- **Batch enqueue** — `quacker.EnqueueBatch` inserts many runs in one write
+  transaction
 - **Cron & delayed runs** — cron specs (`"@daily"`, `"0 9 * * 1-5"`), sub-second
   `"@every 250ms"`, and `quacker.WithDelay`; crons persist and re-arm on
   restart

@@ -11,32 +11,42 @@ import (
 
 // CreateRun inserts a run and its initial steps in one transaction.
 func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
+	return s.CreateRuns(ctx, []*Run{run}, [][]*Step{steps})
+}
+
+// CreateRuns inserts several runs and their steps in one transaction — one
+// transaction for a batch enqueue instead of one per run.
+func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) error {
+	if len(runs) != len(steps) {
+		return fmt.Errorf("quacker: CreateRuns: %d runs, %d step sets", len(runs), len(steps))
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?)`,
-		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID)
-	if err != nil {
-		return fmt.Errorf("quacker: insert run: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("quacker: insert run: %d rows affected", n)
-	}
-	for _, st := range steps {
-		_, err := tx.ExecContext(ctx, `INSERT INTO steps
-			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit)
-			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?)`,
-			st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, joinDeps(st.DependsOn), st.Queue, st.Priority,
-			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
-			st.ConcurrencyKey, st.KeyLimit)
+	for i, run := range runs {
+		res, err := tx.ExecContext(ctx, `INSERT INTO runs
+			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id)
+			VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?)`,
+			run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
+			run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID)
 		if err != nil {
-			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
+			return fmt.Errorf("quacker: insert run: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("quacker: insert run: %d rows affected", n)
+		}
+		for _, st := range steps[i] {
+			_, err := tx.ExecContext(ctx, `INSERT INTO steps
+				(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit)
+				VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?)`,
+				st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, joinDeps(st.DependsOn), st.Queue, st.Priority,
+				st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
+				st.ConcurrencyKey, st.KeyLimit)
+			if err != nil {
+				return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
+			}
 		}
 	}
 	return tx.Commit()
@@ -257,40 +267,112 @@ const keyGate = `(concurrency_key = '' OR key_limit <= 0 OR
 		WHERE r.concurrency_key = steps.concurrency_key
 		AND r.status = '` + StatusRunning + `') < steps.key_limit)`
 
-// ClaimDue claims up to limit due steps for the given queue, moving them and
-// their parent runs to RUNNING. Safe under concurrency: executed on the single
-// writer connection inside one immediate transaction, and each UPDATE is
-// guarded on the step still being QUEUED and its key gate.
-//
-// When rateLimit > 0 the queue is rate-limited: at most rateLimit steps may
-// be claimed in the trailing rateWindow nanoseconds (a sliding window over
-// claimed_at), so limit is capped at the window's remaining budget. The
-// count is persisted, so the window survives a File-mode restart instead of
-// allowing a fresh-process burst.
+// QueueClaim is one queue's claim budget for ClaimDueMulti.
+type QueueClaim struct {
+	Name  string
+	Limit int
+	// RateLimit/RateWindow are the queue's sliding-window start cap; a
+	// RateLimit <= 0 disables it.
+	RateLimit  int64
+	RateWindow int64
+}
+
+// ClaimDue claims up to limit due steps for one queue, moving them and their
+// parent runs to RUNNING. It is ClaimDueMulti with a single queue.
 func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64, rateLimit, rateWindow int64) ([]*Claim, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
+	return s.ClaimDueMulti(ctx, []QueueClaim{{
+		Name: queue, Limit: limit, RateLimit: rateLimit, RateWindow: rateWindow,
+	}}, now)
+}
+
+// ClaimDueMulti claims due steps across several queues in one write
+// transaction — one transaction per scheduler tick rather than one per queue.
+// Each queue is capped at its own limit and rate window, and the per-key gate
+// plus the guarded UPDATE are unchanged. Safe under concurrency: the single
+// writer connection serializes the whole batch, and each step UPDATE is
+// re-guarded on its still being claimable.
+func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64) ([]*Claim, error) {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
-	if rateLimit > 0 {
+	var claims []*Claim
+	for _, q := range queues {
+		cs, err := s.claimQueueTx(ctx, tx, q, now)
+		if err != nil {
+			return nil, err
+		}
+		claims = append(claims, cs...)
+	}
+	if len(claims) == 0 {
+		return nil, tx.Commit()
+	}
+	// Attach run rows for the whole batch in one query.
+	ids := make([]string, len(claims))
+	for i, c := range claims {
+		ids[i] = c.Step.RunID
+	}
+	q := `SELECT ` + runCols + ` FROM runs WHERE id IN (` + placeholders(len(ids)) + `)`
+	rrows, err := tx.QueryContext(ctx, q, argsAny(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	byRun := map[string]*Run{}
+	for rrows.Next() {
+		r, err := scanRun(rrows)
+		if err != nil {
+			rrows.Close()
+			return nil, err
+		}
+		byRun[r.ID] = r
+	}
+	rrows.Close()
+	if err := rrows.Err(); err != nil {
+		return nil, err
+	}
+	for _, c := range claims {
+		if r := byRun[c.Step.RunID]; r != nil {
+			r.Status = StatusRunning
+			if r.StartedAt == 0 {
+				r.StartedAt = now
+			}
+			c.Run = r
+		}
+	}
+	return claims, tx.Commit()
+}
+
+// claimQueueTx claims up to q.Limit steps for one queue inside an existing
+// transaction. Returned claims have their Run unset (ClaimDueMulti attaches
+// runs for the whole batch).
+//
+// When RateLimit > 0 the queue is rate-limited: at most RateLimit steps may
+// be claimed in the trailing RateWindow nanoseconds (a sliding window over
+// claimed_at), so the limit is capped at the window's remaining budget. The
+// count is persisted, so the window survives a File-mode restart instead of
+// allowing a fresh-process burst.
+func (s *Store) claimQueueTx(ctx context.Context, tx *sql.Tx, q QueueClaim, now int64) ([]*Claim, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		return nil, nil
+	}
+	if q.RateLimit > 0 {
+		rateWindow := q.RateWindow
 		if rateWindow <= 0 {
 			rateWindow = int64(time.Second)
 		}
 		var started int64
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE queue=? AND claimed_at >= ?`,
-			queue, now-rateWindow).Scan(&started); err != nil {
+			q.Name, now-rateWindow).Scan(&started); err != nil {
 			return nil, err
 		}
-		if remaining := rateLimit - started; remaining < int64(limit) {
+		if remaining := q.RateLimit - started; remaining < int64(limit) {
 			limit = int(remaining)
 		}
 		if limit <= 0 {
-			return nil, tx.Commit()
+			return nil, nil
 		}
 	}
 
@@ -303,7 +385,7 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
 		) AND `+keyGate+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
-		queue, StatusQueued, now, StatusSuspended, now, limit)
+		q.Name, StatusQueued, now, StatusSuspended, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -365,42 +447,7 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 		st.ResumeAt = 0
 		claims = append(claims, &Claim{Step: st, Resumed: resumed})
 	}
-	if len(claims) == 0 {
-		return nil, tx.Commit()
-	}
-	// Attach run rows.
-	ids := make([]string, len(claims))
-	for i, c := range claims {
-		ids[i] = c.Step.RunID
-	}
-	q := `SELECT ` + runCols + ` FROM runs WHERE id IN (` + placeholders(len(ids)) + `)`
-	rrows, err := tx.QueryContext(ctx, q, argsAny(ids)...)
-	if err != nil {
-		return nil, err
-	}
-	byRun := map[string]*Run{}
-	for rrows.Next() {
-		r, err := scanRun(rrows)
-		if err != nil {
-			rrows.Close()
-			return nil, err
-		}
-		byRun[r.ID] = r
-	}
-	rrows.Close()
-	if err := rrows.Err(); err != nil {
-		return nil, err
-	}
-	for _, c := range claims {
-		if r := byRun[c.Step.RunID]; r != nil {
-			r.Status = StatusRunning
-			if r.StartedAt == 0 {
-				r.StartedAt = now
-			}
-			c.Run = r
-		}
-	}
-	return claims, tx.Commit()
+	return claims, nil
 }
 
 // CompleteResult describes what a CompleteStep transaction changed.

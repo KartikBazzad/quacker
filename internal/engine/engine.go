@@ -485,27 +485,81 @@ func (w *Waiter) Done() <-chan struct{} { return w.ch }
 // waiter for the run. The first wake-up signal is sent to the scheduler.
 // The caller's ctx governs the insert: a cancelled ctx means no run.
 func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, error) {
+	ws, err := e.EnqueueBatch(ctx, []*EnqueueRequest{req})
+	if err != nil {
+		return nil, err
+	}
+	return ws[0], nil
+}
+
+// EnqueueBatch enqueues several runs in one write transaction and returns one
+// waiter per request, in order. It is all-or-nothing: a validation or insert
+// failure rolls the whole batch back. The scheduler is woken once.
+func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*Waiter, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
 	if ctx == nil {
 		ctx = e.ctx
 	}
+	now := e.now()
+	runs := make([]*store.Run, len(reqs))
+	steps := make([][]*store.Step, len(reqs))
+	waiters := make([]*Waiter, len(reqs))
+	for i, req := range reqs {
+		if req == nil {
+			return nil, errors.New("quacker: nil enqueue request")
+		}
+		run, sts, err := e.buildRun(req, now)
+		if err != nil {
+			return nil, err
+		}
+		runs[i], steps[i], waiters[i] = run, sts, newWaiter(run.ID)
+	}
+
+	// Registration and the closing check happen under one lock so an enqueue
+	// racing Close either lands in the sweep or is rejected — never stranded
+	// as a waiter nobody will ever release.
+	e.mu.Lock()
+	if e.closing.Load() {
+		e.mu.Unlock()
+		return nil, ErrClosed
+	}
+	for _, w := range waiters {
+		e.waiters[w.RunID] = w
+	}
+	e.mu.Unlock()
+
+	if err := e.st.CreateRuns(ctx, runs, steps); err != nil {
+		e.mu.Lock()
+		for _, w := range waiters {
+			delete(e.waiters, w.RunID)
+		}
+		e.mu.Unlock()
+		return nil, err
+	}
+	e.wakeScheduler()
+	return waiters, nil
+}
+
+// buildRun validates one enqueue request and materializes its run and steps.
+func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*store.Step, error) {
 	if len(req.Steps) == 0 {
-		return nil, errors.New("quacker: enqueue requires at least one step")
+		return nil, nil, errors.New("quacker: enqueue requires at least one step")
 	}
 	queue := normQueue(req.Queue)
-	if queue == "default" && len(req.Steps) > 0 && req.Steps[0].Def != nil {
+	if queue == "default" && req.Steps[0].Def != nil {
 		queue = normQueue(req.Steps[0].Def.Queue)
 	}
 	e.ensureQueue(queue)
 	if err := validateDAG(req.Steps); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	now := e.now()
 	runAt := req.RunAt
 	if runAt.IsZero() {
 		runAt = now
 	}
 	runID := newID(now)
-
 	run := &store.Run{
 		ID: runID, Workflow: req.Workflow, Kind: req.Kind, Status: store.StatusQueued,
 		Queue: queue, Priority: req.Priority, Input: req.Input, ParentID: req.ParentID,
@@ -515,7 +569,7 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 	for i, sr := range req.Steps {
 		def := sr.Def
 		if def == nil {
-			return nil, fmt.Errorf("quacker: step %q has no task definition", sr.Name)
+			return nil, nil, fmt.Errorf("quacker: step %q has no task definition", sr.Name)
 		}
 		e.RegisterTask(def) // latest definition wins; also arms matching triggers
 		stepQueue := normQueue(def.Queue)
@@ -553,27 +607,7 @@ func (e *Engine) Enqueue(ctx context.Context, req *EnqueueRequest) (*Waiter, err
 	// run-level max attempts mirrors the first step for introspection.
 	run.MaxAttempts = steps[0].MaxAttempts
 	run.ConcurrencyKey = steps[0].ConcurrencyKey
-
-	// Registration and the closing check happen under one lock so an enqueue
-	// racing Close either lands in the sweep or is rejected — never stranded
-	// as a waiter nobody will ever release.
-	w := newWaiter(runID)
-	e.mu.Lock()
-	if e.closing.Load() {
-		e.mu.Unlock()
-		return nil, ErrClosed
-	}
-	e.waiters[runID] = w
-	e.mu.Unlock()
-
-	if err := e.st.CreateRun(ctx, run, steps); err != nil {
-		e.mu.Lock()
-		delete(e.waiters, runID)
-		e.mu.Unlock()
-		return nil, err
-	}
-	e.wakeScheduler()
-	return w, nil
+	return run, steps, nil
 }
 
 // Cancel cancels a run. Queued/blocked steps are CANCELLED immediately and
@@ -645,47 +679,54 @@ func (e *Engine) tick() {
 	e.mu.Unlock()
 
 	now := e.now().UnixNano()
-	runStarted := map[string]bool{} // one run-level QUEUED→RUNNING per run per tick
+	// Build each queue's free-slot budget, then claim across all of them in a
+	// single write transaction (one tx per tick instead of one per queue).
+	var reqs []store.QueueClaim
+	budget := make(map[string]*queueState, len(snapshot))
 	for q, qs := range snapshot {
-		for {
-			slots := int(qs.concurrency.Load()) - int(qs.inFlight.Load())
-			if slots <= 0 {
-				break
-			}
-			claims, err := e.st.ClaimDue(e.ctx, q, slots, now,
-				qs.rateLimit.Load(), qs.rateWindow.Load())
-			if err != nil {
-				if e.ctx.Err() == nil {
-					e.log.Error("quacker: claim failed", "queue", q, "err", err)
-				}
-				break
-			}
-			if len(claims) == 0 {
-				break
-			}
-			for _, c := range claims {
-				qs.inFlight.Add(1)
-				e.wg.Add(1)
-				// Publish before spawning: a fast task's completion event must
-				// never overtake its claim event.
-				from := store.StatusQueued
-				if c.Resumed {
-					from = store.StatusSuspended
-				}
-				e.publish(c.Step.RunID, c.Step.Name, from, store.StatusRunning, "", now)
-				e.log.Debug("quacker: claimed step",
-					"run", c.Step.RunID, "step", c.Step.Name, "queue", q,
-					"attempt", c.Step.Attempts, "resumed", c.Resumed)
-				if c.Run != nil && c.Run.StartedAt == now && !runStarted[c.Step.RunID] {
-					runStarted[c.Step.RunID] = true
-					e.publish(c.Step.RunID, "", store.StatusQueued, store.StatusRunning, "", now)
-				}
-				go e.execute(c, qs)
-			}
-			if len(claims) < slots {
-				break // queue drained
-			}
+		slots := int(qs.concurrency.Load()) - int(qs.inFlight.Load())
+		if slots <= 0 {
+			continue
 		}
+		reqs = append(reqs, store.QueueClaim{
+			Name: q, Limit: slots,
+			RateLimit: qs.rateLimit.Load(), RateWindow: qs.rateWindow.Load(),
+		})
+		budget[q] = qs
+	}
+	if len(reqs) == 0 {
+		return
+	}
+	claims, err := e.st.ClaimDueMulti(e.ctx, reqs, now)
+	if err != nil {
+		if e.ctx.Err() == nil {
+			e.log.Error("quacker: claim failed", "err", err)
+		}
+		return
+	}
+	runStarted := map[string]bool{} // one run-level QUEUED→RUNNING per run per tick
+	for _, c := range claims {
+		qs := budget[c.Step.Queue]
+		if qs == nil {
+			continue
+		}
+		qs.inFlight.Add(1)
+		e.wg.Add(1)
+		// Publish before spawning: a fast task's completion event must never
+		// overtake its claim event.
+		from := store.StatusQueued
+		if c.Resumed {
+			from = store.StatusSuspended
+		}
+		e.publish(c.Step.RunID, c.Step.Name, from, store.StatusRunning, "", now)
+		e.log.Debug("quacker: claimed step",
+			"run", c.Step.RunID, "step", c.Step.Name, "queue", c.Step.Queue,
+			"attempt", c.Step.Attempts, "resumed", c.Resumed)
+		if c.Run != nil && c.Run.StartedAt == now && !runStarted[c.Step.RunID] {
+			runStarted[c.Step.RunID] = true
+			e.publish(c.Step.RunID, "", store.StatusQueued, store.StatusRunning, "", now)
+		}
+		go e.execute(c, qs)
 	}
 }
 
