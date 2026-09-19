@@ -155,6 +155,28 @@ func CorrelatedKeyGate() string {
 		AND r.status = 'RUNNING') < steps.key_limit)`
 }
 
+// UniqueViolationer is an optional Backend extension: it reports whether an
+// error is a unique-constraint violation, so the engine can resolve unique-job
+// conflicts. Drivers that do not implement it fall back to matching the error
+// text for "unique"/"duplicate".
+type UniqueViolationer interface {
+	IsUniqueViolation(err error) bool
+}
+
+// IsUniqueViolation reports whether err is a unique-constraint violation from
+// be, using its UniqueViolationer if implemented and a text heuristic
+// otherwise.
+func IsUniqueViolation(be Backend, err error) bool {
+	if err == nil {
+		return false
+	}
+	if u, ok := be.(UniqueViolationer); ok {
+		return u.IsUniqueViolation(err)
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "unique") || strings.Contains(s, "duplicate")
+}
+
 // MigrateLocker is an optional Backend extension for drivers whose migration
 // lock is session-scoped (MySQL's GET_LOCK) rather than transaction-scoped.
 // When a driver implements it, migrate acquires the lock for the whole

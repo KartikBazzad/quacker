@@ -225,6 +225,13 @@ const migration12 = `
 ALTER TABLE step_journal RENAME COLUMN key TO wkey;
 `
 
+// migration13 adds unique jobs: a nullable unique_key (NULL for non-unique
+// runs, which unique indexes ignore) and a unique index per (workflow, key).
+const migration13 = `
+ALTER TABLE runs ADD COLUMN unique_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_unique ON runs (workflow, unique_key);
+`
+
 var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -238,6 +245,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 10, SQL: migration10},
 	{Version: 11, SQL: migration11},
 	{Version: 12, SQL: migration12},
+	{Version: 13, SQL: migration13},
 }
 
 // init validates the built-in migration list's invariant before any Open can
@@ -368,6 +376,10 @@ func (s *Store) recoverInterrupted(ctx context.Context, keep bool) error {
 				// so it resumes when due.)
 				statuses = append(statuses, StatusSuspended)
 			}
+		}
+		if table == "runs" && !keep {
+			// A failed run frees its unique key; a requeued one keeps it.
+			extra = ", unique_key = NULL"
 		}
 		// keep and !keep are distinct statements rather than one CASE: a CASE
 		// with an integer ELSE makes Postgres infer a 32-bit type for the

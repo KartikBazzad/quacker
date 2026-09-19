@@ -207,6 +207,42 @@ func TestMySQLLabelsAndPurge(t *testing.T) {
 	}
 }
 
+func TestMySQLUniqueReuse(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	task := quacker.NewTask("my.unique", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.WithUnique(func(in string) string { return in }))
+	future := quacker.WithRunAt(time.Now().Add(time.Hour))
+
+	h1, err := quacker.Enqueue(ctx, a, task, "k", future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := quacker.Enqueue(ctx, b, task, "k", future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1.RunID() != h2.RunID() {
+		t.Fatalf("cross-engine reuse: %s vs %s", h1.RunID(), h2.RunID())
+	}
+
+	errTask := quacker.NewTask("my.unique.err", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.WithUnique(func(in string) string { return in }),
+		quacker.WithUniqueConflict(quacker.UniqueError))
+	if _, err := quacker.Enqueue(ctx, a, errTask, "e", future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := quacker.Enqueue(ctx, b, errTask, "e", future); !errors.Is(err, quacker.ErrDuplicateJob) {
+		t.Fatalf("want ErrDuplicateJob, got %v", err)
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)

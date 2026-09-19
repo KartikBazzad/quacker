@@ -135,3 +135,10 @@ CREATE TABLE IF NOT EXISTS locks (
 
 INSERT IGNORE INTO locks (name) VALUES ('claim');
 `
+
+// myMigration2 adds unique jobs: a nullable unique_key (NULL for non-unique
+// runs, which unique indexes ignore) and a unique index per (workflow, key).
+const myMigration2 = `
+ALTER TABLE runs ADD COLUMN unique_key VARCHAR(255) NULL;
+CREATE UNIQUE INDEX uq_runs_unique ON runs (workflow, unique_key);
+`

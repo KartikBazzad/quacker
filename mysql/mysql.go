@@ -18,9 +18,10 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
-	_ "github.com/go-sql-driver/mysql" // registers the "mysql" database/sql driver
+	gomysql "github.com/go-sql-driver/mysql" // registers the "mysql" database/sql driver
 
 	"github.com/kartikbazzad/quacker/driver"
 )
@@ -35,7 +36,10 @@ func (myBackend) Name() string { return "mysql" }
 func (myBackend) Rebind(q string) string { return q }
 
 func (myBackend) Migrations() []driver.Migration {
-	return []driver.Migration{{Version: 1, SQL: mySchema}}
+	return []driver.Migration{
+		{Version: 1, SQL: mySchema},
+		{Version: 2, SQL: myMigration2},
+	}
 }
 
 // MigrateLock is unused: the MySQL driver implements LockMigration instead,
@@ -103,6 +107,12 @@ func (myBackend) KeyGate() string {
 	return `(concurrency_key = '' OR key_limit <= 0 OR
 	(SELECT COUNT(*) FROM (SELECT concurrency_key FROM steps WHERE status = 'RUNNING') AS r
 		WHERE r.concurrency_key = steps.concurrency_key) < steps.key_limit)`
+}
+
+// IsUniqueViolation matches MySQL/MariaDB error 1062 (ER_DUP_ENTRY).
+func (myBackend) IsUniqueViolation(err error) bool {
+	var me *gomysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
 }
 
 // LabelGate admits a step only when its labels array is a subset of the

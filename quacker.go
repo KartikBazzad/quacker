@@ -14,6 +14,7 @@ package quacker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -136,8 +137,46 @@ func (q *Quacker) RemoveCron(name string) error { return q.eng.RemoveCron(name) 
 type EnqueueOption func(*enqueueConfig)
 
 type enqueueConfig struct {
-	runAt    time.Time
-	priority int64
+	runAt        time.Time
+	priority     int64
+	uniqueKey    string
+	uniqueKeySet bool
+}
+
+// UniqueConflict selects what a unique run does when its key is already held by
+// a live run. Set the default per task with WithUniqueConflict.
+type UniqueConflict = store.UniqueConflict
+
+const (
+	// UniqueReuse returns the live run's handle and creates nothing.
+	UniqueReuse = store.UniqueReuse
+	// UniqueError fails the enqueue with ErrDuplicateJob.
+	UniqueError = store.UniqueError
+	// UniqueReplace cancels the live run and enqueues the new one.
+	UniqueReplace = store.UniqueReplace
+)
+
+// ErrDuplicateJob is returned by an enqueue under UniqueError when a live run
+// already holds the unique key.
+var ErrDuplicateJob = store.ErrDuplicateJob
+
+// WithUniqueKey sets the run's unique key explicitly, overriding a task's
+// WithUnique. The key is scoped to the task/workflow name, and "" means the
+// run is not unique.
+func WithUniqueKey(key string) EnqueueOption {
+	return func(c *enqueueConfig) { c.uniqueKey, c.uniqueKeySet = key, true }
+}
+
+// uniqueKeyFor resolves the unique key for one enqueue: the explicit
+// WithUniqueKey if set, else the task's WithUnique function.
+func uniqueKeyFor(ec *enqueueConfig, cfg *taskConfig, codec engine.Codec, input json.RawMessage) string {
+	if ec.uniqueKeySet {
+		return ec.uniqueKey
+	}
+	if cfg != nil && cfg.uniqueOn && cfg.uniqueFn != nil {
+		return cfg.uniqueFn(codec, input)
+	}
+	return ""
 }
 
 // WithDelay schedules the run to start at least d from now.
@@ -177,12 +216,14 @@ func EnqueueBatch[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], 
 			return nil, err
 		}
 		reqs[i] = &engine.EnqueueRequest{
-			Workflow: t.name,
-			Kind:     store.KindTask,
-			Input:    b,
-			Priority: ec.priority,
-			RunAt:    ec.runAt,
-			Steps:    []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+			Workflow:  t.name,
+			Kind:      store.KindTask,
+			Input:     b,
+			Priority:  ec.priority,
+			RunAt:     ec.runAt,
+			UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), b),
+			Conflict:  t.cfg.uniqueMode,
+			Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 		}
 	}
 	ws, err := q.eng.EnqueueBatch(ctx, reqs)
@@ -218,13 +259,15 @@ func enqueueTask[I any, O any](ctx context.Context, q *Quacker, t *Task[I, O], i
 		return nil, err
 	}
 	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
-		Workflow: t.name,
-		Kind:     store.KindTask,
-		Input:    inputJSON,
-		Priority: ec.priority,
-		RunAt:    ec.runAt,
-		ParentID: parent,
-		Steps:    []engine.StepReq{{Name: t.name, Def: t.toDef()}},
+		Workflow:  t.name,
+		Kind:      store.KindTask,
+		Input:     inputJSON,
+		Priority:  ec.priority,
+		RunAt:     ec.runAt,
+		ParentID:  parent,
+		UniqueKey: uniqueKeyFor(&ec, &t.cfg, q.eng.Codec(), inputJSON),
+		Conflict:  t.cfg.uniqueMode,
+		Steps:     []engine.StepReq{{Name: t.name, Def: t.toDef()}},
 	})
 	if err != nil {
 		return nil, err
@@ -265,13 +308,14 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 		steps[i] = engine.StepReq{Name: s.name, Deps: s.deps, Def: s.def}
 	}
 	w, err := q.eng.Enqueue(ctx, &engine.EnqueueRequest{
-		Workflow: wf.name,
-		Kind:     store.KindWorkflow,
-		Input:    inputJSON,
-		Priority: ec.priority,
-		RunAt:    ec.runAt,
-		ParentID: parent,
-		Steps:    steps,
+		Workflow:  wf.name,
+		Kind:      store.KindWorkflow,
+		Input:     inputJSON,
+		Priority:  ec.priority,
+		RunAt:     ec.runAt,
+		ParentID:  parent,
+		UniqueKey: ec.uniqueKey,
+		Steps:     steps,
 	})
 	if err != nil {
 		return nil, err

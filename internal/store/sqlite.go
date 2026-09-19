@@ -42,6 +42,11 @@ func (sqliteBackend) SupportsCheckpoint(cfg driver.Config) bool { return cfg.Mod
 
 func (sqliteBackend) RecoverOnBoot(cfg driver.Config) bool { return cfg.Mode == driver.ModeFile }
 
+// IsUniqueViolation matches modernc's UNIQUE-constraint error text.
+func (sqliteBackend) IsUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
 func (sqliteBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
 
 func (sqliteBackend) LabelGate() string {

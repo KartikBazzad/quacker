@@ -88,7 +88,11 @@ type EnqueueRequest struct {
 	// ParentID links this run to the run that enqueued it ("" for a root
 	// run). Lineage is informational.
 	ParentID string
-	Steps    []StepReq
+	// UniqueKey, when non-empty, makes the run unique per (workflow, key)
+	// among non-terminal runs. Conflict selects the outcome on collision.
+	UniqueKey string
+	Conflict  store.UniqueConflict
+	Steps     []StepReq
 }
 
 // CronInfo describes a registered cron trigger.
@@ -570,6 +574,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	now := e.now()
 	runs := make([]*store.Run, len(reqs))
 	steps := make([][]*store.Step, len(reqs))
+	conflicts := make([]store.UniqueConflict, len(reqs))
 	waiters := make([]*Waiter, len(reqs))
 	infos := make([]EnqueueInfo, len(reqs))
 	var enqueueSpans []trace.Span
@@ -592,6 +597,7 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 			return nil, herr // plugin veto: nothing is written
 		}
 		infos[i] = info
+		conflicts[i] = req.Conflict
 		if span != nil {
 			// Record the producer span so the executing step can link to it,
 			// even after a restart or on another process.
@@ -621,7 +627,8 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 	}
 	e.mu.Unlock()
 
-	if err := e.st.CreateRuns(ctx, runs, steps); err != nil {
+	ids, replaced, err := e.createRuns(ctx, runs, steps, conflicts)
+	if err != nil {
 		e.mu.Lock()
 		for _, w := range waiters {
 			delete(e.waiters, w.RunID)
@@ -630,9 +637,85 @@ func (e *Engine) EnqueueBatch(ctx context.Context, reqs []*EnqueueRequest) ([]*W
 		e.afterEnqueueReverse(ctx, infos, err)
 		return nil, err
 	}
+
+	// A reused unique run keeps its own id; rebind the caller's handle to a
+	// waiter for that run (the local waiter if this engine owns it, else a
+	// poller), and drop the placeholder we registered for the new id.
+	inserted := false
+	e.mu.Lock()
+	for i, id := range ids {
+		if id == runs[i].ID {
+			inserted = true
+			continue
+		}
+		delete(e.waiters, waiters[i].RunID)
+		if existing, ok := e.waiters[id]; ok {
+			waiters[i] = existing
+			continue
+		}
+		pw := e.newPollWaiter(id)
+		e.waiters[id] = pw
+		waiters[i] = pw
+	}
+	e.mu.Unlock()
+
+	// UniqueReplace cancelled these runs in the store; interrupt locally now.
+	for _, r := range replaced {
+		e.interruptLocal(r.RunID, store.StatusRunning, r.RunningSteps, e.now().UnixNano())
+	}
+
 	e.afterEnqueueReverse(ctx, infos, nil)
-	e.wakeScheduler()
+	if inserted || len(replaced) > 0 {
+		e.wakeScheduler()
+	}
 	return waiters, nil
+}
+
+// createRuns inserts the batch, re-resolving unique conflicts. A concurrent
+// enqueue that wins a key surfaces as ErrUniqueViolation; the retry sees the
+// winner and reuses/errors/replaces per policy. Bounded so a pathological
+// stream of collisions cannot spin.
+func (e *Engine) createRuns(ctx context.Context, runs []*store.Run, steps [][]*store.Step, conflicts []store.UniqueConflict) ([]string, []store.ReplacedRun, error) {
+	var (
+		ids      []string
+		replaced []store.ReplacedRun
+		err      error
+	)
+	for attempt := 0; attempt < 3; attempt++ {
+		ids, replaced, err = e.st.CreateRunsUnique(ctx, runs, steps, conflicts)
+		if err == nil {
+			return ids, replaced, nil
+		}
+		if !errors.Is(err, store.ErrUniqueViolation) {
+			return nil, nil, err
+		}
+	}
+	return nil, nil, err
+}
+
+// newPollWaiter waits for a run this engine may not execute (a reused unique
+// run, possibly from another instance) by polling the store until it is
+// terminal.
+func (e *Engine) newPollWaiter(runID string) *Waiter {
+	w := newWaiter(runID)
+	go func() {
+		t := time.NewTicker(e.poll)
+		defer t.Stop()
+		for {
+			r, err := e.st.GetRun(e.ctx, runID)
+			if err == nil && store.IsTerminal(r.Status) {
+				w.finish(r.Status, json.RawMessage(r.Output), runErr(runID, r.Status, r.Error))
+				return
+			}
+			select {
+			case <-e.ctx.Done():
+				w.finish(store.StatusInterrupted, nil, ErrRunInterrupted)
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return w
 }
 
 // afterEnqueueReverse fires AfterEnqueue for each info in reverse
@@ -664,6 +747,7 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 	run := &store.Run{
 		ID: runID, Workflow: req.Workflow, Kind: req.Kind, Status: store.StatusQueued,
 		Queue: queue, Priority: req.Priority, Input: req.Input, ParentID: req.ParentID,
+		UniqueKey:   req.UniqueKey,
 		MaxAttempts: 1, RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
 	}
 	var steps []*store.Step
@@ -723,6 +807,14 @@ func (e *Engine) Cancel(runID string) error {
 	if err != nil || !ok {
 		return err
 	}
+	e.interruptLocal(runID, prevStatus, running, now)
+	return nil
+}
+
+// interruptLocal cancels the contexts of a run's running steps, releases its
+// waiter with ErrRunCancelled, and publishes the transition. It is the
+// in-memory half of Cancel, shared with UniqueReplace.
+func (e *Engine) interruptLocal(runID, prevStatus string, running []string, now int64) {
 	e.mu.Lock()
 	var cancels []context.CancelFunc
 	for _, stepID := range running {
@@ -744,7 +836,6 @@ func (e *Engine) Cancel(runID string) error {
 		w.finish(store.StatusCancelled, nil, ErrRunCancelled)
 	}
 	e.publish(runID, "", prevStatus, store.StatusCancelled, "", now)
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,16 +1146,21 @@ func (e *Engine) cancelStepContexts(stepIDs []string) {
 }
 
 // finishRun releases the waiter and publishes the run-level transition.
-func (e *Engine) finishRun(runID, status string, output json.RawMessage, errMsg string, now int64) {
-	var err error
+// runErr maps a terminal run status to the error a waiter should observe.
+func runErr(runID, status, errMsg string) error {
 	switch status {
 	case store.StatusFailed:
-		err = &RunError{RunID: runID, Msg: errMsg}
+		return &RunError{RunID: runID, Msg: errMsg}
 	case store.StatusCancelled:
-		err = ErrRunCancelled
+		return ErrRunCancelled
 	case store.StatusInterrupted:
-		err = ErrRunInterrupted
+		return ErrRunInterrupted
 	}
+	return nil
+}
+
+func (e *Engine) finishRun(runID, status string, output json.RawMessage, errMsg string, now int64) {
+	err := runErr(runID, status, errMsg)
 	e.mu.Lock()
 	w := e.waiters[runID]
 	delete(e.waiters, runID) // handles are short-lived; keep the map bounded

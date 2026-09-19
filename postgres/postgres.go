@@ -17,10 +17,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 
 	"github.com/kartikbazzad/quacker/driver"
@@ -54,6 +56,7 @@ func (pgBackend) Migrations() []driver.Migration {
 		{Version: 2, SQL: pgMigration2},
 		{Version: 3, SQL: pgMigration3},
 		{Version: 4, SQL: pgMigration4},
+		{Version: 5, SQL: pgMigration5},
 	}
 }
 
@@ -95,6 +98,12 @@ func (pgBackend) SupportsCheckpoint(driver.Config) bool { return false }
 // steal a peer node's in-flight work. The lease reaper recovers a crashed
 // node's steps instead.
 func (pgBackend) RecoverOnBoot(driver.Config) bool { return false }
+
+// IsUniqueViolation matches Postgres SQLSTATE 23505 (unique_violation).
+func (pgBackend) IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
 
 func (pgBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
 

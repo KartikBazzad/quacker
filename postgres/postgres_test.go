@@ -247,6 +247,50 @@ func TestPostgresTwoEngines(t *testing.T) {
 	})
 }
 
+// TestPostgresUniqueReuse: a unique key held by one engine's run is reused by
+// another engine sharing the database.
+func TestPostgresUniqueReuse(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+
+	task := quacker.NewTask("pg.unique", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.WithUnique(func(in string) string { return in }))
+	// Scheduled ahead so the run stays QUEUED and the key stays held.
+	future := quacker.WithRunAt(time.Now().Add(time.Hour))
+
+	h1, err := quacker.Enqueue(ctx, a, task, "k", future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := quacker.Enqueue(ctx, b, task, "k", future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1.RunID() != h2.RunID() {
+		t.Fatalf("cross-engine reuse: %s vs %s", h1.RunID(), h2.RunID())
+	}
+	if h3, err := quacker.Enqueue(ctx, b, task, "other", future); err != nil {
+		t.Fatal(err)
+	} else if h3.RunID() == h1.RunID() {
+		t.Fatal("distinct key reused")
+	}
+
+	errTask := quacker.NewTask("pg.unique.err", func(ctx context.Context, in string) (string, error) {
+		return in, nil
+	}, quacker.WithUnique(func(in string) string { return in }),
+		quacker.WithUniqueConflict(quacker.UniqueError))
+	if _, err := quacker.Enqueue(ctx, a, errTask, "e", future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := quacker.Enqueue(ctx, b, errTask, "e", future); !errors.Is(err, quacker.ErrDuplicateJob) {
+		t.Fatalf("want ErrDuplicateJob, got %v", err)
+	}
+}
+
 // TestPostgresLeaseReap: a store-level claim carries a worker + lease, and an
 // expired lease is re-queued by the reaper.
 func TestPostgresLeaseReap(t *testing.T) {

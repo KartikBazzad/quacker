@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/kartikbazzad/quacker/driver"
 )
 
 // CreateRun inserts a run and its initial steps in one transaction.
@@ -31,34 +33,191 @@ func (s *Store) CreateRuns(ctx context.Context, runs []*Run, steps [][]*Step) er
 	return tx.Commit()
 }
 
+// Sentinel errors for unique jobs.
+var (
+	// ErrUniqueViolation reports that an insert collided with the unique-job
+	// index — normally a concurrent enqueue race; the caller re-resolves.
+	ErrUniqueViolation = errors.New("quacker: unique constraint violation")
+	// ErrDuplicateJob is returned under UniqueError when a live run already
+	// holds the run's unique key.
+	ErrDuplicateJob = errors.New("quacker: a run with this unique key already exists")
+)
+
+// UniqueConflict selects what a unique run does when a live run already holds
+// its (workflow, unique_key).
+type UniqueConflict int
+
+const (
+	// UniqueReuse returns the live run's id and inserts nothing.
+	UniqueReuse UniqueConflict = iota
+	// UniqueError fails the enqueue with ErrDuplicateJob.
+	UniqueError
+	// UniqueReplace cancels the live run and inserts the new one.
+	UniqueReplace
+)
+
+// ReplacedRun is a run cancelled by UniqueReplace. The engine cancels the
+// contexts of RunningSteps and releases the run's local waiter.
+type ReplacedRun struct {
+	RunID        string
+	RunningSteps []string
+}
+
+// CreateRunsUnique inserts runs and steps, resolving unique keys against live
+// runs in the same transaction. For each run with a non-empty UniqueKey it
+// looks up a non-terminal run with the same (workflow, key): UniqueReuse skips
+// the insert and returns the existing id, UniqueError fails with
+// ErrDuplicateJob, UniqueReplace cancels the existing run and inserts. It
+// returns the effective run id per input (existing for reuse, new otherwise)
+// and any runs replaced (for the engine to interrupt locally). A concurrent
+// enqueue race surfaces as a wrapped ErrUniqueViolation; the caller retries.
+func (s *Store) CreateRunsUnique(ctx context.Context, runs []*Run, steps [][]*Step, conflicts []UniqueConflict) ([]string, []ReplacedRun, error) {
+	if len(runs) != len(steps) || len(runs) != len(conflicts) {
+		return nil, nil, fmt.Errorf("quacker: CreateRunsUnique: %d runs, %d step sets, %d conflicts", len(runs), len(steps), len(conflicts))
+	}
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	ids := make([]string, len(runs))
+	var replaced []ReplacedRun
+	for i, run := range runs {
+		ids[i] = run.ID
+		if run.UniqueKey != "" {
+			existing, err := liveRunByUnique(ctx, tx, run.Workflow, run.UniqueKey)
+			if err != nil {
+				return nil, nil, err
+			}
+			if existing != "" {
+				switch conflicts[i] {
+				case UniqueReuse:
+					ids[i] = existing
+					continue
+				case UniqueError:
+					return nil, nil, ErrDuplicateJob
+				case UniqueReplace:
+					running, err := replaceRunTx(ctx, tx, existing, nowUnix())
+					if err != nil {
+						return nil, nil, err
+					}
+					replaced = append(replaced, ReplacedRun{RunID: existing, RunningSteps: running})
+				}
+			}
+		}
+		if err := insertRunTx(ctx, tx, run, steps[i]); err != nil {
+			if driver.IsUniqueViolation(s.be, err) {
+				return nil, nil, fmt.Errorf("%w: %w", ErrUniqueViolation, err)
+			}
+			return nil, nil, err
+		}
+	}
+	return ids, replaced, tx.Commit()
+}
+
+// liveRunByUnique returns the id of a non-terminal run holding (workflow, key),
+// or "" when none exists.
+func liveRunByUnique(ctx context.Context, tx *txn, workflow, key string) (string, error) {
+	var id string
+	err := tx.queryRow(ctx, `SELECT id FROM runs
+		WHERE workflow=? AND unique_key=? AND status NOT IN (?,?,?,?)
+		ORDER BY created_at LIMIT 1`,
+		workflow, key, StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// replaceRunTx cancels a run and every non-terminal step. The replacement
+// insert needs the unique key freed and cannot coexist with the old run. It
+// returns the ids that were RUNNING so the engine can cancel their contexts.
+func replaceRunTx(ctx context.Context, tx *txn, runID string, now int64) ([]string, error) {
+	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	var running []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		running = append(running, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE id=?`,
+		StatusCancelled, now, runID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED')`,
+		StatusCancelled, now, runID); err != nil {
+		return nil, err
+	}
+	return running, nil
+}
+
+// cancelRunTx marks a run and its non-running steps CANCELLED inside an
+// existing transaction.
+func cancelRunTx(ctx context.Context, tx *txn, runID string, now int64) error {
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE id=?`,
+		StatusCancelled, now, runID); err != nil {
+		return err
+	}
+	_, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
+		StatusCancelled, now, runID)
+	return err
+}
+
 // insertRunsTx inserts runs and steps into an existing transaction. Shared by
 // CreateRuns and FireCron (which fuses the insert with a cron CAS).
 func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) error {
 	for i, run := range runs {
-		res, err := tx.exec(ctx, `INSERT INTO runs
-			(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent)
-			VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?)`,
-			run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-			run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.TraceParent)
-		if err != nil {
-			return fmt.Errorf("quacker: insert run: %w", err)
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return fmt.Errorf("quacker: insert run: %d rows affected", n)
-		}
-		for _, st := range steps[i] {
-			_, err := tx.exec(ctx, `INSERT INTO steps
-				(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels)
-				VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?)`,
-				st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
-				st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
-				st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels))
-			if err != nil {
-				return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
-			}
+		if err := insertRunTx(ctx, tx, run, steps[i]); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// insertRunTx inserts one run and its steps. unique_key is NULL when the run
+// is not unique so the unique index ignores it.
+func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
+	res, err := tx.exec(ctx, `INSERT INTO runs
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, trace_parent, unique_key)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?)`,
+		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
+		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.TraceParent,
+		nullableString(run.UniqueKey))
+	if err != nil {
+		return fmt.Errorf("quacker: insert run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("quacker: insert run: %d rows affected", n)
+	}
+	for _, st := range steps {
+		_, err := tx.exec(ctx, `INSERT INTO steps
+			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels)
+			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?)`,
+			st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
+			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
+			st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels))
+		if err != nil {
+			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
+		}
+	}
+	return nil
+}
+
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // ErrNonTerminalPurge is returned when a purge is asked to delete a
@@ -571,7 +730,7 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	if err := tx.queryRow(ctx, `SELECT output FROM steps WHERE run_id=? ORDER BY ord DESC LIMIT 1`, runID).Scan(&lastOut); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return CompleteResult{}, err
 	}
-	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=?, unique_key=NULL WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		runStatus, lastOut, runErr, now, runID); err != nil {
 		return CompleteResult{}, err
 	}
@@ -734,7 +893,7 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		}
 	}
 
-	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, error=?, completed_at=? WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, error=?, completed_at=?, unique_key=NULL WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		StatusFailed, errMsg, now, runID); err != nil {
 		return CompleteResult{}, err
 	}
@@ -778,12 +937,7 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 	if IsTerminal(status) {
 		return nil, status, false, nil
 	}
-	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=? WHERE id=?`,
-		StatusCancelled, now, runID); err != nil {
-		return nil, "", false, err
-	}
-	if _, err := tx.exec(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
-		StatusCancelled, now, runID); err != nil {
+	if err := cancelRunTx(ctx, tx, runID, now); err != nil {
 		return nil, "", false, err
 	}
 	rows, err := tx.query(ctx, `SELECT id FROM steps WHERE run_id=? AND status=?`, runID, StatusRunning)

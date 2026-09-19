@@ -140,3 +140,10 @@ CREATE INDEX IF NOT EXISTS idx_steps_worker ON steps (worker_id, status);
 const pgMigration4 = `
 ALTER TABLE step_journal RENAME COLUMN key TO wkey;
 `
+
+// pgMigration5 adds unique jobs: a nullable unique_key (NULL for non-unique
+// runs, which unique indexes ignore) and a unique index per (workflow, key).
+const pgMigration5 = `
+ALTER TABLE runs ADD COLUMN unique_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_unique ON runs (workflow, unique_key);
+`

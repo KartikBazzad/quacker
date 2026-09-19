@@ -128,7 +128,7 @@ func (s *Store) InterruptAll(ctx context.Context, workerID string, now int64) er
 			return err
 		}
 		_, err := s.write.ExecContext(ctx,
-			`UPDATE runs SET status=?, completed_at=? WHERE status=?`,
+			`UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE status=?`,
 			StatusInterrupted, now, StatusRunning)
 		return err
 	}
@@ -163,7 +163,7 @@ func (s *Store) InterruptAll(ctx context.Context, workerID string, now int64) er
 	if len(runIDs) > 0 {
 		args := []any{StatusInterrupted, now, StatusRunning}
 		args = append(args, argsAny(runIDs)...)
-		if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=? WHERE status=? AND id IN (`+
+		if _, err := tx.exec(ctx, `UPDATE runs SET status=?, completed_at=?, unique_key=NULL WHERE status=? AND id IN (`+
 			placeholders(len(runIDs))+`) AND NOT EXISTS (
 				SELECT 1 FROM steps s WHERE s.run_id=runs.id AND s.status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED'))`,
 			args...); err != nil {

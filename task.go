@@ -33,6 +33,9 @@ type taskConfig struct {
 	backoff     Backoff
 	keyFn       func(engine.Codec, json.RawMessage) string
 	keyLimit    int
+	uniqueFn    func(engine.Codec, json.RawMessage) string
+	uniqueOn    bool
+	uniqueMode  UniqueConflict
 	wrap        []engine.Middleware
 	labels      []string
 }
@@ -87,6 +90,33 @@ func WithKey[I any](fn func(I) string) TaskOption {
 // without WithKey; values <1 are treated as 1.
 func WithKeyConcurrency(n int) TaskOption {
 	return func(c *taskConfig) { c.keyLimit = n }
+}
+
+// WithUnique makes runs of this task unique per derived key among non-terminal
+// runs: while a run with the key is QUEUED/RUNNING/BLOCKED/SUSPENDED, another
+// enqueue with the same key resolves by the conflict policy (default
+// UniqueReuse). The key is computed from input at enqueue; returning "" leaves
+// that run not unique. Uniqueness is scoped to the task name.
+func WithUnique[I any](fn func(I) string) TaskOption {
+	return func(c *taskConfig) {
+		c.uniqueOn = true
+		c.uniqueFn = func(codec engine.Codec, raw json.RawMessage) string {
+			var in I
+			if len(raw) > 0 {
+				if err := codec.Unmarshal(raw, &in); err != nil {
+					return "" // undecodable input: not unique; the task's own decode surfaces the error
+				}
+			}
+			return fn(in)
+		}
+	}
+}
+
+// WithUniqueConflict sets what a unique run does when its key is already held:
+// UniqueReuse (default) returns the live run's handle, UniqueError fails with
+// ErrDuplicateJob, UniqueReplace cancels the live run and enqueues the new one.
+func WithUniqueConflict(m UniqueConflict) TaskOption {
+	return func(c *taskConfig) { c.uniqueOn = true; c.uniqueMode = m }
 }
 
 // Wrap attaches per-task middleware around this task's body. Engine-wide
