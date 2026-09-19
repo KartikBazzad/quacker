@@ -1,7 +1,9 @@
 # Roadmap
 
-Status: **v0.2 shipped** — all three tiers (P0 hardening, P1 control +
-operations, P2 triggers & ergonomics) are done. v0.3 is next.
+Status: **v0.3 in progress** — v0.2 is fully shipped; the durable-execution
+substrate and durable sleep (slice A) are done. Next: durable event waits,
+then child runs; then worker labels, OTel, and the Postgres/multi-instance
+epic.
 
 - v0.1 shipped: tasks, retries, timeouts, queues, priorities, DAG workflows,
   cron, delayed runs, cancel, graceful shutdown, File persistence + recovery,
@@ -143,15 +145,42 @@ Semver tags remain pending a git remote (none is configured).
 
 ## v0.3 — durable execution & visibility
 
-- **Durable sleep**: `quacker.SleepDurable(ctx, 2*time.Hour)` checkpoints the
-  step (persisted "phase" + input), returns without failing, and the engine
-  resumes the continuation later — the state machine gains a
-  `SUSPENDED(step_phase)` state. Requires a resumable-task protocol
-  (`StepFunc` receiving a resume handle) — biggest design item on the board.
-- **Event waits**: durable `WaitFor(ctx, "payment.received", timeout)` built
-  on the same suspension mechanism.
+### Slice A — substrate + durable sleep (✅ DONE)
+
+As built (deviating from the sketch's "persisted phase + resume handle"):
+durable execution is **journaled replay**, not a phase handle, so tasks stay
+plain Go functions. Migration v5 adds a `SUSPENDED` step state (`resume_at`,
+`wait_kind`, `wait_event`) and a `step_journal` table. Each durable call
+appends a journal entry; on resume the task re-runs from the top and replays
+entries by index. Suspension unwinds by an internal panic, caught by the
+executor's recover boundary — a task cannot swallow it by ignoring an error.
+`ClaimDue` gained a second arm (`SUSPENDED AND resume_at<=now`); a resume
+stamps `claimed_at` (start budget) but not `attempts`, and the per-attempt
+timeout covers active execution only. `SleepDurable(ctx, d)` releases the
+queue and per-key slots; `RunOnce(key, fn)` memoizes side effects across
+replays (exactly-once on success, re-runs on failure). A replay-time seatbelt
+(`ErrJournalMisaligned`) fails loudly when replayed calls do not match the
+journal's kind/key/event instead of resuming with wrong data.
+
+- ✅ Substrate: `SUSPENDED`, journal, resume claim arm, cancellation/status
+  plumbing, per-segment timeout.
+- ✅ `SleepDurable`.
+- ✅ `RunOnce` (required for replay-safe side effects).
+
+### Slice B — durable event waits (next)
+
+- `WaitFor[T](ctx, "payment.received", timeout)`: `Emit` atomically inserts
+  the event and appends its payload to every undone matching wait entry (in
+  one writer transaction), then wakes them; timeout writes `timed_out=1,
+  done=1` before returning `ErrWaitTimeout`, and delivery only touches
+  `done=0` entries so a late emit cannot resurrect a consumed wait. Waits are
+  subscription-style (an event emitted before the wait registers does not
+  count).
+
+### Slice C — child runs
+
 - **Child runs**: enqueue from inside a task with `runs.parent_id` for
-  lineage; `Execution` exposes children.
+  lineage; `Execution` exposes children. Lineage only — no implicit join.
 - **Embedded debug logger**: `q.DebugLogger()` returns a logger that writes to a channel, which can be consumed by the user.
   - "We dont want the quacker to serve http. so a method can return debug logs"
 - **DAG Visualizer**: `q.DAGJSON()` returns a JSON representation of the DAG, which can be consumed by the user.

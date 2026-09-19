@@ -9,7 +9,8 @@ import (
 const (
 	StatusQueued      = "QUEUED"
 	StatusRunning     = "RUNNING"
-	StatusBlocked     = "BLOCKED" // DAG step waiting on dependencies
+	StatusBlocked     = "BLOCKED"   // DAG step waiting on dependencies
+	StatusSuspended   = "SUSPENDED" // durable sleep/wait: not holding a slot
 	StatusSucceeded   = "SUCCEEDED"
 	StatusFailed      = "FAILED"
 	StatusCancelled   = "CANCELLED"
@@ -144,11 +145,39 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
 );
 `
 
+// migration 5 adds the durable-execution substrate: a SUSPENDED step's resume
+// time/wait identity, and the per-step journal of durable awaits replayed on
+// every invocation of a durable task.
+const migration5 = `
+ALTER TABLE steps ADD COLUMN resume_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE steps ADD COLUMN wait_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE steps ADD COLUMN wait_event TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_steps_resume ON steps (status, resume_at);
+
+CREATE TABLE IF NOT EXISTS step_journal (
+	step_id   TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+	idx       INTEGER NOT NULL,
+	kind      TEXT NOT NULL,
+	key       TEXT NOT NULL DEFAULT '',
+	event     TEXT NOT NULL DEFAULT '',
+	wake_at   INTEGER NOT NULL DEFAULT 0,
+	deadline  INTEGER NOT NULL DEFAULT 0,
+	payload   BLOB,
+	result    BLOB,
+	err       TEXT NOT NULL DEFAULT '',
+	done      INTEGER NOT NULL DEFAULT 0,
+	timed_out INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (step_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_journal_wait ON step_journal (kind, done, event);
+`
+
 var migrations = []migration{
 	{version: 1, sql: schema},
 	{version: 2, sql: migration2},
 	{version: 3, sql: migration3},
 	{version: 4, sql: migration4},
+	{version: 5, sql: migration5},
 }
 
 // init validates the migration list's invariant before any Open can rely

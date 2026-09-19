@@ -57,6 +57,9 @@ is the wrong amount of infrastructure.
   restart
 - **In-process events** — `q.Emit(name, payload)` fans out to tasks bound with
   `quacker.On(name, task)`, each receiving the payload as input
+- **Durable execution** — `quacker.SleepDurable` suspends a run without
+  holding a worker slot and survives restarts; `quacker.RunOnce` keeps side
+  effects from repeating when a task replays
 - **Cancellation** — instant, propagated to running task contexts
 - **Non-blocking introspection** — `Execution`, `Runs`, `Metrics`, `Logs`,
   `Subscribe` — never pause or slow the workers
@@ -234,6 +237,44 @@ are loaded and arm as soon as their task is registered, so the app only needs
 `quacker.Register`. A stored fire time still in the future is honored; a
 missed one is recomputed from now (no catch-up burst).
 
+## Durable execution
+
+```go
+task := quacker.NewTask("orders.fulfill", func(ctx context.Context, id string) (string, error) {
+    // Runs exactly once, even though the task replays after the sleep below.
+    receipt, err := quacker.RunOnce(ctx, "reserve", func() (string, error) {
+        return reserve(id) // a side effect you don't want to repeat
+    })
+    if err != nil {
+        return "", err
+    }
+
+    if err := quacker.SleepDurable(ctx, 2*time.Hour); err != nil { // no worker slot held
+        return "", err
+    }
+    return ship(receipt), nil
+})
+```
+
+`SleepDurable` marks the step `SUSPENDED`: it releases its queue and per-key
+slots and is not charged an attempt. When the wake time passes the step is
+claimed again and the task is re-invoked **from the top**, at which point the
+sleep returns immediately. With File storage this survives a restart; the
+per-attempt timeout covers active execution only, not the sleep.
+`Execution().Steps[i].Status` shows `SUSPENDED` with a `ResumeAt`.
+
+Two rules make this safe:
+
+- **Code before a durable await re-executes on resume.** Wrap side effects in
+  `RunOnce(key, fn)` — its result is memoized, so it runs once on success and
+  re-runs on failure (idempotency stays with you on the failure path).
+- **Do not `recover()` around a durable helper**, in a task or in middleware —
+  suspension unwinds via an internal panic, and recovering swallows it.
+
+Replay is validated: if a task's durable calls no longer match its persisted
+journal (e.g. you deployed changed code while runs were suspended), the step
+fails with `quacker.ErrJournalMisaligned` rather than resuming with wrong data.
+
 ## Cancellation & shutdown
 
 ```go
@@ -298,6 +339,7 @@ labels/affinity, a web UI, OpenTelemetry.
  runnable programs live in [`examples/`](examples/):
 [`simple`](examples/simple/main.go) · [`dag`](examples/dag/main.go) ·
 [`cron`](examples/cron/main.go) · [`events`](examples/events/main.go) ·
+[`durable`](examples/durable/main.go) ·
 [`introspect`](examples/introspect/main.go)
 
 ## Development

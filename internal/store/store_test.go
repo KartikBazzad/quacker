@@ -183,6 +183,79 @@ func TestMigrationV4Tables(t *testing.T) {
 	}
 }
 
+// TestMigrationV5Journal: migration 5 adds the durable-execution columns and
+// the journal table.
+func TestMigrationV5Journal(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.Read().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='step_journal'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("step_journal table count = %d, want 1", n)
+	}
+}
+
+// TestJournalRoundTripAndResumeClaim: the journal persists in call order, and
+// a SUSPENDED step is claimed again by the resume arm without a new attempt.
+func TestJournalRoundTripAndResumeClaim(t *testing.T) {
+	s, err := Open(Config{Mode: ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	run := &Run{ID: "r", Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	step := &Step{ID: "r/s", RunID: "r", Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	if err := s.CreateRun(ctx, run, []*Step{step}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimDue(ctx, "q", 1, now, 0, 0)
+	if err != nil || len(claims) != 1 || claims[0].Resumed {
+		t.Fatalf("first claim = %+v err=%v, want one fresh claim", claims, err)
+	}
+
+	if err := s.AppendJournal(ctx, &JournalEntry{StepID: "r/s", Idx: 0, Kind: JournalSleep, WakeAt: now + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendJournal(ctx, &JournalEntry{StepID: "r/s", Idx: 1, Kind: JournalOnce, Key: "k", Done: true, Result: []byte(`1`)}); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := s.LoadJournal(ctx, "r/s")
+	if err != nil || len(journal) != 2 || journal[0].Kind != JournalSleep || journal[1].Kind != JournalOnce || !journal[1].Done {
+		t.Fatalf("journal = %+v err=%v", journal, err)
+	}
+
+	// An event-only wait (resume_at=0) must not be claimed.
+	if err := s.SuspendStep(ctx, "r/s", "wait", "go", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := s.ClaimDue(ctx, "q", 1, now, 0, 0); len(c) != 0 {
+		t.Fatalf("event-only wait was claimed: %+v", c)
+	}
+
+	// A due resume is claimed, stamps claimed_at, and does not add an attempt.
+	if _, err := s.Write().ExecContext(ctx, `UPDATE steps SET status=? WHERE id='r/s'`, StatusRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SuspendStep(ctx, "r/s", "sleep", "", now-1, now); err != nil {
+		t.Fatal(err)
+	}
+	claims, err = s.ClaimDue(ctx, "q", 1, now, 0, 0)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("resume claim = %+v err=%v", claims, err)
+	}
+	if !claims[0].Resumed || claims[0].Step.Attempts != 1 || claims[0].Step.ClaimedAt != now {
+		t.Fatalf("resumed claim = %+v, want resumed, attempts=1, claimed_at=now", claims[0])
+	}
+}
+
 // TestPurgeRejectsBadOptions: a non-terminal status or a zero cutoff is
 // refused, so a purge can never touch live work by accident.
 func TestPurgeRejectsBadOptions(t *testing.T) {

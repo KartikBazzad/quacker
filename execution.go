@@ -15,6 +15,7 @@ const (
 	StatusQueued      Status = store.StatusQueued
 	StatusRunning     Status = store.StatusRunning
 	StatusBlocked     Status = store.StatusBlocked
+	StatusSuspended   Status = store.StatusSuspended
 	StatusSucceeded   Status = store.StatusSucceeded
 	StatusFailed      Status = store.StatusFailed
 	StatusCancelled   Status = store.StatusCancelled
@@ -54,6 +55,11 @@ type StepState struct {
 	CreatedAt   time.Time       `json:"created_at"`
 	StartedAt   time.Time       `json:"started_at,omitempty"`
 	CompletedAt time.Time       `json:"completed_at,omitempty"`
+	// WaitEvent is the event a SUSPENDED step awaits ("" for a sleep or a
+	// non-suspended step); ResumeAt is when a sleeping/suspended step becomes
+	// claimable again (zero for event-only waits).
+	WaitEvent string    `json:"wait_event,omitempty"`
+	ResumeAt  time.Time `json:"resume_at,omitempty"`
 }
 
 // Execution is a consistent point-in-time view of a run. Reads never pause
@@ -105,9 +111,10 @@ type RunFilter struct {
 
 // QueueStats is a per-queue depth snapshot.
 type QueueStats struct {
-	Queued  int64 `json:"queued"`
-	Running int64 `json:"running"`
-	Blocked int64 `json:"blocked"`
+	Queued    int64 `json:"queued"`
+	Running   int64 `json:"running"`
+	Blocked   int64 `json:"blocked"`
+	Suspended int64 `json:"suspended"`
 }
 
 // Metrics is a global state snapshot.
@@ -175,6 +182,7 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 			Input: s.Input, Output: s.Output, Error: s.Error,
 			RunAt: unixToTime(s.RunAt), CreatedAt: unixToTime(s.CreatedAt),
 			StartedAt: unixToTime(s.StartedAt), CompletedAt: unixToTime(s.CompletedAt),
+			WaitEvent: s.WaitEvent, ResumeAt: unixToTime(s.ResumeAt),
 		})
 	}
 	return ex, nil

@@ -308,6 +308,59 @@ the kind retention was built to close, so `PurgeRuns` now also deletes
 `Events`. Subscriptions are never purged. The alternative — a separate
 event-retention knob — was rejected as more surface for the same outcome.
 
+### 19. Durable execution is journaled replay, not a resume handle
+
+The roadmap's sketch proposed a "resumable-task protocol (`StepFunc` receiving
+a resume handle)". Making `SleepDurable(ctx, d)` transparent — the API people
+actually want — requires the task to resume in the middle of itself, and Go
+has no continuations. Rather than introduce a second, phase-switch task style,
+the engine keeps tasks as plain functions and gives them a **journal**:
+migration v5 adds `step_journal`, every durable call appends an entry in call
+order, and on each invocation a per-step cursor replays entries by index.
+Satisfied entries return immediately; an unsatisfied one is persisted and the
+task is unwound.
+
+Three decisions make that work:
+
+- **Suspension unwinds by panic, not error.** A helper that returned an error
+  could be ignored (or logged) by a task, which would then keep running past
+  its suspension point with no durable record. A private `suspendSignal`
+  panic is caught by the executor's existing recover boundary, which checks
+  for it before the generic panic-to-error conversion. The cost is a real
+  contract: `recover()` around a durable helper — in a task *or middleware* —
+  swallows the suspension. This is documented, not defended against.
+- **Resumes reuse the claim path.** `ClaimDue` gained a second arm,
+  `status='SUSPENDED' AND resume_at>0 AND resume_at<=now`. A sleep's wake and
+  a wait's timeout are both just `resume_at`, so no separate sweeper or timer
+  is needed: a SUSPENDED step is not RUNNING, so it holds neither a queue slot
+  nor a per-key slot, and the existing DB-count key gate frees it for free.
+- **A resume is a start for rate limiting but not an attempt.** It stamps
+  `claimed_at` (so a mass-wake of sleepers can't slip past an N-per-window
+  cap by consuming batch slots without window budget) but leaves `attempts`
+  and `started_at` alone. The per-attempt timeout is applied per active
+  segment, so a sleep longer than the timeout is fine.
+
+`RunOnce` is part of the same slice, not a follow-up: any side effect before a
+suspension re-executes on replay, so shipping sleep without it would ship a
+feature whose canonical use is broken. It exercises the complete-without-
+suspend journal path too. Its error semantics are deliberate — on `fn` error
+the entry is left undone, so a retry re-invokes `fn`: exactly-once on
+success, at-least-once on failure, with idempotency left to the caller.
+
+### 20. A replay seatbelt turns silent corruption into a loud failure
+
+Journaled replay's known hazard is a task whose durable-call shape changes
+between invocations (data-dependent branches, or deploying new code while
+runs are suspended). Silent misalignment is far worse than a failed step, so
+each replayed entry is validated against the call: the entry `kind` must
+match, a wait must carry the same `event`, and a `RunOnce` the same `key`.
+A mismatch fails the step with `ErrJournalMisaligned` instead of returning
+wrong-typed or wrong-keyed data. This catches the dominant modes — reordering
+or removing different-kind calls, kind swaps, key swaps. It deliberately does
+not catch same-kind identical-parameter reordering (semantically inert) or
+changed-code-same-shape, which is `StepVersion` territory: a versioning
+protocol, not a guard, and deferred with the limitation documented.
+
 ## Lessons (bugs the tests caught)
 
 - **A transaction that isn't committed is a rollback.** `CancelRun` returned

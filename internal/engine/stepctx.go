@@ -66,21 +66,29 @@ func DepOutput[T any](ctx context.Context, name string) (T, error) {
 }
 
 // stepState is the internal context payload: identity, dependency outputs
-// loaded at claim time, and this engine's log sink (engine-scoped so
-// multiple engines in one process never misroute each other's logs).
+// loaded at claim time, this engine's log sink (engine-scoped so multiple
+// engines in one process never misroute each other's logs), and the durable
+// journal replayed by SleepDurable/RunOnce/WaitFor.
 type stepState struct {
 	StepContext
 	depOutputs map[string]json.RawMessage
 	send       func(store.LogEntry)
+
+	eng    *Engine
+	stepID string
+	// journal is the step's persisted durable awaits, loaded at claim time;
+	// cursor counts durable-helper calls so replays align by index.
+	journal []*store.JournalEntry
+	cursor  int
 }
 
-func withStepContext(ctx context.Context, c *store.Claim, depOutputs map[string]json.RawMessage, send func(store.LogEntry)) context.Context {
+func withStepContext(ctx context.Context, c *store.Claim, depOutputs map[string]json.RawMessage, send func(store.LogEntry), journal []*store.JournalEntry, eng *Engine) context.Context {
 	sc := StepContext{RunID: c.Step.RunID, Step: c.Step.Name, Attempt: int(c.Step.Attempts)}
 	sc.Task = c.Step.Task
 	if sc.Task == "" {
 		sc.Task = c.Step.Name
 	}
-	ss := &stepState{StepContext: sc, depOutputs: depOutputs, send: send}
+	ss := &stepState{StepContext: sc, depOutputs: depOutputs, send: send, eng: eng, stepID: c.Step.ID, journal: journal}
 	return context.WithValue(ctx, ctxKey{}, ss)
 }
 

@@ -233,7 +233,7 @@ func metricsFromSnapshot(s engine.MetricsSnapshot) *Metrics {
 		m.Runs[Status(st)] = n
 	}
 	for name, qs := range s.Queues {
-		m.Queues[name] = QueueStats{Queued: qs.Queued, Running: qs.Running, Blocked: qs.Blocked}
+		m.Queues[name] = QueueStats{Queued: qs.Queued, Running: qs.Running, Blocked: qs.Blocked, Suspended: qs.Suspended}
 	}
 	return m
 }

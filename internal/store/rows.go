@@ -63,8 +63,17 @@ type Step struct {
 	KeyLimit int64
 	// ClaimedAt is stamped on every QUEUED→RUNNING transition so a queue's
 	// sliding-window start rate can be counted; ParkStep clears it since a
-	// parked claim never executed.
+	// parked claim never executed. Resumes also stamp it (a resumed step
+	// spends start budget), but do not increment Attempts.
 	ClaimedAt int64
+	// ResumeAt is when a SUSPENDED step becomes claimable again: a sleep's
+	// wake time, or a wait's timeout deadline. 0 means event-only (never
+	// self-claims).
+	ResumeAt int64
+	// WaitKind is "sleep" or "wait" for a SUSPENDED step ("" otherwise);
+	// WaitEvent is the awaited event name for a wait.
+	WaitKind  string
+	WaitEvent string
 }
 
 // Cron is a row in the crons table.
@@ -124,7 +133,7 @@ const runCols = `id, workflow, kind, status, queue, priority, input, output, err
 
 const stepCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error,
 	attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at,
-	concurrency_key, key_limit, claimed_at`
+	concurrency_key, key_limit, claimed_at, resume_at, wait_kind, wait_event`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
@@ -143,7 +152,8 @@ func scanStep(row interface{ Scan(...any) error }) (*Step, error) {
 	err := row.Scan(&s.ID, &s.RunID, &s.Name, &s.Task, &s.Ord, &s.Status, &deps, &s.Queue, &s.Priority,
 		&s.Input, &s.Output, &s.Error, &s.Attempts, &s.MaxAttempts, &s.Timeout,
 		&s.RunAt, &s.CreatedAt, &s.StartedAt, &s.CompletedAt,
-		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt)
+		&s.ConcurrencyKey, &s.KeyLimit, &s.ClaimedAt,
+		&s.ResumeAt, &s.WaitKind, &s.WaitEvent)
 	if err != nil {
 		return nil, err
 	}

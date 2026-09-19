@@ -236,10 +236,13 @@ func (s *Store) purgeOrphanLogs(ctx context.Context, batch int) (int64, error) {
 	return n, tx.Commit()
 }
 
-// Claim is a step atomically moved to RUNNING, with its parent run.
+// Claim is a step atomically moved to RUNNING, with its parent run. Resumed
+// is true when the step was SUSPENDED (a durable resume) rather than QUEUED;
+// a resume stamps claimed_at but does not increment attempts.
 type Claim struct {
-	Step *Step
-	Run  *Run
+	Step    *Step
+	Run     *Run
+	Resumed bool
 }
 
 // keyGate lets a claim proceed only while fewer than key_limit RUNNING
@@ -291,10 +294,16 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 		}
 	}
 
+	// Two claim arms: fresh QUEUED work, and due SUSPENDED steps resuming
+	// (a sleep's wake time or a wait's timeout deadline). Event-driven wakes
+	// flip the step to QUEUED and are covered by the first arm.
 	rows, err := tx.QueryContext(ctx, `SELECT `+stepCols+` FROM steps
-		WHERE status = ? AND run_at <= ? AND queue = ? AND `+keyGate+`
+		WHERE queue = ? AND (
+			(status = ? AND run_at <= ?)
+			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
+		) AND `+keyGate+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
-		StatusQueued, now, queue, limit)
+		queue, StatusQueued, now, StatusSuspended, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -315,29 +324,46 @@ func (s *Store) ClaimDue(ctx context.Context, queue string, limit int, now int64
 
 	var claims []*Claim
 	for _, st := range cands {
-		res, err := tx.ExecContext(ctx, `UPDATE steps SET
-			status = ?, attempts = attempts + 1, claimed_at = ?,
-			started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
-			WHERE id = ? AND status = ? AND `+keyGate,
-			StatusRunning, now, now, st.ID, StatusQueued)
+		resumed := st.Status == StatusSuspended
+		var (
+			res sql.Result
+			err error
+		)
+		if resumed {
+			// A resume spends start budget (claimed_at) but is not a new
+			// attempt and does not restamp started_at.
+			res, err = tx.ExecContext(ctx, `UPDATE steps SET
+				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = ''
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+keyGate,
+				StatusRunning, now, st.ID, StatusSuspended, now)
+		} else {
+			res, err = tx.ExecContext(ctx, `UPDATE steps SET
+				status = ?, attempts = attempts + 1, claimed_at = ?,
+				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
+				WHERE id = ? AND status = ? AND `+keyGate,
+				StatusRunning, now, now, st.ID, StatusQueued)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
 			continue // moved by someone else, or its key saturated mid-batch
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE runs SET
-			status = ?, attempts = attempts + 1, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
-			WHERE id = ? AND status = ?`, StatusRunning, now, st.RunID, StatusQueued); err != nil {
-			return nil, err
+		if !resumed {
+			if _, err := tx.ExecContext(ctx, `UPDATE runs SET
+				status = ?, attempts = attempts + 1, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END
+				WHERE id = ? AND status = ?`, StatusRunning, now, st.RunID, StatusQueued); err != nil {
+				return nil, err
+			}
+			st.Attempts++
+			if st.StartedAt == 0 {
+				st.StartedAt = now
+			}
 		}
 		st.Status = StatusRunning
-		st.Attempts++
 		st.ClaimedAt = now
-		if st.StartedAt == 0 {
-			st.StartedAt = now
-		}
-		claims = append(claims, &Claim{Step: st})
+		st.ResumeAt = 0
+		claims = append(claims, &Claim{Step: st, Resumed: resumed})
 	}
 	if len(claims) == 0 {
 		return nil, tx.Commit()
@@ -522,7 +548,7 @@ func (s *Store) FinalFailStep(ctx context.Context, stepID, runID string, errMsg 
 		return CompleteResult{}, err
 	}
 	res := CompleteResult{StepDone: true}
-	rows, err := tx.QueryContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING') AND id != ? RETURNING id, name`,
+	rows, err := tx.QueryContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','RUNNING','SUSPENDED') AND id != ? RETURNING id, name`,
 		StatusCancelled, now, runID, stepID)
 	if err != nil {
 		return CompleteResult{}, err
@@ -580,7 +606,7 @@ func (s *Store) CancelRun(ctx context.Context, runID string, now int64) (running
 		StatusCancelled, now, runID); err != nil {
 		return nil, "", false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED')`,
+	if _, err := tx.ExecContext(ctx, `UPDATE steps SET status=?, completed_at=? WHERE run_id=? AND status IN ('QUEUED','BLOCKED','SUSPENDED')`,
 		StatusCancelled, now, runID); err != nil {
 		return nil, "", false, err
 	}
@@ -684,9 +710,10 @@ func (s *Store) ListRuns(ctx context.Context, f Filter) ([]*Run, error) {
 
 // QueueStats is a per-queue depth snapshot.
 type QueueStats struct {
-	Queued  int64
-	Running int64
-	Blocked int64
+	Queued    int64
+	Running   int64
+	Blocked   int64
+	Suspended int64
 }
 
 // Metrics returns run counts by status and per-queue depths.
@@ -712,7 +739,7 @@ func (s *Store) Metrics(ctx context.Context) (map[string]int64, map[string]*Queu
 
 	queues := map[string]*QueueStats{}
 	rows, err = s.read.QueryContext(ctx, `SELECT queue, status, COUNT(*) FROM steps
-		WHERE status IN ('QUEUED','RUNNING','BLOCKED') GROUP BY queue, status`)
+		WHERE status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED') GROUP BY queue, status`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -735,6 +762,8 @@ func (s *Store) Metrics(ctx context.Context) (map[string]int64, map[string]*Queu
 			qs.Running += n
 		case StatusBlocked:
 			qs.Blocked += n
+		case StatusSuspended:
+			qs.Suspended += n
 		}
 	}
 	return byStatus, queues, rows.Err()
@@ -985,7 +1014,7 @@ func statusOf(steps []*Step, name string) string {
 func anyActive(steps []*Step) bool {
 	for _, s := range steps {
 		switch s.Status {
-		case StatusQueued, StatusRunning, StatusBlocked:
+		case StatusQueued, StatusRunning, StatusBlocked, StatusSuspended:
 			return true
 		}
 	}

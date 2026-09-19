@@ -88,7 +88,10 @@ runs(id, workflow, kind, status, queue, priority, input, output, error,
 steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
       run_at, created_at, started_at, completed_at,
-      concurrency_key, key_limit, claimed_at)
+      concurrency_key, key_limit, claimed_at,
+      resume_at, wait_kind, wait_event)
+step_journal(step_id→steps, idx, kind, key, event, wake_at, deadline,
+             payload, result, err, done, timed_out, PK(step_id, idx))
 crons(id, name UNIQUE, spec, task, input, next_at, created_at)
 events(seq AUTOINCREMENT, name, payload, created_at)
 event_subscriptions(id PK, event, task, created_at, UNIQUE(event, task))
@@ -102,7 +105,9 @@ version row. Migration 1 is all `CREATE TABLE IF NOT EXISTS`, so a v0.1
 File database (tables present, no version row) baselines at version 1.
 Migration 3 adds `idx_runs_purge (status, completed_at)` for retention;
 migration 4 adds `events` (best-effort emit audit) and
-`event_subscriptions` (event→task bindings, unique per pair).
+`event_subscriptions` (event→task bindings, unique per pair); migration 5
+adds the durable-execution columns on `steps` and the `step_journal` table
+(entries cascade with their step).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog
@@ -126,10 +131,13 @@ semantics.
 
 ```
 QUEUED ──claim──▶ RUNNING ──success──▶ SUCCEEDED
-   ▲                │ │
-   │  retry         │ │ final failure (attempts == max_attempts)
-   └────────────────┘ ▼
-                     FAILED
+   ▲                │ │  ▲
+   │  retry         │ │  │ resume (resume_at <= now)
+   └────────────────┘ │  │
+                      │  └── SUSPENDED ──(durable sleep/wait, no slot held)
+                      │ final failure (attempts == max_attempts)
+                      ▼
+                    FAILED
 BLOCKED ──all deps SUCCEEDED──▶ QUEUED      (workflow steps)
 any active state ──Cancel()──▶ CANCELLED    (running ctx cancelled)
 RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
@@ -139,11 +147,14 @@ RUNNING/QUEUED ──Close() drain timeout──▶ INTERRUPTED
    Kahn's), inserts the run + steps in one write transaction, registers a
    `Waiter`, and signals the scheduler's wake channel.
 2. **Claim**: the scheduler loop (50ms tick + wake) checks each queue's free
-   slots (`concurrency - inFlight`), then claims due steps
-   (`status='QUEUED' AND run_at <= now`, ordered `priority DESC, run_at ASC`)
-   in one immediate transaction: `UPDATE steps ... WHERE id=? AND
-   status='QUEUED'` with a rows-affected check, plus `QUEUED→RUNNING` on the
-   parent run. Two extra gates apply inside the same transaction — a
+   slots (`concurrency - inFlight`), then claims due steps — either
+   `status='QUEUED' AND run_at <= now` or `status='SUSPENDED' AND
+   resume_at > 0 AND resume_at <= now` (a durable resume), ordered
+   `priority DESC, run_at ASC` — in one immediate transaction: `UPDATE steps
+   ... WHERE id=? AND status=...` with a rows-affected check, plus
+   `QUEUED→RUNNING` on the parent run for fresh claims. A resume stamps
+   `claimed_at` but not `attempts`. Two extra gates apply inside the same
+   transaction — a
    **per-key gate** (`RUNNING` count sharing the step's `concurrency_key`
    must be below `key_limit`, re-checked per UPDATE so a batch of same-key
    candidates can't over-claim) and a **rate gate** (when the queue has a
@@ -227,16 +238,39 @@ supplying a def arms its triggers too.
   best-effort in-process; `q.Events` reads the audit rows and
   `WithRetention`/`q.Purge` ages them out with the same cutoff.
 
+## Durable execution
+
+`SleepDurable`/`RunOnce` (and the coming `WaitFor`) implement journaled
+replay. `step_journal` holds one row per durable call in call order. On each
+invocation the executor loads the journal into the step context; a cursor
+replays entries by index, validating `kind` (and key/event) as it goes. A
+satisfied entry returns; an unsatisfied one is appended and the task unwinds
+via an internal `suspendSignal` panic, which the executor recognizes and
+records as `SUSPENDED` with `resume_at` (a sleep's wake or a wait's timeout;
+0 = event-only). Because `SUSPENDED` is not `RUNNING`, the step holds no queue
+or per-key slot, and the DB-count key gate frees it automatically.
+
+`RunOnce` never suspends: it appends an undone entry, runs `fn`, and on
+success memoizes the result. On `fn` error it leaves the entry undone so a
+retry re-invokes `fn`. Replay correctness depends on the durable-call
+sequence matching the journal; `ErrJournalMisaligned` makes a mismatch a hard
+step failure. The contract — code before an await re-executes, and don't
+`recover()` over a helper (tasks or middleware) — is documented in
+DESIGN_NOTES §19–20.
+
 ## Testing strategy
 
 - Behavioral unit/integration tests in the root package (success, retries,
   panics, timeouts, concurrency caps, priority order, DAG ordering and
   failure, cancel, delayed runs, cron, logs, filters, middleware
   ordering/panic/retry, log-sink routing, metrics push, purge/retention,
-  sub-second and persistent cron, event emit/On/Off/arming).
+  sub-second and persistent cron, event emit/On/Off/arming, durable sleep and
+  RunOnce replay, journal-misalignment failure, cancel-a-sleeper,
+  restart-mid-sleep).
 - Purge edge cases (terminal-only, `Before<=0`, `RUNNING`-step guard,
-  keep-logs + orphan sweep, batching), the migration-v3 index, and the
-  migration-v4 event tables live in `internal/store`.
+  keep-logs + orphan sweep, batching), the migration-v3 index, the
+  migration-v4 event tables, and the migration-v5 journal/resume-claim path
+  live in `internal/store`.
 - CI runs gofmt/vet/test/`-race` on ubuntu and macos
   (`.github/workflows/ci.yml`); the repo is MIT-licensed.
 - `TestIntrospectionUnderLoad`: 8 readers hammer snapshots while 200 runs

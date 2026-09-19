@@ -646,7 +646,11 @@ func (e *Engine) tick() {
 				e.wg.Add(1)
 				// Publish before spawning: a fast task's completion event must
 				// never overtake its claim event.
-				e.publish(c.Step.RunID, c.Step.Name, store.StatusQueued, store.StatusRunning, "", now)
+				from := store.StatusQueued
+				if c.Resumed {
+					from = store.StatusSuspended
+				}
+				e.publish(c.Step.RunID, c.Step.Name, from, store.StatusRunning, "", now)
 				if c.Run != nil && c.Run.StartedAt == now && !runStarted[c.Step.RunID] {
 					runStarted[c.Step.RunID] = true
 					e.publish(c.Step.RunID, "", store.StatusQueued, store.StatusRunning, "", now)
@@ -726,16 +730,36 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 			}
 		}
 	}
-	stepCtx := withStepContext(taskCtx, c, depOutputs, e.logSend)
+	journal, jerr := e.st.LoadJournal(bg, st.ID)
+	if jerr != nil {
+		e.log.Error("quacker: load journal", "run", st.RunID, "step", st.Name, "err", jerr)
+	}
+	stepCtx := withStepContext(taskCtx, c, depOutputs, e.logSend, journal, e)
 	handler := e.wrapHandler(def)
+	var suspend *suspendSignal
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
+				// A durable helper asks to suspend by panicking; recognize it
+				// before the generic panic-to-error conversion.
+				if s, ok := r.(*suspendSignal); ok {
+					suspend = s
+					return
+				}
 				err = fmt.Errorf("panic: %v\n%s", r, stack())
 			}
 		}()
 		out, err = handler(stepCtx, st.Input)
 	}()
+	if suspend != nil {
+		snow := e.now()
+		if serr := e.st.SuspendStep(bg, st.ID, suspend.waitKind, suspend.event, suspend.resumeAt, snow.UnixNano()); serr != nil {
+			e.log.Error("quacker: record suspend", "run", st.RunID, "step", st.Name, "err", serr)
+			return
+		}
+		e.publish(st.RunID, st.Name, store.StatusRunning, store.StatusSuspended, "", snow.UnixNano())
+		return
+	}
 
 	now := e.now()
 	errStr := truncateErr(err)
