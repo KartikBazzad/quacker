@@ -77,6 +77,9 @@ type TaskDef struct {
 	KeyLimit int
 	// KeyStrategy selects what an enqueue does when the key is at capacity.
 	KeyStrategy store.ConcurrencyStrategy
+	// ExtraKeys are additional named concurrency keys, each with its own limit;
+	// a step is claimable only when every one has a free slot.
+	ExtraKeys []KeyDef
 	// DeadLetter marks a run dead-lettered when it exhausts retries, so it can
 	// be listed and retried from the dead-letter queue.
 	DeadLetter bool
@@ -85,6 +88,13 @@ type TaskDef struct {
 	SequenceFn func(c Codec, input json.RawMessage) string
 	// Ephemeral deletes a run on terminal and skips boot recovery.
 	Ephemeral bool
+}
+
+// KeyDef is a named concurrency key with a limit.
+type KeyDef struct {
+	Name  string
+	Fn    func(c Codec, input json.RawMessage) string
+	Limit int
 }
 
 // StepReq is one step of an enqueue request.
@@ -1028,13 +1038,29 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 		if def.SequenceFn != nil {
 			seqKey = def.SequenceFn(e.codec, req.Input)
 		}
+		var extra []store.StepKey
+		for _, kd := range def.ExtraKeys {
+			v := kd.Fn(e.codec, req.Input)
+			if v == "" {
+				continue // an empty value leaves this key ungated
+			}
+			name := kd.Name
+			if name == "" {
+				name = def.Name
+			}
+			lim := int64(kd.Limit)
+			if lim < 1 {
+				lim = 1
+			}
+			extra = append(extra, store.StepKey{Name: name, Value: v, Limit: lim})
+		}
 		steps = append(steps, &store.Step{
 			ID: runID + "/" + sr.Name, RunID: runID, Name: sr.Name, Task: def.Name, Ord: int64(i),
 			Status: status, DependsOn: sr.Deps, Queue: stepQueue, Priority: req.Priority,
 			Input: req.Input, MaxAttempts: int64(maxAtt), Timeout: def.Timeout,
 			RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
 			ConcurrencyKey: key, KeyLimit: keyLimit, Labels: def.Labels,
-			SequenceKey: seqKey,
+			SequenceKey: seqKey, Keys: extra,
 		})
 	}
 	// run-level max attempts mirrors the first step for introspection.

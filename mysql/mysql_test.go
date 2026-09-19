@@ -679,6 +679,51 @@ func TestMySQLConcurrencyCancelNewest(t *testing.T) {
 	})
 }
 
+func TestMySQLMultipleKeys(t *testing.T) {
+	dsn := testDSN(t)
+	resetDB(t, dsn)
+	a := openQ(t, dsn)
+	b := openQ(t, dsn)
+	ctx := context.Background()
+	type mkInput struct{ Acct, Region string }
+
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	task := quacker.NewTask("my.mk", func(ctx context.Context, in mkInput) (string, error) {
+		started <- in.Acct
+		<-release
+		return in.Acct, nil
+	},
+		quacker.WithKeyLimit("acct", func(in mkInput) string { return in.Acct }, 1),
+		quacker.WithKeyLimit("region", func(in mkInput) string { return in.Region }, 1))
+	quacker.Register(b, task)
+
+	h1, err := quacker.Enqueue(ctx, a, task, mkInput{"a", "r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first run never started")
+	}
+	h2, err := quacker.Enqueue(ctx, a, task, mkInput{"a", "r2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if s, err := b.Execution(ctx, h2.RunID()); err != nil || s.Status != quacker.StatusQueued {
+		t.Fatalf("second run = %+v err=%v, want QUEUED", s, err)
+	}
+	close(release)
+	for _, h := range []*quacker.RunHandle[string]{h1, h2} {
+		waitFor(t, 5*time.Second, func() bool {
+			s, err := a.Execution(ctx, h.RunID())
+			return err == nil && s.Status == quacker.StatusSucceeded
+		})
+	}
+}
+
 func TestMySQLWithDB(t *testing.T) {
 	dsn := testDSN(t)
 	resetDB(t, dsn)

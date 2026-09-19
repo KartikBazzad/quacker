@@ -51,6 +51,8 @@ func (sqliteBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
 
 func (sqliteBackend) SequenceGate() string { return driver.CorrelatedSequenceGate() }
 
+func (sqliteBackend) KeysGate() string { return driver.CorrelatedKeysGate() }
+
 func (sqliteBackend) LabelGate() string {
 	return `NOT EXISTS (
 	SELECT 1 FROM json_each(steps.labels) AS l

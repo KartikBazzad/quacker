@@ -184,3 +184,15 @@ INSERT INTO counters (name, next) VALUES ('run', 0) ON CONFLICT (name) DO NOTHIN
 const pgMigration10 = `
 ALTER TABLE runs ADD COLUMN ephemeral BIGINT NOT NULL DEFAULT 0;
 `
+
+// pgMigration11 adds extra concurrency keys.
+const pgMigration11 = `
+CREATE TABLE IF NOT EXISTS step_keys (
+	step_id   TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+	name      TEXT NOT NULL,
+	value     TEXT NOT NULL,
+	key_limit BIGINT NOT NULL,
+	PRIMARY KEY (step_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_step_keys_value ON step_keys (name, value);
+`

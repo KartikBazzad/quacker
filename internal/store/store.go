@@ -33,12 +33,13 @@ const (
 
 // Store wraps a database. It is safe for concurrent use.
 type Store struct {
-	be      driver.Backend
-	keyGate string  // backend's per-key concurrency predicate, built once
-	seqGate string  // backend's per-sequence ordering predicate, built once
-	write   *dbConn // all mutations go through here
-	read    *dbConn // introspection queries
-	cleanup func() error
+	be       driver.Backend
+	keyGate  string  // backend's per-key concurrency predicate, built once
+	seqGate  string  // backend's per-sequence ordering predicate, built once
+	keysGate string  // backend's extra-keys predicate, built once
+	write    *dbConn // all mutations go through here
+	read     *dbConn // introspection queries
+	cleanup  func() error
 	// ckptCancel/ckptWG drive the WAL checkpoint loop (SQLite WAL modes only).
 	ckptCancel context.CancelFunc
 	ckptWG     sync.WaitGroup
@@ -63,12 +64,13 @@ func Open(cfg driver.Config) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		be:      be,
-		keyGate: be.KeyGate(),
-		seqGate: be.SequenceGate(),
-		write:   &dbConn{DB: write, be: be},
-		read:    &dbConn{DB: read, be: be},
-		cleanup: cleanup,
+		be:       be,
+		keyGate:  be.KeyGate(),
+		seqGate:  be.SequenceGate(),
+		keysGate: be.KeysGate(),
+		write:    &dbConn{DB: write, be: be},
+		read:     &dbConn{DB: read, be: be},
+		cleanup:  cleanup,
 	}
 	if err := s.migrate(ctx); err != nil {
 		s.Close()

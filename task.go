@@ -34,6 +34,7 @@ type taskConfig struct {
 	keyFn       func(engine.Codec, json.RawMessage) string
 	keyLimit    int
 	keyStrategy ConcurrencyStrategy
+	keys        []keyDef
 	uniqueFn    func(engine.Codec, json.RawMessage) string
 	uniqueOn    bool
 	uniqueMode  UniqueConflict
@@ -87,6 +88,35 @@ func WithKey[I any](fn func(I) string) TaskOption {
 			}
 			return fn(in)
 		}
+	}
+}
+
+type keyDef struct {
+	name  string
+	fn    func(engine.Codec, json.RawMessage) string
+	limit int
+}
+
+// WithKeyLimit declares an additional named concurrency key with its own limit.
+// A step is claimed only when every key it declares has a free slot, so
+// declaring several gates on multiple dimensions at once. Keys are scoped by
+// name and value: two tasks using the same name and equal values share one
+// budget, which is how a limit is "shared" across tasks.
+func WithKeyLimit[I any](name string, fn func(I) string, limit int) TaskOption {
+	return func(c *taskConfig) {
+		c.keys = append(c.keys, keyDef{
+			name:  name,
+			limit: limit,
+			fn: func(codec engine.Codec, raw json.RawMessage) string {
+				var in I
+				if len(raw) > 0 {
+					if err := codec.Unmarshal(raw, &in); err != nil {
+						return "" // undecodable input leaves this key ungated
+					}
+				}
+				return fn(in)
+			},
+		})
 	}
 }
 
@@ -237,6 +267,9 @@ func (t *Task[I, O]) toDef() *engine.TaskDef {
 	def.KeyFn = t.cfg.keyFn
 	def.KeyLimit = t.cfg.keyLimit
 	def.KeyStrategy = t.cfg.keyStrategy
+	for _, kd := range t.cfg.keys {
+		def.ExtraKeys = append(def.ExtraKeys, engine.KeyDef{Name: kd.name, Fn: kd.fn, Limit: kd.limit})
+	}
 	def.Wrappers = t.cfg.wrap
 	def.Labels = t.cfg.labels
 	def.DeadLetter = t.cfg.deadLetter

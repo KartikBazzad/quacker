@@ -179,3 +179,16 @@ INSERT IGNORE INTO counters (name, next) VALUES ('run', 0);
 const myMigration7 = `
 ALTER TABLE runs ADD COLUMN ephemeral BIGINT NOT NULL DEFAULT 0;
 `
+
+// myMigration8 adds extra concurrency keys.
+const myMigration8 = `
+CREATE TABLE IF NOT EXISTS step_keys (
+	step_id   VARCHAR(64) NOT NULL,
+	name      VARCHAR(255) NOT NULL,
+	value     VARCHAR(255) NOT NULL,
+	key_limit BIGINT NOT NULL,
+	PRIMARY KEY (step_id, name),
+	KEY idx_step_keys_value (name, value),
+	CONSTRAINT fk_step_keys_step FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+`

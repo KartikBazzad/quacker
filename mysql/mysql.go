@@ -44,6 +44,7 @@ func (myBackend) Migrations() []driver.Migration {
 		{Version: 5, SQL: myMigration5},
 		{Version: 6, SQL: myMigration6},
 		{Version: 7, SQL: myMigration7},
+		{Version: 8, SQL: myMigration8},
 	}
 }
 
@@ -123,6 +124,16 @@ func (myBackend) SequenceGate() string {
 		WHERE sequence_key <> '' AND status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED')
 	) AS s2
 	WHERE s2.sequence_key = steps.sequence_key AND s2.seq < steps.seq)`
+}
+
+// KeysGate uses a derived table of RUNNING step ids so the self-reference in
+// UPDATE steps satisfies MySQL (error 1093).
+func (myBackend) KeysGate() string {
+	return `NOT EXISTS (SELECT 1 FROM step_keys k
+		WHERE k.step_id = steps.id AND k.key_limit > 0
+		  AND (SELECT COUNT(*) FROM step_keys k2
+		       JOIN (SELECT id FROM steps WHERE status = 'RUNNING') AS sr ON sr.id = k2.step_id
+		       WHERE k2.name = k.name AND k2.value = k.value) >= k.key_limit)`
 }
 
 // IsUniqueViolation matches MySQL/MariaDB error 1062 (ER_DUP_ENTRY).

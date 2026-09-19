@@ -427,6 +427,12 @@ func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
 		if err != nil {
 			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
 		}
+		for _, k := range st.Keys {
+			if _, err := tx.exec(ctx, `INSERT INTO step_keys (step_id, name, value, key_limit) VALUES (?,?,?,?)`,
+				st.ID, k.Name, k.Value, k.Limit); err != nil {
+				return fmt.Errorf("quacker: insert step key %q: %w", k.Name, err)
+			}
+		}
 	}
 	return nil
 }
@@ -964,6 +970,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 		AND `+queuePausedGate+`
 		AND `+runNotPausedGate+`
 		AND `+s.seqGate+`
+		AND `+s.keysGate+`
 		AND `+s.be.LabelGate()+`
 		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
@@ -998,14 +1005,14 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, claimed_at = ?, resume_at = 0, wait_kind = '', wait_event = '',
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate,
+				WHERE id = ? AND status = ? AND resume_at > 0 AND resume_at <= ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate+` AND `+s.keysGate,
 				StatusRunning, now, workerID, leaseUntil, st.ID, StatusSuspended, now)
 		} else {
 			res, err = tx.exec(ctx, `UPDATE steps SET
 				status = ?, attempts = attempts + 1, claimed_at = ?,
 				started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
 				worker_id = ?, lease_expires_at = ?
-				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate,
+				WHERE id = ? AND status = ? AND `+s.keyGate+` AND `+queuePausedGate+` AND `+runNotPausedGate+` AND `+s.seqGate+` AND `+s.keysGate,
 				StatusRunning, now, now, workerID, leaseUntil, st.ID, StatusQueued)
 		}
 		if err != nil {

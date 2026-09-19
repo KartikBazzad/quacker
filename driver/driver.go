@@ -118,9 +118,13 @@ type Backend interface {
 	KeyGate() string
 	// SequenceGate is the predicate (no placeholders) that admits a step only
 	// when no earlier-inserted step in the same sequence is unfinished. It is
-	// a coroutine on the enclosing steps row (SQLite/Postgres); MySQL needs the
-	// derived-table form.
+	// a correlated subquery on the enclosing steps row (SQLite/Postgres); MySQL
+	// needs the derived-table form.
 	SequenceGate() string
+	// KeysGate is the predicate (no placeholders) that admits a step only when
+	// every extra concurrency key on the step has a free slot (fewer than its
+	// limit RUNNING siblings with the same name and value).
+	KeysGate() string
 	// LabelGate is the SQL predicate (containing one '?' for the worker-labels
 	// JSON) admitting a step only when its labels are a subset of the worker's.
 	LabelGate() string
@@ -191,6 +195,16 @@ func CorrelatedSequenceGate() string {
 		  AND s2.sequence_key <> ''
 		  AND s2.seq < steps.seq
 		  AND s2.status IN ('QUEUED','RUNNING','BLOCKED','SUSPENDED'))`
+}
+
+// CorrelatedKeysGate is the default extra-concurrency-keys predicate: a step
+// is admitted only when every extra key on it has fewer than its limit RUNNING
+// siblings. The statement must expose `steps`.
+func CorrelatedKeysGate() string {
+	return `NOT EXISTS (SELECT 1 FROM step_keys k
+		WHERE k.step_id = steps.id AND k.key_limit > 0
+		  AND (SELECT COUNT(*) FROM step_keys k2 JOIN steps s2 ON s2.id = k2.step_id
+		       WHERE k2.name = k.name AND k2.value = k.value AND s2.status = 'RUNNING') >= k.key_limit)`
 }
 
 // MigrateLocker is an optional Backend extension for drivers whose migration

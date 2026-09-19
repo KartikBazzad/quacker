@@ -122,6 +122,16 @@ type Step struct {
 	// unfinished.
 	SequenceKey string
 	Seq         int64
+	// Keys are extra concurrency keys beyond ConcurrencyKey, each with its own
+	// limit; all must have a free slot for the step to be claimed.
+	Keys []StepKey
+}
+
+// StepKey is one named extra concurrency key on a step.
+type StepKey struct {
+	Name  string
+	Value string
+	Limit int64
 }
 
 // Cron is a row in the crons table.

@@ -242,6 +242,20 @@ CREATE TABLE IF NOT EXISTS queue_pauses (
 );
 `
 
+// migration19 adds extra concurrency keys: a per-step list of named keys,
+// each with its own limit, so a task can be gated on several keys at once and
+// share a named budget with other tasks.
+const migration19 = `
+CREATE TABLE IF NOT EXISTS step_keys (
+	step_id   TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+	name      TEXT NOT NULL,
+	value     TEXT NOT NULL,
+	key_limit BIGINT NOT NULL,
+	PRIMARY KEY (step_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_step_keys_value ON step_keys (name, value);
+`
+
 // migration18 adds ephemeral runs: persisted while in flight, deleted on
 // terminal and never recovered.
 const migration18 = `
@@ -294,6 +308,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 16, SQL: migration16},
 	{Version: 17, SQL: migration17},
 	{Version: 18, SQL: migration18},
+	{Version: 19, SQL: migration19},
 }
 
 // init validates the built-in migration list's invariant before any Open can

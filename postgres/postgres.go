@@ -62,6 +62,7 @@ func (pgBackend) Migrations() []driver.Migration {
 		{Version: 8, SQL: pgMigration8},
 		{Version: 9, SQL: pgMigration9},
 		{Version: 10, SQL: pgMigration10},
+		{Version: 11, SQL: pgMigration11},
 	}
 }
 
@@ -113,6 +114,8 @@ func (pgBackend) IsUniqueViolation(err error) bool {
 func (pgBackend) KeyGate() string { return driver.CorrelatedKeyGate() }
 
 func (pgBackend) SequenceGate() string { return driver.CorrelatedSequenceGate() }
+
+func (pgBackend) KeysGate() string { return driver.CorrelatedKeysGate() }
 
 // LabelGate: labels are stored as JSON text; cast to jsonb and test subset
 // membership with jsonb_array_elements_text.
