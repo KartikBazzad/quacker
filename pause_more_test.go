@@ -173,8 +173,12 @@ func TestPauseRunDAGBoundary(t *testing.T) {
 func TestPauseRunDurable(t *testing.T) {
 	q := newTestQ(t)
 	ctx := context.Background()
+	// An event-only wait keeps the step SUSPENDED with no wake timer, so the
+	// pause/resume happens deterministically (a SleepDurable here can race its
+	// own wake time under -race). The step registers the wait before the pause,
+	// so the later Emit counts and wakes it.
 	task := NewTask("prm.durable", func(ctx context.Context, in string) (string, error) {
-		if err := SleepDurable(ctx, 40*time.Millisecond); err != nil {
+		if _, err := WaitFor[string](ctx, "prm.resume", 0); err != nil {
 			return "", err
 		}
 		return in, nil
@@ -194,6 +198,9 @@ func TestPauseRunDurable(t *testing.T) {
 		t.Fatalf("status = %+v err=%v, want PAUSED", snap, err)
 	}
 	if err := q.ResumeRun(ctx, h.RunID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Emit(ctx, "prm.resume", nil); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := h.Result(ctx); err != nil || out != "x" {
