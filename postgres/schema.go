@@ -201,3 +201,9 @@ CREATE INDEX IF NOT EXISTS idx_step_keys_value ON step_keys (name, value);
 const pgMigration12 = `
 ALTER TABLE runs ADD COLUMN parent_step TEXT NOT NULL DEFAULT '';
 `
+
+// pgMigration13 stores a grouped workflow's group structure (name, group-level
+// deps, member steps) as JSON for DAG rendering.
+const pgMigration13 = `
+ALTER TABLE runs ADD COLUMN groups_json TEXT NOT NULL DEFAULT '';
+`

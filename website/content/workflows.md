@@ -44,6 +44,38 @@ undecodable output fails the call. Inside a workflow step,
 `StepFromContext` reports both the step name and its task name
 (`sc.Step` vs `sc.Task`).
 
+## Groups
+
+An ELT-style pipeline is stages of parallel steps, each stage gated on the
+previous one. `NewGroupWorkflow` expresses that directly: a group declares its
+dependency once with `After`, and member steps declare only intra-group deps.
+Group deps expand to member steps at enqueue, so nothing extra runs and there
+is no gate step.
+
+```go
+extract := quacker.NewGroup[Order]("extract",
+    quacker.Step("customers", extractCustomers),
+    quacker.Step("orders", extractOrders),
+)
+transform := quacker.NewGroup[Order]("transform",
+    quacker.Step("dim_customers", transformCustomers),
+    quacker.Step("facts_orders", transformOrders, "dim_customers"), // same group
+).After("extract")   // the whole group waits for extract
+load := quacker.NewGroup[Order]("load",
+    quacker.Step("load_all", loadTask),
+).After("transform")
+
+wf := quacker.NewGroupWorkflow[Order]("elt", extract, transform, load)
+```
+
+`After` names another group in the same workflow; an unknown name fails the
+enqueue. Because a group dep is recorded on every member step, a step can read
+any predecessor group's output with `DepOutput` (the dep is declared for it).
+
+`DAG`/`DAGSVG` draw a box per group and one **group-to-group edge** per
+`After`, plus the intra-group step edges — not the expanded cross-group step
+mesh. `Execution.Groups` reports each group's name, deps, and members.
+
 ## Failure semantics
 
 - A step exhausting retries marks it `FAILED`; the run fails and remaining
@@ -66,7 +98,10 @@ svg, _ := q.DAGSVG(ctx, runID)     // standalone SVG document
 `DAG` returns `DAGNode`s (`Name`, `Task`, `Status`, `DurationMs`, `Err`) and
 `DAGEdge`s (`From`, `To`). `DAGJSON` is machine-consumable state for
 dashboards; `DAGSVG` renders an embeddable picture (see
-`examples/dagsvg`, which writes `dag.svg`).
+`examples/dagsvg`, which writes `dag.svg`). For a grouped workflow the graph
+also carries `DAGGroup`s (name, deps, members) and draws group boxes with
+group-to-group edges; for child workflows, `DAGTree`/`DAGTreeSVG` draw the
+whole family, contracting each spawner into the group its children form.
 
 ## Limits
 

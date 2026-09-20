@@ -412,11 +412,11 @@ func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) er
 // is not unique so the unique index ignores it.
 func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
 	res, err := tx.exec(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, parent_step, trace_parent, unique_key, sequence_key, seq, ephemeral)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?,?,?)`,
+		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, parent_step, trace_parent, unique_key, sequence_key, seq, ephemeral, groups_json)
+		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
 		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
 		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.ParentStep, run.TraceParent,
-		nullableString(run.UniqueKey), run.SequenceKey, run.Seq, boolInt(run.Ephemeral))
+		nullableString(run.UniqueKey), run.SequenceKey, run.Seq, boolInt(run.Ephemeral), string(run.Groups))
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}

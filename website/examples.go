@@ -16,7 +16,7 @@ import (
 // advanced programs.
 var exampleOrder = []string{
 	"simple", "dag", "cron", "events", "children", "durable",
-	"introspect", "dagsvg",
+	"introspect", "dagsvg", "eltgroups",
 }
 
 // renderExamples builds the examples gallery: each example's doc comment as

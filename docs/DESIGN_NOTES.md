@@ -918,7 +918,51 @@ clustered together ("partition → 8 child runs") — one box for the fan-out, n
 one per child, and no box for the root run's own steps (it would just wrap the
 whole graph). The groups are in the JSON too. It recurses (bounded by depth and node count) so a tree
 of child workflows renders in one image. The plain `DAG` is unchanged, so the
-single-run contract holds; `DAGTree` is the opt-in family view.
+single-run contract holds; `DAGTree` is the opt-in family view. (v1.11 revises
+the drawing: the spawning step is contracted into the group its children form,
+and groups are linked group-to-group — see §42.)
+
+### 42. v1.11: workflow groups are a build-time expansion; the DAG draws groups
+
+An ELT pipeline is stages of parallel steps, each stage gated on the previous
+one. Expressing that with raw step deps means either repeating the stage's
+dependency on every member step or adding a synthetic "gate" step whose only
+job is to fan in the previous stage. `NewGroupWorkflow` removes both: a group
+declares its dependency once with `.After(group)`, and the dependency is
+**expanded to the predecessor group's member steps at enqueue**. The engine and
+store are untouched — a grouped run is an ordinary run whose `depends_on`
+arrays happen to be larger — so claim gating, DAG completion, retries, and
+restart recovery all keep working with no new code path.
+
+The group structure itself is rendering-only, so it is persisted as a single
+JSON column (`runs.groups_json`: `[{name, deps, steps}]`) rather than a child
+table; nothing ever queries it. The column is `groups_json`, not `groups`,
+because MySQL 8 reserves `GROUPS` (the window-frame unit) — the same
+reserved-word rule that named the journal's `wkey` (§34, DRIVERS.md).
+
+The interesting half is the picture. `DAG`/`DAGSVG` must draw group boxes and
+**group-to-group edges** while hiding the expanded cross-group step mesh (the
+expansion is an implementation detail). So `DAG` tags each member node with its
+group, drops a step edge whose endpoints are in two different groups (the group
+edge stands in for all of them), and adds one edge per `After`.
+
+Rendering that correctly forced a real layout change. The first cut laid every
+node out globally by dependency level and drew each group as the min/max
+bounding box of its members — which is geometrically valid but visually wrong:
+a box could enclose a node from another group whenever their levels interleaved.
+The fix is a compound layout (`layoutDAG`/`layoutCluster`): each group is laid
+out independently, sized (members + padding + label strip), then treated as one
+**atomic unit** in its parent's layout and translated into place. Group boxes
+therefore come from the layout, never from member coordinates, so they cannot
+overlap or swallow foreign nodes. An edge endpoint is a node name or a group
+name, resolved to a node box or a group box when drawn.
+
+The same machinery serves child workflows. In `DAGTree`, a step that spawns
+child runs is contracted into the group those runs form (the spawner node
+disappears), the group inherits the spawner's dependencies as group-level
+edges, and the spawner→child-root edges are gone — so a nested pipeline reads
+`extract → transform → load` with intra-group step edges, exactly like the flat
+case.
 
 ## Lessons (bugs the tests caught)
 

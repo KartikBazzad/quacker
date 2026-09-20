@@ -93,9 +93,23 @@ type Execution struct {
 	StartedAt   time.Time   `json:"started_at,omitempty"`
 	CompletedAt time.Time   `json:"completed_at,omitempty"`
 	Steps       []StepState `json:"steps"`
+	// Groups are the run's logical groups (from a grouped workflow), each with
+	// its group-level dependencies and member step names. Empty for a plain
+	// workflow.
+	Groups []RunGroup `json:"groups,omitempty"`
 	// Children are runs enqueued from inside this run (via EnqueueChild),
 	// oldest first. They run independently; the parent does not wait for them.
 	Children []RunSummary `json:"children,omitempty"`
+}
+
+// RunGroup is a named set of steps that share a group-level dependency. Group
+// deps gate the whole group; member steps do not repeat them.
+type RunGroup struct {
+	Name string `json:"name"`
+	// Deps are the names of groups this group runs after.
+	Deps []string `json:"deps,omitempty"`
+	// Steps are the member step names.
+	Steps []string `json:"steps"`
 }
 
 // RunSummary is a run without payloads, for list views.
@@ -216,6 +230,9 @@ func (q *Quacker) Execution(ctx context.Context, runID string) (*Execution, erro
 				CompletedAt: unixToTime(c.CompletedAt),
 			})
 		}
+	}
+	if len(run.Groups) > 0 {
+		_ = json.Unmarshal(run.Groups, &ex.Groups)
 	}
 	return ex, nil
 }

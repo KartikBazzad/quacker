@@ -36,6 +36,9 @@ is the wrong amount of infrastructure.
 
 ## Features
 
+- **Workflows & groups** — `NewWorkflow` for a step DAG; `NewGroupWorkflow`
+  + `NewGroup(name, …).After(group)` gives each stage a single group-level
+  dependency (drawn as box-to-box edges) without repeating it on every step
 - **Typed tasks** — `NewTask[I, O]` with JSON payloads (or a pluggable codec)
 - **Retries** — attempt counts, exponential/constant backoff with jitter
 - **Timeouts** — per-attempt, via `context`
@@ -184,6 +187,37 @@ so you only list `"charge"` on `notify` if you want the edge explicit or
 robust to `ship`'s definition changing. There is one hard reason to list it:
 `DepOutput` sees only *declared* deps, so a step must name a dep to read its
 output (see `ship` reading `charge` above).
+
+### Groups
+
+An ELT-style pipeline is often stages of parallel steps, each stage gated on
+the previous one. `NewGroupWorkflow` expresses that directly: a group declares
+its dependency once with `After`, and the group's member steps only declare
+their intra-group deps. Group deps expand to member steps at enqueue, so
+nothing extra runs and there is no gate step.
+
+```go
+extract := quacker.NewGroup[Order]("extract",
+    quacker.Step("customers", extractCustomers),
+    quacker.Step("orders", extractOrders),
+)
+transform := quacker.NewGroup[Order]("transform",
+    quacker.Step("dim_customers", transformCustomers),
+    quacker.Step("facts_orders", transformOrders, "dim_customers"), // same group
+).After("extract")   // the whole group waits for extract
+load := quacker.NewGroup[Order]("load",
+    quacker.Step("load_all", loadTask),
+).After("transform")
+
+wf := quacker.NewGroupWorkflow[Order]("elt", extract, transform, load)
+```
+
+`DAG`/`DAGSVG` draw a box per group and a **group-to-group edge** for each
+`After`, plus intra-group step edges — not the expanded cross-group step mesh.
+`Execution.Groups` carries each group's name, deps, and members. The same
+semantics apply to child workflows in a run tree: a spawner step is contracted
+into the group its child runs form, and `DAGTree` links groups to the groups
+they depend on.
 
 ## DAG visualization
 
@@ -573,12 +607,13 @@ overhead at all.
 
 ## Not yet
 
-Strict (ordered) per-key concurrency and a web UI. Compile-time lifecycle-hook
-plugins, a pluggable payload codec (v1.3), and a public storage-driver contract
-with MySQL/MariaDB (v1.4) shipped; new SQL databases are a
-[driver](docs/DRIVERS.md) you can implement out-of-tree. Multi-process scaling
-over Postgres/MySQL, worker labels, OTel tracing, durable execution, and DAG
-visualization are all shipped.
+A web UI. Everything else on the old list has shipped: strict ordered per-key
+concurrency (`WithSequence`), compile-time lifecycle-hook plugins, a pluggable
+payload codec, and a public storage-driver contract with MySQL/MariaDB — new
+SQL databases are a [driver](docs/DRIVERS.md) you can implement out-of-tree.
+Multi-process scaling over Postgres/MySQL, worker labels, OTel tracing, durable
+execution, and DAG visualization (including workflow groups and child-run
+trees) are all shipped.
 
 ## Documentation
 
@@ -596,7 +631,8 @@ visualization are all shipped.
 [`dagsvg`](examples/dagsvg/main.go) · [`cron`](examples/cron/main.go) ·
 [`events`](examples/events/main.go) · [`durable`](examples/durable/main.go) ·
 [`children`](examples/children/main.go) ·
-[`introspect`](examples/introspect/main.go)
+[`introspect`](examples/introspect/main.go) ·
+[`eltgroups`](examples/eltgroups/main.go)
 
 ## Development
 

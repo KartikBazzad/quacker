@@ -262,6 +262,13 @@ const migration20 = `
 ALTER TABLE runs ADD COLUMN parent_step TEXT NOT NULL DEFAULT '';
 `
 
+// migration21 stores a grouped workflow's group structure (name, group-level
+// deps, member steps) as JSON, so DAG/DAGSVG can draw group boxes and
+// group-to-group edges without every member step repeating the group dep.
+const migration21 = `
+ALTER TABLE runs ADD COLUMN groups_json TEXT NOT NULL DEFAULT '';
+`
+
 // migration18 adds ephemeral runs: persisted while in flight, deleted on
 // terminal and never recovered.
 const migration18 = `
@@ -316,6 +323,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 18, SQL: migration18},
 	{Version: 19, SQL: migration19},
 	{Version: 20, SQL: migration20},
+	{Version: 21, SQL: migration21},
 }
 
 // init validates the built-in migration list's invariant before any Open can

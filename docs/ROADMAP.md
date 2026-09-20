@@ -1,13 +1,14 @@
 # Roadmap
 
-Status: **v1.0–v1.10 shipped** — durable execution, DAG visualizer, debug
+Status: **v1.0–v1.11 shipped** — durable execution, DAG visualizer, debug
 logger, worker labels, OTel tracing, Postgres with multi-instance leases, the
 perf pass, lifecycle-hook plugins, a pluggable payload codec, and a public
 storage-driver contract with a MySQL/MariaDB driver, v1.5 job-control
 primitives (unique jobs, snooze, queue pause, run pause/resume), v1.6
 (retention per queue, enqueue-on-`*sql.Tx`, dead-letter queue, sequences), and
 v1.7 (encrypted payloads, ephemeral runs), v1.8 (concurrency cancel
-strategies), and v1.9 (multiple/shared concurrency keys). The v1.0 stability
+strategies), v1.9 (multiple/shared concurrency keys), v1.10 (batched
+completion), and v1.11 (workflow groups). The v1.0 stability
 gates (semver policy, chaos, fuzzing, pkg.go.dev examples) are
 complete; the first release, v1.0.0, is tagged and published.
 
@@ -564,6 +565,21 @@ Still open on concurrency: per-worker slots and dynamic limit expressions.
   ~1.4× and making it scale with worker count. Sequential latency unchanged.
   See DESIGN_NOTES §40 and BENCHMARKS.md.
 
+## v1.11 — workflow groups (✅ DONE)
+
+- ✅ **`NewGroupWorkflow` / `NewGroup(name, …).After(group)`**: a group declares
+  its dependency once, and the dep expands to the group's member steps at
+  enqueue — no gate step, no child runs. Member steps declare only intra-group
+  deps. `DAG`/`DAGSVG` draw a box per group and group-to-group edges (plus
+  intra-group step edges) instead of the expanded cross-group step mesh;
+  `Execution.Groups` exposes each group's name, deps, and members. Group
+  structure persists in `runs.groups_json`. Migration: SQLite 21, Postgres 13,
+  MySQL 10. See DESIGN_NOTES §42.
+- ✅ **Run-tree groups are first-class**: a step that spawns child runs is
+  contracted into the group those runs form, and `DAGTree` links groups to the
+  groups they depend on (the spawner's deps) rather than drawing spawner nodes
+  and spawner→child edges.
+
 ## Backlog
 - Custom storage backends
 - Http Layer + Multi Node Architecture (Seperate Go Framework based on Quacker)
@@ -602,8 +618,9 @@ names the closest API today.
 | Work functions | ✅ | Tasks are plain Go functions (`NewTask`). |
 | Pause/resume jobs & workflows | ✅ | `PauseRun`/`ResumeRun` (v1.5); running steps requeue on resume. |
 | Workflows | ✅ | DAG workflows (`NewWorkflow`/`Step`/`DepOutput`) plus child runs. |
+| Workflow groups | ✅ | `NewGroupWorkflow`/`NewGroup(...).After(...)`: group-level deps expand to member steps; DAG draws group boxes + group-to-group edges (v1.11). |
 
-Tally: 24 shipped, 2 partial, 0 missing — v1.7 (encrypted payloads, ephemeral
+Tally: 25 shipped, 2 partial, 0 missing — v1.7 (encrypted payloads, ephemeral
 runs), v1.8 (cancel strategies), and v1.9 (multiple/shared keys) were
 additive within existing rows. The remaining partial items are per-worker
 slots and dynamic limit expressions, and the client-in-context accessor.

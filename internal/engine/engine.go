@@ -123,7 +123,11 @@ type EnqueueRequest struct {
 	Conflict  store.UniqueConflict
 	// Ephemeral deletes the run on terminal and skips boot recovery.
 	Ephemeral bool
-	Steps     []StepReq
+	// Groups, when non-empty, is the run's group structure as JSON (name,
+	// group-level deps, member steps), persisted for DAG rendering. Execution
+	// does not read it: group deps are already expanded into Steps.
+	Groups []byte
+	Steps  []StepReq
 }
 
 // CronInfo describes a registered cron trigger.
@@ -1025,6 +1029,7 @@ func (e *Engine) buildRun(req *EnqueueRequest, now time.Time) (*store.Run, []*st
 		ParentID: req.ParentID, ParentStep: req.ParentStep,
 		UniqueKey:   req.UniqueKey,
 		MaxAttempts: 1, RunAt: runAt.UnixNano(), CreatedAt: now.UnixNano(),
+		Groups: req.Groups,
 	}
 	var steps []*store.Step
 	for i, sr := range req.Steps {

@@ -9,8 +9,9 @@ How quacker works inside one process. For user-facing docs see the
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ package quacker (public API)                                        │
-│   Open/Close · Task[I,O] · Workflow[I] · RunHandle[O]               │
-│   Enqueue/EnqueueWorkflow/Cron · Execution/Runs/Metrics/Logs        │
+│   Open/Close · Task[I,O] · Workflow[I] · Group[I] · RunHandle[O]    │
+│   Enqueue/EnqueueWorkflow/EnqueueWorkflowChild/Cron                 │
+│   NewWorkflow/NewGroupWorkflow · Execution/Runs/Metrics/Logs        │
 │   Subscribe · Cancel                                                │
 │   Use/Wrap (middleware) · Purge/WithRetention · WithMetricsFunc     │
 │   WithTaskLogSink/WithLogSink · WithLogStorage · DAGJSON/DAGSVG     │
@@ -133,7 +134,7 @@ is true.
 ```
 runs(id, workflow, kind, status, queue, priority, input, output, error,
      attempts, max_attempts, run_at, created_at, started_at, completed_at,
-     concurrency_key, parent_id, trace_parent)
+     concurrency_key, parent_id, parent_step, trace_parent, groups_json)
 steps(id, run_id→runs, name, task, ord, status, depends_on, queue, priority,
       input, output, error, attempts, max_attempts, timeout_ns,
       run_at, created_at, started_at, completed_at,
@@ -161,9 +162,12 @@ adds the durable-execution columns on `steps` and the `step_journal` table
 leave a dangling id); migration 7 rewrites `steps.depends_on` from
 comma-joined text to a JSON array; migration 8 adds `steps.labels` (JSON
 array) for worker-label routing; migration 9 adds `runs.trace_parent` (the
-W3C traceparent captured at enqueue). Postgres has a single initial migration
-with the same columns in dialect types (BIGINT throughout, identity `seq`,
-BYTEA, BOOLEAN journal flags, JSON kept as TEXT).
+W3C traceparent captured at enqueue); later migrations add sequences,
+ephemeral runs, extra concurrency keys, `runs.parent_step` (the spawner of a
+child run), and `runs.groups_json` (a grouped workflow's group structure —
+rendering-only, never queried). Postgres and MySQL track the same columns with
+dialect types (BIGINT throughout, identity `seq`, BYTEA/LONGBLOB, BOOLEAN
+journal flags, JSON kept as TEXT).
 
 The `logs` table still exists, but is only written when
 `WithLogStorage(true)` is set: by default task logs go to a sink (engine slog

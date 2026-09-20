@@ -68,23 +68,16 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 		t.Fatalf("child steps in tree = %d, want 3 (nodes: %v)", childSteps, nodeNames(tree))
 	}
 
-	// Each child is attached to the spawning step "fan", both as an edge and
-	// as a dependency (so the level layout places it after fan, not in the
-	// root column).
-	spawnEdges := 0
-	for _, e := range tree.Edges {
-		if e.From == "fan" && strings.HasSuffix(e.To, "/job") {
-			spawnEdges++
+	// The spawning step "fan" is contracted into the group it spawns: it is
+	// not a node, and its dependency ("plan") becomes a group-level edge.
+	for _, n := range tree.Nodes {
+		if n.Name == "fan" {
+			t.Fatalf("spawner step should be contracted into its group (nodes: %v)", nodeNames(tree))
 		}
 	}
-	if spawnEdges != 3 {
-		t.Fatalf("spawn edges from fan = %d, want 3 (edges: %v)", spawnEdges, tree.Edges)
-	}
 	for _, n := range tree.Nodes {
-		if strings.HasSuffix(n.Name, "/job") {
-			if len(n.Deps) != 1 || n.Deps[0] != "fan" {
-				t.Fatalf("child node %s deps = %v, want [fan]", n.Name, n.Deps)
-			}
+		if strings.HasSuffix(n.Name, "/job") && len(n.Deps) != 0 {
+			t.Fatalf("child node %s deps = %v, want none (group carries the dep)", n.Name, n.Deps)
 		}
 	}
 
@@ -96,9 +89,22 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 	if got := tree.Groups[0].Label; got != "fan → 3 child runs" {
 		t.Fatalf("fan-out group label = %q, want %q", got, "fan → 3 child runs")
 	}
+	grp := tree.Groups[0]
+	if len(grp.Deps) != 1 || grp.Deps[0] != "plan" {
+		t.Fatalf("group deps = %v, want [plan]", grp.Deps)
+	}
+	groupEdges := 0
+	for _, e := range tree.Edges {
+		if e.From == "plan" && e.To == grp.Name {
+			groupEdges++
+		}
+	}
+	if groupEdges != 1 {
+		t.Fatalf("plan → group edges = %d, want 1 (edges: %v)", groupEdges, tree.Edges)
+	}
 	for _, n := range tree.Nodes {
 		if strings.HasSuffix(n.Name, "/job") {
-			if n.Group != tree.Groups[0].Name {
+			if n.Group != grp.Name {
 				t.Fatalf("child node %s group = %q, want the fan group", n.Name, n.Group)
 			}
 		} else if n.Group != "" {
@@ -137,6 +143,23 @@ func TestDAGTreeIncludesChildren(t *testing.T) {
 	if !strings.Contains(string(svg), "fan → 3 child runs") {
 		t.Fatal("tree SVG missing the fan-out group label")
 	}
+
+	// The rendered group box must wrap only the child-run nodes, never the
+	// root steps — the bounding-box-over-global-layout regression.
+	nodeW := dagNodeWidth(tree.Nodes)
+	pos, boxes, _, _ := layoutDAG(tree, nodeW)
+	bx, ok := boxes[tree.Groups[0].Name]
+	if !ok {
+		t.Fatal("no box for the fan-out group")
+	}
+	for _, n := range tree.Nodes {
+		p := pos[n.Name]
+		cx, cy := p[0]+nodeW/2, p[1]+dagNodeH/2
+		inside := cx >= bx.x && cx <= bx.x+bx.w && cy >= bx.y && cy <= bx.y+bx.h
+		if want := n.Group == tree.Groups[0].Name; inside != want {
+			t.Fatalf("node %s inside its group box = %v, want %v", n.Name, inside, want)
+		}
+	}
 }
 
 func nodeNames(d *DAG) []string {
@@ -145,4 +168,66 @@ func nodeNames(d *DAG) []string {
 		names[i] = n.Name
 	}
 	return names
+}
+
+// TestDAGSVGGroupsAreIsolated: a group's box must contain only its own nodes
+// and must not overlap a sibling group's box. This is the regression where
+// boxes were min/max bounds over globally layered members, so a box could
+// enclose nodes belonging to another group.
+func TestDAGSVGGroupsAreIsolated(t *testing.T) {
+	d := &DAG{
+		RunID: "root", Workflow: "wf", Status: StatusSucceeded,
+		Groups: []DAGGroup{
+			{Name: "root/extract", Label: "extract → 1 child runs"},
+			{Name: "root/load", Label: "load → 1 child runs"},
+		},
+		Nodes: []DAGNode{
+			{Name: "extract", Group: ""},
+			{Name: "load", Group: ""},
+			{Name: "c1/extract_a", Group: "root/extract"},
+			{Name: "c1/extract_b", Group: "root/extract"},
+			{Name: "c1/extract_join", Group: "root/extract"},
+			{Name: "c2/load_a", Group: "root/load"},
+			{Name: "c2/load_b", Group: "root/load"},
+		},
+		Edges: []DAGEdge{
+			{From: "extract", To: "c1/extract_a"},
+			{From: "c1/extract_a", To: "c1/extract_join"},
+			{From: "c1/extract_b", To: "c1/extract_join"},
+			{From: "extract", To: "load"},
+			{From: "load", To: "c2/load_a"},
+			{From: "c2/load_a", To: "c2/load_b"},
+		},
+	}
+	nodeW := dagNodeWidth(d.Nodes)
+	pos, boxes, _, _ := layoutDAG(d, nodeW)
+
+	if len(boxes) != len(d.Groups) {
+		t.Fatalf("boxes = %d, want %d", len(boxes), len(d.Groups))
+	}
+	inside := func(r svgRect, name string) bool {
+		p := pos[name]
+		cx, cy := p[0]+nodeW/2, p[1]+dagNodeH/2
+		return cx >= r.x && cx <= r.x+r.w && cy >= r.y && cy <= r.y+r.h
+	}
+	for _, g := range d.Groups {
+		bx := boxes[g.Name]
+		for _, n := range d.Nodes {
+			if got, want := inside(bx, n.Name), n.Group == g.Name; got != want {
+				t.Errorf("node %q inside box %q = %v, want %v (box=%+v pos=%v)",
+					n.Name, g.Name, got, want, bx, pos[n.Name])
+			}
+		}
+	}
+	for i := 0; i < len(d.Groups); i++ {
+		for j := i + 1; j < len(d.Groups); j++ {
+			if a, b := boxes[d.Groups[i].Name], boxes[d.Groups[j].Name]; rectsOverlap(a, b) {
+				t.Errorf("group boxes overlap: %q=%+v %q=%+v", d.Groups[i].Name, a, d.Groups[j].Name, b)
+			}
+		}
+	}
+}
+
+func rectsOverlap(a, b svgRect) bool {
+	return a.x < b.x+b.w && b.x < a.x+a.w && a.y < b.y+b.h && b.y < a.y+a.h
 }

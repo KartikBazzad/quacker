@@ -46,6 +46,7 @@ func (myBackend) Migrations() []driver.Migration {
 		{Version: 7, SQL: myMigration7},
 		{Version: 8, SQL: myMigration8},
 		{Version: 9, SQL: myMigration9},
+		{Version: 10, SQL: myMigration10},
 	}
 }
 

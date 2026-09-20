@@ -26,6 +26,11 @@ any time.
 
 - New options, hooks, fields, methods, and **status values** (e.g.
   `StatusPaused`) are additive and non-breaking.
+- New workflow-building helpers are additive: `NewGroupWorkflow`, `Group[I]`,
+  and `Group.After` (v1.2.0) sit beside `NewWorkflow`/`Step`, which are
+  unchanged. `Execution.Groups`, `DAGNode.Group`, and `DAGGroup`'s
+  `Parent`/`Deps`/`Steps` are new fields on existing structs (JSON-optional),
+  so existing readers and decoders keep working.
 - Removing or changing the signature of an exported identifier is breaking.
 - When something is superseded it is first deprecated in a doc comment before
   removal in the next major.

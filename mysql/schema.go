@@ -197,3 +197,10 @@ CREATE TABLE IF NOT EXISTS step_keys (
 const myMigration9 = `
 ALTER TABLE runs ADD COLUMN parent_step VARCHAR(255) NOT NULL DEFAULT '';
 `
+
+// myMigration10 stores a grouped workflow's group structure (name, group-level
+// deps, member steps) as JSON for DAG rendering. NULL rather than NOT NULL
+// because MySQL forbids defaults on TEXT columns.
+const myMigration10 = `
+ALTER TABLE runs ADD COLUMN groups_json LONGTEXT NULL;
+`

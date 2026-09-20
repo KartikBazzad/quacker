@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 
 // Version is the released semantic version of this build. Releases are tagged
 // vMAJOR.MINOR.PATCH (see docs/STABILITY.md); fixes bump the patch component.
-const Version = "v1.1.1"
+const Version = "v1.2.0"
 
 // Quacker is an embedded orchestration engine. Create with Open; safe for
 // concurrent use.
@@ -444,6 +445,15 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 	if err != nil {
 		return nil, err
 	}
+	var groupsJSON []byte
+	if len(wf.groups) > 0 {
+		if err := validateWorkflowGroups(wf); err != nil {
+			return nil, err
+		}
+		if groupsJSON, err = json.Marshal(wf.groups); err != nil {
+			return nil, err
+		}
+	}
 	steps := make([]engine.StepReq, len(wf.steps))
 	for i, s := range wf.steps {
 		steps[i] = engine.StepReq{Name: s.name, Deps: s.deps, Def: s.def}
@@ -458,12 +468,36 @@ func enqueueWorkflow[O any, I any](ctx context.Context, q *Quacker, wf *Workflow
 		ParentStep: parentStepOf(ctx, parent),
 		UniqueKey:  ec.uniqueKey,
 		Ephemeral:  wf.steps[0].def.Ephemeral,
+		Groups:     groupsJSON,
 		Steps:      steps,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &RunHandle[O]{runID: w.RunID, w: w, codec: q.eng.Codec()}, nil
+}
+
+// validateWorkflowGroups checks group names are unique and every After
+// reference names a declared group.
+func validateWorkflowGroups[I any](wf *Workflow[I]) error {
+	names := make(map[string]bool, len(wf.groups))
+	for _, g := range wf.groups {
+		if g.Name == "" {
+			return errors.New("quacker: group requires a name")
+		}
+		if names[g.Name] {
+			return fmt.Errorf("quacker: duplicate group name %q", g.Name)
+		}
+		names[g.Name] = true
+	}
+	for _, g := range wf.groups {
+		for _, dep := range g.Deps {
+			if !names[dep] {
+				return fmt.Errorf("quacker: group %q depends on unknown group %q", g.Name, dep)
+			}
+		}
+	}
+	return nil
 }
 
 // parentStepOf returns the current step's name when enqueuing a child run, or

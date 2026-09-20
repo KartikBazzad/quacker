@@ -1,0 +1,230 @@
+{
+  "run_id": "dlk28lc1mafk-512accf3",
+  "workflow": "elt.grouped_pipeline",
+  "kind": "workflow",
+  "status": "SUCCEEDED",
+  "queue": "default",
+  "nodes": [
+    {
+      "name": "extract_customers",
+      "task": "elt.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 3,
+      "group": "extract"
+    },
+    {
+      "name": "extract_orders",
+      "task": "elt.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 3,
+      "group": "extract"
+    },
+    {
+      "name": "extract_products",
+      "task": "elt.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 3,
+      "group": "extract"
+    },
+    {
+      "name": "transform_customers",
+      "task": "elt.transform",
+      "status": "SUCCEEDED",
+      "deps": [
+        "extract_customers",
+        "extract_orders",
+        "extract_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "transform"
+    },
+    {
+      "name": "transform_orders",
+      "task": "elt.transform",
+      "status": "SUCCEEDED",
+      "deps": [
+        "transform_customers",
+        "extract_customers",
+        "extract_orders",
+        "extract_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "transform"
+    },
+    {
+      "name": "transform_products",
+      "task": "elt.transform",
+      "status": "SUCCEEDED",
+      "deps": [
+        "extract_customers",
+        "extract_orders",
+        "extract_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "transform"
+    },
+    {
+      "name": "load_customers",
+      "task": "elt.load",
+      "status": "SUCCEEDED",
+      "deps": [
+        "transform_customers",
+        "transform_orders",
+        "transform_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "load"
+    },
+    {
+      "name": "load_orders",
+      "task": "elt.load",
+      "status": "SUCCEEDED",
+      "deps": [
+        "transform_customers",
+        "transform_orders",
+        "transform_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "load"
+    },
+    {
+      "name": "load_products",
+      "task": "elt.load",
+      "status": "SUCCEEDED",
+      "deps": [
+        "transform_customers",
+        "transform_orders",
+        "transform_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "load"
+    },
+    {
+      "name": "refresh_dashboard",
+      "task": "elt.refresh_dashboard",
+      "status": "SUCCEEDED",
+      "deps": [
+        "load_customers",
+        "load_orders",
+        "load_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "report"
+    },
+    {
+      "name": "publish_metrics",
+      "task": "elt.publish_metrics",
+      "status": "SUCCEEDED",
+      "deps": [
+        "load_customers",
+        "load_orders",
+        "load_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "report"
+    },
+    {
+      "name": "send_alert",
+      "task": "elt.send_alert",
+      "status": "SUCCEEDED",
+      "deps": [
+        "refresh_dashboard",
+        "publish_metrics",
+        "load_customers",
+        "load_orders",
+        "load_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "report"
+    }
+  ],
+  "edges": [
+    {
+      "from": "transform_customers",
+      "to": "transform_orders"
+    },
+    {
+      "from": "refresh_dashboard",
+      "to": "send_alert"
+    },
+    {
+      "from": "publish_metrics",
+      "to": "send_alert"
+    },
+    {
+      "from": "extract",
+      "to": "transform"
+    },
+    {
+      "from": "transform",
+      "to": "load"
+    },
+    {
+      "from": "load",
+      "to": "report"
+    }
+  ],
+  "groups": [
+    {
+      "name": "extract",
+      "label": "extract",
+      "status": "SUCCEEDED",
+      "steps": [
+        "extract_customers",
+        "extract_orders",
+        "extract_products"
+      ]
+    },
+    {
+      "name": "transform",
+      "label": "transform",
+      "status": "SUCCEEDED",
+      "deps": [
+        "extract"
+      ],
+      "steps": [
+        "transform_customers",
+        "transform_orders",
+        "transform_products"
+      ]
+    },
+    {
+      "name": "load",
+      "label": "load",
+      "status": "SUCCEEDED",
+      "deps": [
+        "transform"
+      ],
+      "steps": [
+        "load_customers",
+        "load_orders",
+        "load_products"
+      ]
+    },
+    {
+      "name": "report",
+      "label": "report",
+      "status": "SUCCEEDED",
+      "deps": [
+        "load"
+      ],
+      "steps": [
+        "refresh_dashboard",
+        "publish_metrics",
+        "send_alert"
+      ]
+    }
+  ]
+}

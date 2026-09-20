@@ -1,0 +1,196 @@
+{
+  "run_id": "dlk29c1w1pig-023f99dd",
+  "workflow": "elt.nested_pipeline",
+  "kind": "workflow",
+  "status": "SUCCEEDED",
+  "queue": "default",
+  "nodes": [
+    {
+      "name": "d8408729/load_customers",
+      "task": "nested.load",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/load_group"
+    },
+    {
+      "name": "d8408729/load_orders",
+      "task": "nested.load",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/load_group"
+    },
+    {
+      "name": "d8408729/load_products",
+      "task": "nested.load",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/load_group"
+    },
+    {
+      "name": "d8408729/load_join",
+      "task": "nested.join",
+      "status": "SUCCEEDED",
+      "deps": [
+        "d8408729/load_customers",
+        "d8408729/load_orders",
+        "d8408729/load_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/load_group"
+    },
+    {
+      "name": "3b6c945e/transform_customers",
+      "task": "nested.transform",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/transform_group"
+    },
+    {
+      "name": "3b6c945e/transform_orders",
+      "task": "nested.transform",
+      "status": "SUCCEEDED",
+      "deps": [
+        "3b6c945e/transform_customers"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/transform_group"
+    },
+    {
+      "name": "3b6c945e/transform_products",
+      "task": "nested.transform",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/transform_group"
+    },
+    {
+      "name": "3b6c945e/transform_join",
+      "task": "nested.join",
+      "status": "SUCCEEDED",
+      "deps": [
+        "3b6c945e/transform_customers",
+        "3b6c945e/transform_orders",
+        "3b6c945e/transform_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/transform_group"
+    },
+    {
+      "name": "a46abee1/extract_customers",
+      "task": "nested.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/extract_group"
+    },
+    {
+      "name": "a46abee1/extract_orders",
+      "task": "nested.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/extract_group"
+    },
+    {
+      "name": "a46abee1/extract_products",
+      "task": "nested.extract",
+      "status": "SUCCEEDED",
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/extract_group"
+    },
+    {
+      "name": "a46abee1/extract_join",
+      "task": "nested.join",
+      "status": "SUCCEEDED",
+      "deps": [
+        "a46abee1/extract_customers",
+        "a46abee1/extract_orders",
+        "a46abee1/extract_products"
+      ],
+      "attempts": 1,
+      "max_attempts": 1,
+      "group": "dlk29c1w1pig-023f99dd/extract_group"
+    }
+  ],
+  "edges": [
+    {
+      "from": "dlk29c1w1pig-023f99dd/transform_group",
+      "to": "dlk29c1w1pig-023f99dd/load_group"
+    },
+    {
+      "from": "d8408729/load_customers",
+      "to": "d8408729/load_join"
+    },
+    {
+      "from": "d8408729/load_orders",
+      "to": "d8408729/load_join"
+    },
+    {
+      "from": "d8408729/load_products",
+      "to": "d8408729/load_join"
+    },
+    {
+      "from": "dlk29c1w1pig-023f99dd/extract_group",
+      "to": "dlk29c1w1pig-023f99dd/transform_group"
+    },
+    {
+      "from": "3b6c945e/transform_customers",
+      "to": "3b6c945e/transform_orders"
+    },
+    {
+      "from": "3b6c945e/transform_customers",
+      "to": "3b6c945e/transform_join"
+    },
+    {
+      "from": "3b6c945e/transform_orders",
+      "to": "3b6c945e/transform_join"
+    },
+    {
+      "from": "3b6c945e/transform_products",
+      "to": "3b6c945e/transform_join"
+    },
+    {
+      "from": "a46abee1/extract_customers",
+      "to": "a46abee1/extract_join"
+    },
+    {
+      "from": "a46abee1/extract_orders",
+      "to": "a46abee1/extract_join"
+    },
+    {
+      "from": "a46abee1/extract_products",
+      "to": "a46abee1/extract_join"
+    }
+  ],
+  "groups": [
+    {
+      "name": "dlk29c1w1pig-023f99dd/load_group",
+      "label": "load_group → 1 child runs",
+      "status": "SUCCEEDED",
+      "deps": [
+        "dlk29c1w1pig-023f99dd/transform_group"
+      ]
+    },
+    {
+      "name": "dlk29c1w1pig-023f99dd/transform_group",
+      "label": "transform_group → 1 child runs",
+      "status": "SUCCEEDED",
+      "deps": [
+        "dlk29c1w1pig-023f99dd/extract_group"
+      ]
+    },
+    {
+      "name": "dlk29c1w1pig-023f99dd/extract_group",
+      "label": "extract_group → 1 child runs",
+      "status": "SUCCEEDED"
+    }
+  ]
+}

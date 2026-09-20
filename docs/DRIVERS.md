@@ -78,7 +78,9 @@ once. A driver must satisfy these:
 - **64-bit integers.** Unix-nanosecond timestamps overflow 32-bit `INTEGER`;
   use `BIGINT`.
 - **No reserved words in shared column names.** The durable journal's key
-  column is `wkey`, not `key`, because `KEY` is reserved on MySQL.
+  column is `wkey`, not `key`, because `KEY` is reserved on MySQL. For the same
+  reason the group-structure column is `groups_json`, not `groups` (`GROUPS` is
+  reserved on MySQL 8 as a window-frame unit).
 - **`?` placeholders everywhere**, with `Rebind` translating if needed.
 - **DDL must match the query layer's column names** (types are the driver's
   choice). `postgres/schema.go` and `mysql/schema.go` are the reference.
