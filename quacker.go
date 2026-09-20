@@ -25,6 +25,10 @@ import (
 	"github.com/kartikbazzad/quacker/internal/store"
 )
 
+// Version is the released semantic version of this build. Releases are tagged
+// vMAJOR.MINOR.PATCH (see docs/STABILITY.md); fixes bump the patch component.
+const Version = "v1.1.1"
+
 // Quacker is an embedded orchestration engine. Create with Open; safe for
 // concurrent use.
 type Quacker struct {

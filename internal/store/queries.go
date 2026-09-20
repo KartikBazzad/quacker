@@ -11,6 +11,12 @@ import (
 	"github.com/kartikbazzad/quacker/driver"
 )
 
+// maxIntrospectionRows bounds run-scoped introspection collections (a run's
+// steps, a run's children) so a pathological run cannot exhaust memory through
+// the read pool. The bound is generous — real DAGs and fan-out counts sit far
+// below it — and only truncates the snapshot, never execution.
+const maxIntrospectionRows = 10000
+
 // CreateRun inserts a run and its initial steps in one transaction.
 func (s *Store) CreateRun(ctx context.Context, run *Run, steps []*Step) error {
 	return s.CreateRuns(ctx, []*Run{run}, [][]*Step{steps})
@@ -1622,6 +1628,7 @@ func (s *Store) GetRunWithSteps(ctx context.Context, runID string) (*Run, []*Ste
 	return run, steps, nil
 }
 
+// GetSteps returns a run's steps in DAG order, capped at maxIntrospectionRows.
 func (s *Store) GetSteps(ctx context.Context, runID string) ([]*Step, error) {
 	return loadStepsDB(ctx, s.read, runID)
 }
@@ -1658,8 +1665,10 @@ func (s *Store) ListRuns(ctx context.Context, f Filter) ([]*Run, error) {
 		limit = 1000
 	}
 	args = append(args, limit, f.Offset)
+	// id is the tiebreaker: created_at can collide (batch enqueues share a
+	// now), and without it OFFSET pagination can repeat or skip rows.
 	rows, err := s.read.QueryContext(ctx, `SELECT `+runCols+` FROM runs WHERE `+strings.Join(where, " AND ")+
-		` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
+		` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1675,10 +1684,12 @@ func (s *Store) ListRuns(ctx context.Context, f Filter) ([]*Run, error) {
 	return out, rows.Err()
 }
 
-// ListChildren returns the runs enqueued from parentID, oldest first.
+// ListChildren returns the runs enqueued from parentID, oldest first, capped
+// at maxIntrospectionRows.
 func (s *Store) ListChildren(ctx context.Context, parentID string) ([]*Run, error) {
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT `+runCols+` FROM runs WHERE parent_id=? ORDER BY created_at`, parentID)
+		`SELECT `+runCols+` FROM runs WHERE parent_id=? ORDER BY created_at, id LIMIT ?`,
+		parentID, maxIntrospectionRows)
 	if err != nil {
 		return nil, err
 	}
@@ -1974,7 +1985,9 @@ func (s *Store) GetStepOutputs(ctx context.Context, runID string, names []string
 }
 
 func loadStepsDB(ctx context.Context, db *dbConn, runID string) ([]*Step, error) {
-	rows, err := db.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord`, runID)
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+stepCols+` FROM steps WHERE run_id=? ORDER BY ord LIMIT ?`,
+		runID, maxIntrospectionRows)
 	if err != nil {
 		return nil, err
 	}
