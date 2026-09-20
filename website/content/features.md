@@ -52,11 +52,16 @@ h, _ := quacker.EnqueueWorkflow[Order](ctx, q, wf, order)
 ```
 
 - **`DepOutput[T]`** reads an upstream step's result inside a downstream task.
+- **Groups** — `NewGroupWorkflow` + `NewGroup(name, …).After(group)` gates a
+  whole stage on the previous one; the dep expands to member steps, and
+  `DAGSVG` draws group boxes with group-to-group edges instead of the expanded
+  step mesh.
 - **Live introspection** — `q.DAG(ctx, runID)` returns the graph, `DAGJSON` a
   serializable form, and **`DAGSVG`** a rendered diagram at any point during a
   run.
 - **Child runs** — `EnqueueChild`/`EnqueueWorkflowChild` start a run from
   inside another and record the lineage; `q.Children(ctx, runID)` lists them.
+  `DAGTree` draws the whole family, one group per spawning step.
 
 ## Durable execution
 
