@@ -64,6 +64,7 @@ func (fakeBackend) BlockedDependentsSQL() string                   { return "SEL
 func (fakeBackend) UpsertSQL(table string, insertCols, conflictCols, updateCols []string) string {
 	return OnConflictUpsert(table, insertCols, conflictCols, updateCols)
 }
+func (fakeBackend) InsertBatchRows() int { return 200 }
 
 func TestRegisterAndLookup(t *testing.T) {
 	RegisterBackend(fakeBackend{})

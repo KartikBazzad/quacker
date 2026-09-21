@@ -25,6 +25,8 @@ func (sqliteBackend) Name() string { return "sqlite" }
 
 func (sqliteBackend) Rebind(q string) string { return q }
 
+func (sqliteBackend) InsertBatchRows() int { return 25 }
+
 func (sqliteBackend) Migrations() []driver.Migration { return sqliteMigrations }
 
 func (sqliteBackend) MigrateLock(context.Context, *sql.Tx) error { return nil }

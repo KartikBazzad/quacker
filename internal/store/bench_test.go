@@ -32,12 +32,58 @@ func BenchmarkWideDAGComplete(b *testing.B) {
 				}
 				b.StartTimer()
 				for _, st := range steps {
-					if _, err := s.CompleteStep(ctx, st.ID, run.ID, out, nowUnix()); err != nil {
+					if _, err := s.CompleteStep(ctx, st.ID, run.ID, st.Name, out, nowUnix()); err != nil {
 						b.Fatal(err)
 					}
 				}
 				b.StopTimer()
 				s.Close()
+			}
+		})
+	}
+}
+
+// BenchmarkClaimCandidates isolates the scheduler's candidate read: return up
+// to limit due steps from a queue of n. Migration22's
+// (queue, priority DESC, run_at, ord) index matches the ORDER BY, so the scan
+// walks the index and stops at LIMIT. Without it the two-arm OR plus the
+// priority sort gather every due step into a temp B-tree first. Keep this flat
+// as n grows; a regression to ~n-proportional cost means the plan fell back to
+// a sort.
+func BenchmarkClaimCandidates(b *testing.B) {
+	for _, n := range []int{500, 5000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			ctx := context.Background()
+			now := nowUnix()
+			runs := make([]*Run, n)
+			steps := make([][]*Step, n)
+			for i := 0; i < n; i++ {
+				id := fmt.Sprintf("r-%d", i)
+				p := int64(i % 5)
+				runs[i] = &Run{ID: id, Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", Priority: p, RunAt: now, CreatedAt: now, MaxAttempts: 1}
+				steps[i] = []*Step{{ID: id + "/s", RunID: id, Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", Priority: p, RunAt: now, CreatedAt: now, MaxAttempts: 1}}
+			}
+			if err := s.CreateRuns(ctx, runs, steps); err != nil {
+				b.Fatal(err)
+			}
+			sql := s.claimCandidatesSQL()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rows, err := s.read.QueryContext(ctx, sql, "q", StatusQueued, now, StatusSuspended, now, "[]", 64)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for rows.Next() {
+					if _, err := scanStep(rows); err != nil {
+						b.Fatal(err)
+					}
+				}
+				rows.Close()
 			}
 		})
 	}

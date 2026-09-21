@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,7 @@ func testDSN(t *testing.T) string {
 }
 
 // resetDB drops quacker's tables so each test starts clean.
-func resetDB(t *testing.T, dsn string) {
+func resetDB(t testing.TB, dsn string) {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -762,5 +763,46 @@ func TestMySQLWithDB(t *testing.T) {
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM runs`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("runs=%d err=%v", n, err)
+	}
+}
+
+// BenchmarkMySQLEnqueueBatch measures pure producer throughput on MySQL — runs
+// are scheduled far in the future so no worker executes them, isolating the
+// insert path. Run with:
+//
+//	QUACKER_TEST_MYSQL_DSN=... go test -run XXX -bench BenchmarkMySQLEnqueueBatch ./mysql/
+func BenchmarkMySQLEnqueueBatch(b *testing.B) {
+	dsn := os.Getenv("QUACKER_TEST_MYSQL_DSN")
+	if dsn == "" {
+		b.Skip("set QUACKER_TEST_MYSQL_DSN to run the MySQL benchmarks")
+	}
+	resetDB(b, dsn)
+	q, err := quacker.Open(
+		quacker.WithStorage(quacker.Driver("mysql", dsn)),
+		quacker.WithPollInterval(time.Hour), // don't waste cycles scanning
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer q.Close(context.Background())
+
+	type in struct{ N int }
+	task := quacker.NewTask("my.bench", func(ctx context.Context, v in) (int, error) { return v.N, nil })
+	future := quacker.WithRunAt(time.Now().Add(24 * time.Hour))
+
+	for _, n := range []int{1, 10, 100, 1000} {
+		inputs := make([]in, n)
+		for i := range inputs {
+			inputs[i] = in{N: i}
+		}
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := quacker.EnqueueBatch(context.Background(), q, task, inputs, future); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

@@ -207,3 +207,10 @@ ALTER TABLE runs ADD COLUMN parent_step TEXT NOT NULL DEFAULT '';
 const pgMigration13 = `
 ALTER TABLE runs ADD COLUMN groups_json TEXT NOT NULL DEFAULT '';
 `
+
+// pgMigration14 adds a queue-leading index matching the claim query's ORDER BY
+// (priority DESC, run_at, ord), so the claim scan stops at LIMIT instead of
+// collecting every due step and sorting it.
+const pgMigration14 = `
+CREATE INDEX IF NOT EXISTS idx_steps_queue_claim ON steps (queue, priority DESC, run_at, ord);
+`

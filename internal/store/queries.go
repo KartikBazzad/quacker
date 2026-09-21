@@ -156,6 +156,27 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 		}
 		seqNext = base
 	}
+	// Plain runs (no unique key, no cancel strategy) batch into multi-row
+	// inserts. A unique run is resolved and inserted on its own so its
+	// liveRunByUnique sees every previously inserted row, and a run with a
+	// cancel strategy is inserted on its own so the strategy sees exactly the
+	// runs inserted before it — batching either could change the outcome.
+	var batchRuns []*Run
+	var batchSteps [][]*Step
+	flush := func() error {
+		if len(batchRuns) == 0 {
+			return nil
+		}
+		err := insertRunsTx(ctx, tx, batchRuns, batchSteps)
+		batchRuns, batchSteps = nil, nil
+		return err
+	}
+	insertErr := func(err error) error {
+		if driver.IsUniqueViolation(s.be, err) {
+			return fmt.Errorf("%w: %w", ErrUniqueViolation, err)
+		}
+		return err
+	}
 	for i, run := range runs {
 		ids[i] = run.ID
 		if run.SequenceKey != "" || policy(i).Key != "" {
@@ -164,6 +185,14 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 			for _, st := range steps[i] {
 				st.SequenceKey = run.SequenceKey
 				st.Seq = run.Seq
+			}
+		}
+		p := policy(i)
+		useStrategy := p.Strategy != ConcurrencyHold && p.Key != "" && p.Limit > 0
+		immediate := run.UniqueKey != "" || useStrategy
+		if immediate {
+			if err := flush(); err != nil {
+				return nil, nil, insertErr(err)
 			}
 		}
 		if run.UniqueKey != "" {
@@ -187,19 +216,24 @@ func (s *Store) createRunsUniqueTx(ctx context.Context, tx *txn, runs []*Run, st
 				}
 			}
 		}
-		if err := insertRunTx(ctx, tx, run, steps[i]); err != nil {
-			if driver.IsUniqueViolation(s.be, err) {
-				return nil, nil, fmt.Errorf("%w: %w", ErrUniqueViolation, err)
+		if immediate {
+			if err := insertRunsTx(ctx, tx, []*Run{run}, [][]*Step{steps[i]}); err != nil {
+				return nil, nil, insertErr(err)
 			}
-			return nil, nil, err
+		} else {
+			batchRuns = append(batchRuns, run)
+			batchSteps = append(batchSteps, steps[i])
 		}
-		if p := policy(i); p.Strategy != ConcurrencyHold && p.Key != "" && p.Limit > 0 {
+		if useStrategy {
 			victims, err := s.applyConcurrencyStrategy(ctx, tx, run, p.Limit, p.Strategy, nowUnix())
 			if err != nil {
 				return nil, nil, err
 			}
 			replaced = append(replaced, victims...)
 		}
+	}
+	if err := flush(); err != nil {
+		return nil, nil, insertErr(err)
 	}
 	return ids, replaced, nil
 }
@@ -397,47 +431,120 @@ func (s *Store) applyConcurrencyStrategy(ctx context.Context, tx *txn, run *Run,
 	return out, nil
 }
 
-// insertRunsTx inserts runs and steps into an existing transaction. Shared by
-// CreateRuns and FireCron (which fuses the insert with a cron CAS).
+// The multi-row INSERT column list and one row's value tuple. output and
+// started_at/completed_at/error/attempts use literals so only the real columns
+// travel as bound parameters. unique_key is NULL for non-unique runs, which
+// every backend's unique index ignores.
+const (
+	runInsertCols = `id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, parent_step, trace_parent, unique_key, sequence_key, seq, ephemeral, groups_json`
+	runInsertRow  = `(?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`
+
+	stepInsertCols = `id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels, sequence_key, seq`
+	stepInsertRow  = `(?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?,?,?)`
+)
+
+func runInsertArgs(run *Run) []any {
+	return []any{
+		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
+		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey,
+		run.ParentID, run.ParentStep, run.TraceParent, nullableString(run.UniqueKey),
+		run.SequenceKey, run.Seq, boolInt(run.Ephemeral), string(run.Groups),
+	}
+}
+
+func stepInsertArgs(st *Step) []any {
+	return []any{
+		st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn),
+		st.Queue, st.Priority, st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
+		st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels), st.SequenceKey, st.Seq,
+	}
+}
+
+// insertRunsTx inserts runs and their steps into an existing transaction using
+// multi-row INSERTs, chunked by the backend's InsertBatchRows (large for
+// networked databases, small for modernc SQLite). Shared by CreateRuns and
+// FireCron (which fuses the insert with a cron CAS). All runs in a chunk are
+// inserted before their steps, so the steps' foreign key always resolves.
 func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) error {
-	for i, run := range runs {
-		if err := insertRunTx(ctx, tx, run, steps[i]); err != nil {
+	batch := driver.DefaultInsertBatchRows
+	if b, ok := tx.be.(driver.InsertBatcher); ok {
+		batch = b.InsertBatchRows()
+	}
+	if batch < 1 {
+		batch = 1
+	}
+	for start := 0; start < len(runs); start += batch {
+		end := start + batch
+		if end > len(runs) {
+			end = len(runs)
+		}
+		if err := insertRunsChunk(ctx, tx, runs[start:end], steps[start:end]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// insertRunTx inserts one run and its steps. unique_key is NULL when the run
-// is not unique so the unique index ignores it.
-func insertRunTx(ctx context.Context, tx *txn, run *Run, steps []*Step) error {
-	res, err := tx.exec(ctx, `INSERT INTO runs
-		(id, workflow, kind, status, queue, priority, input, output, error, attempts, max_attempts, run_at, created_at, started_at, completed_at, concurrency_key, parent_id, parent_step, trace_parent, unique_key, sequence_key, seq, ephemeral, groups_json)
-		VALUES (?,?,?,?,?,?,?,NULL,'',0,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
-		run.ID, run.Workflow, run.Kind, run.Status, run.Queue, run.Priority,
-		run.Input, run.MaxAttempts, run.RunAt, run.CreatedAt, run.ConcurrencyKey, run.ParentID, run.ParentStep, run.TraceParent,
-		nullableString(run.UniqueKey), run.SequenceKey, run.Seq, boolInt(run.Ephemeral), string(run.Groups))
+// insertRunsChunk writes one chunk of runs, all of their steps, and all of
+// their step keys. unique_key is NULL when the run is not unique so the unique
+// index ignores it.
+func insertRunsChunk(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) error {
+	var rb strings.Builder
+	rb.WriteString(`INSERT INTO runs (` + runInsertCols + `) VALUES `)
+	rargs := make([]any, 0, len(runs)*19)
+	for i, run := range runs {
+		if i > 0 {
+			rb.WriteByte(',')
+		}
+		rb.WriteString(runInsertRow)
+		rargs = append(rargs, runInsertArgs(run)...)
+	}
+	res, err := tx.exec(ctx, rb.String(), rargs...)
 	if err != nil {
 		return fmt.Errorf("quacker: insert run: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("quacker: insert run: %d rows affected", n)
+	if n, _ := res.RowsAffected(); n != int64(len(runs)) {
+		return fmt.Errorf("quacker: insert run: %d rows affected for %d runs", n, len(runs))
 	}
-	for _, st := range steps {
-		_, err := tx.exec(ctx, `INSERT INTO steps
-			(id, run_id, name, task, ord, status, depends_on, queue, priority, input, output, error, attempts, max_attempts, timeout_ns, run_at, created_at, started_at, completed_at, concurrency_key, key_limit, labels, sequence_key, seq)
-			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'',0,?,?,?,?,0,0,?,?,?,?,?)`,
-			st.ID, st.RunID, st.Name, st.Task, st.Ord, st.Status, encodeList(st.DependsOn), st.Queue, st.Priority,
-			st.Input, st.MaxAttempts, st.Timeout, st.RunAt, st.CreatedAt,
-			st.ConcurrencyKey, st.KeyLimit, encodeList(st.Labels), st.SequenceKey, st.Seq)
-		if err != nil {
-			return fmt.Errorf("quacker: insert step %q: %w", st.Name, err)
-		}
-		for _, k := range st.Keys {
-			if _, err := tx.exec(ctx, `INSERT INTO step_keys (step_id, name, value, key_limit) VALUES (?,?,?,?)`,
-				st.ID, k.Name, k.Value, k.Limit); err != nil {
-				return fmt.Errorf("quacker: insert step key %q: %w", k.Name, err)
+
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO steps (` + stepInsertCols + `) VALUES `)
+	sargs := make([]any, 0, len(runs)*19)
+	rows := 0
+	for _, sts := range steps {
+		for _, st := range sts {
+			if rows > 0 {
+				sb.WriteByte(',')
 			}
+			sb.WriteString(stepInsertRow)
+			sargs = append(sargs, stepInsertArgs(st)...)
+			rows++
+		}
+	}
+	if rows > 0 {
+		if _, err := tx.exec(ctx, sb.String(), sargs...); err != nil {
+			return fmt.Errorf("quacker: insert steps: %w", err)
+		}
+	}
+
+	var kb strings.Builder
+	kargs := []any{}
+	krows := 0
+	for _, sts := range steps {
+		for _, st := range sts {
+			for _, k := range st.Keys {
+				if krows > 0 {
+					kb.WriteByte(',')
+				}
+				kb.WriteString(`(?,?,?,?)`)
+				kargs = append(kargs, st.ID, k.Name, k.Value, k.Limit)
+				krows++
+			}
+		}
+	}
+	if krows > 0 {
+		if _, err := tx.exec(ctx, `INSERT INTO step_keys (step_id, name, value, key_limit) VALUES `+kb.String(), kargs...); err != nil {
+			return fmt.Errorf("quacker: insert step keys: %w", err)
 		}
 	}
 	return nil
@@ -867,6 +974,33 @@ func (s *Store) PausedQueues(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
+// NextDue returns the earliest scheduled claim time (unix nanos) among QUEUED
+// steps' run_at and SUSPENDED steps' resume_at, or 0 when nothing is
+// scheduled. A value at or before now means work is already due — it may have
+// been inserted after the last claim (e.g. EnqueueTx) or be held by a
+// concurrency/sequence/label gate — so the scheduler must not sleep long.
+// A future value lets the scheduler sleep until then. It ignores event-only
+// waits (resume_at = 0), which never self-claim.
+func (s *Store) NextDue(ctx context.Context) (int64, error) {
+	var next sql.NullInt64
+	err := s.read.QueryRowContext(ctx, `SELECT MIN(t) FROM (
+		SELECT run_at AS t FROM steps WHERE status=?
+		UNION ALL
+		SELECT resume_at AS t FROM steps WHERE status=? AND resume_at > 0
+	)`, StatusQueued, StatusSuspended).Scan(&next)
+	if err != nil {
+		return 0, err
+	}
+	if !next.Valid {
+		return 0, nil
+	}
+	return next.Int64, nil
+}
+
+// claimTxs counts claim transactions opened, so tests can prove the scheduler
+// stops opening empty ones when nothing is due.
+func (s *Store) ClaimTransactions() int64 { return s.claimTxs.Load() }
+
 // ClaimDueMulti claims due steps across several queues in one write
 // transaction — one transaction per scheduler tick rather than one per queue.
 // Each queue is capped at its own limit and rate window, and the per-key gate
@@ -877,6 +1011,7 @@ func (s *Store) PausedQueues(ctx context.Context) ([]string, error) {
 // lock so the counting gates are evaluated cluster-wide exactly as SQLite's
 // single writer does.
 func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int64, workerLabels []string, workerID string, leaseUntil int64) ([]*Claim, error) {
+	s.claimTxs.Add(1)
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
@@ -933,6 +1068,26 @@ func (s *Store) ClaimDueMulti(ctx context.Context, queues []QueueClaim, now int6
 	return claims, tx.Commit()
 }
 
+// claimCandidatesSQL is the scheduler's candidate read: due QUEUED steps plus
+// resumable SUSPENDED steps in one queue, in claim order. Its ORDER BY must
+// stay in sync with the (queue, priority DESC, run_at, ord) index from
+// migration22 — the index lets the scan stop at LIMIT instead of gathering and
+// sorting every due step. Extracted so BenchmarkClaimCandidates measures the
+// exact query the scheduler runs.
+func (s *Store) claimCandidatesSQL() string {
+	return `SELECT ` + stepCols + ` FROM steps
+		WHERE queue = ? AND (
+			(status = ? AND run_at <= ?)
+			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
+		) AND ` + s.keyGate + `
+		AND ` + queuePausedGate + `
+		AND ` + runNotPausedGate + `
+		AND ` + s.seqGate + `
+		AND ` + s.keysGate + `
+		AND ` + s.be.LabelGate() + `
+		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`
+}
+
 // claimQueueTx claims up to q.Limit steps for one queue inside an existing
 // transaction. Returned claims have their Run unset (ClaimDueMulti attaches
 // runs for the whole batch).
@@ -968,17 +1123,7 @@ func (s *Store) claimQueueTx(ctx context.Context, tx *txn, q QueueClaim, now int
 	// Two claim arms: fresh QUEUED work, and due SUSPENDED steps resuming
 	// (a sleep's wake time or a wait's timeout deadline). Event-driven wakes
 	// flip the step to QUEUED and are covered by the first arm.
-	rows, err := tx.query(ctx, `SELECT `+stepCols+` FROM steps
-		WHERE queue = ? AND (
-			(status = ? AND run_at <= ?)
-			OR (status = ? AND resume_at > 0 AND resume_at <= ?)
-		) AND `+s.keyGate+`
-		AND `+queuePausedGate+`
-		AND `+runNotPausedGate+`
-		AND `+s.seqGate+`
-		AND `+s.keysGate+`
-		AND `+s.be.LabelGate()+`
-		ORDER BY priority DESC, run_at ASC, ord ASC LIMIT ?`,
+	rows, err := tx.query(ctx, s.claimCandidatesSQL(),
 		q.Name, StatusQueued, now, StatusSuspended, now, workerLabelsJSON, limit)
 	if err != nil {
 		return nil, err
@@ -1073,15 +1218,18 @@ type CompleteResult struct {
 // the output of the last step (highest ord). Guards prevent overwriting a run
 // that is already terminal (e.g. cancelled mid-flight) and refuse to
 // resurrect a step that was cancelled or failed by another path.
-// Completion is one step success to record in a batch.
+// Completion is one step success to record in a batch. Name is the step's DAG
+// identity (the executor already knows it), carried so completion can find its
+// dependents without re-reading the row.
 type Completion struct {
 	StepID string
 	RunID  string
+	Name   string
 	Output []byte
 	Now    int64
 }
 
-func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output []byte, now int64) (CompleteResult, error) {
+func (s *Store) CompleteStep(ctx context.Context, stepID, runID, name string, output []byte, now int64) (CompleteResult, error) {
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return CompleteResult{}, err
@@ -1091,11 +1239,39 @@ func (s *Store) CompleteStep(ctx context.Context, stepID, runID string, output [
 	if err := s.be.RunLock(ctx, tx.Tx, runID); err != nil {
 		return CompleteResult{}, err
 	}
-	res, err := s.completeStepTx(ctx, tx, stepID, runID, output, now)
+	counts, err := s.stepCountsTx(ctx, tx, []string{runID})
+	if err != nil {
+		return CompleteResult{}, err
+	}
+	res, err := s.completeStepTx(ctx, tx, stepID, runID, name, counts[runID], output, now)
 	if err != nil {
 		return CompleteResult{}, err
 	}
 	return res, tx.Commit()
+}
+
+// stepCountsTx returns the total step count per run id, so completion can
+// recognize a run whose only step just finished and skip the DAG queries.
+func (s *Store) stepCountsTx(ctx context.Context, tx *txn, runIDs []string) (map[string]int64, error) {
+	if len(runIDs) == 0 {
+		return map[string]int64{}, nil
+	}
+	rows, err := tx.query(ctx, `SELECT run_id, COUNT(*) FROM steps WHERE run_id IN (`+placeholders(len(runIDs))+`) GROUP BY run_id`,
+		argsAny(runIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[string]int64, len(runIDs))
+	for rows.Next() {
+		var id string
+		var n int64
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		counts[id] = n
+	}
+	return counts, rows.Err()
 }
 
 // CompleteSteps records several step completions in one transaction, in order,
@@ -1109,11 +1285,25 @@ func (s *Store) CompleteSteps(ctx context.Context, comps []Completion) ([]Comple
 	}
 	defer tx.Rollback()
 	out := make([]CompleteResult, len(comps))
+	// One query classifies every run in the batch by step count; a run with a
+	// single step takes the fast path below.
+	runIDs := make([]string, 0, len(comps))
+	seen := make(map[string]struct{}, len(comps))
+	for _, c := range comps {
+		if _, ok := seen[c.RunID]; !ok {
+			seen[c.RunID] = struct{}{}
+			runIDs = append(runIDs, c.RunID)
+		}
+	}
+	counts, err := s.stepCountsTx(ctx, tx, runIDs)
+	if err != nil {
+		return nil, err
+	}
 	for i, c := range comps {
 		if err := s.be.RunLock(ctx, tx.Tx, c.RunID); err != nil {
 			return nil, err
 		}
-		res, err := s.completeStepTx(ctx, tx, c.StepID, c.RunID, c.Output, c.Now)
+		res, err := s.completeStepTx(ctx, tx, c.StepID, c.RunID, c.Name, counts[c.RunID], c.Output, c.Now)
 		if err != nil {
 			return nil, err
 		}
@@ -1128,7 +1318,7 @@ func (s *Store) CompleteSteps(ctx context.Context, comps []Completion) ([]Comple
 // completeStepTx is the body of CompleteStep (and each entry of CompleteSteps):
 // it must run inside a transaction that already holds the run lock, and it does
 // not commit.
-func (s *Store) completeStepTx(ctx context.Context, tx *txn, stepID, runID string, output []byte, now int64) (CompleteResult, error) {
+func (s *Store) completeStepTx(ctx context.Context, tx *txn, stepID, runID, stepName string, stepCount int64, output []byte, now int64) (CompleteResult, error) {
 	// A run that is already terminal (cancelled/failed/interrupted) must not
 	// gain SUCCEEDED steps from executors that raced the transition.
 	var runStatus string
@@ -1154,11 +1344,25 @@ func (s *Store) completeStepTx(ctx context.Context, tx *txn, stepID, runID strin
 		return CompleteResult{StepDone: false}, nil
 	}
 
-	var stepName string
-	if err := tx.queryRow(ctx, `SELECT name FROM steps WHERE id=?`, stepID).Scan(&stepName); err != nil {
-		return CompleteResult{}, err
-	}
 	res := CompleteResult{StepDone: true, RunStatus: StatusRunning}
+
+	// The run's only step just succeeded: it is terminal, has no BLOCKED
+	// dependents within the run to unblock, no failed sibling to report, and
+	// its own output is the run output. Skip the DAG queries — this is the
+	// common one-task-per-run shape.
+	if stepCount == 1 {
+		if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error='', completed_at=?, unique_key=NULL WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
+			StatusSucceeded, output, now, runID); err != nil {
+			return CompleteResult{}, err
+		}
+		res.RunTerminal, res.RunStatus, res.RunError, res.RunOutput = true, StatusSucceeded, "", output
+		if ephemeral != 0 {
+			if err := deleteEphemeralRunTx(ctx, tx, runID); err != nil {
+				return CompleteResult{}, err
+			}
+		}
+		return res, nil
+	}
 
 	// Unblock the direct dependents of the step that just finished. Only those
 	// BLOCKED steps are read (indexed by run_id,status, filtered to those that
@@ -1181,18 +1385,20 @@ func (s *Store) completeStepTx(ctx context.Context, tx *txn, stepID, runID strin
 		return CompleteResult{}, err
 	}
 
+	// The run's outcome and payload in one round trip: a failed step's error
+	// (if any) and the last step's output (highest ord). Both are scalar
+	// subqueries, so exactly one row is returned even when neither exists.
 	runStatus, runErr := StatusSucceeded, ""
 	var failedErr sql.NullString
-	switch err := tx.queryRow(ctx, `SELECT error FROM steps WHERE run_id=? AND status=? LIMIT 1`, runID, StatusFailed).Scan(&failedErr); {
-	case err == nil:
-		runStatus, runErr = StatusFailed, failedErr.String
-	case errors.Is(err, sql.ErrNoRows):
-	default:
+	var lastOut []byte
+	if err := tx.queryRow(ctx, `SELECT
+		(SELECT error FROM steps WHERE run_id=? AND status=? LIMIT 1),
+		(SELECT output FROM steps WHERE run_id=? ORDER BY ord DESC LIMIT 1)`,
+		runID, StatusFailed, runID).Scan(&failedErr, &lastOut); err != nil {
 		return CompleteResult{}, err
 	}
-	var lastOut []byte
-	if err := tx.queryRow(ctx, `SELECT output FROM steps WHERE run_id=? ORDER BY ord DESC LIMIT 1`, runID).Scan(&lastOut); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return CompleteResult{}, err
+	if failedErr.Valid {
+		runStatus, runErr = StatusFailed, failedErr.String
 	}
 	if _, err := tx.exec(ctx, `UPDATE runs SET status=?, output=?, error=?, completed_at=?, unique_key=NULL WHERE id=? AND status NOT IN ('SUCCEEDED','FAILED','CANCELLED','INTERRUPTED')`,
 		runStatus, lastOut, runErr, now, runID); err != nil {

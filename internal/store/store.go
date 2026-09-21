@@ -46,7 +46,10 @@ type Store struct {
 	// ckptCount ticks once per checkpoint attempt; tests read it to prove
 	// the loop runs without waiting a full interval.
 	ckptCount atomic.Int64
-	closed    atomic.Bool
+	// claimTxs counts claim transactions opened (diagnostic: the scheduler
+	// should stop opening them when nothing is due).
+	claimTxs atomic.Int64
+	closed   atomic.Bool
 }
 
 // Open opens (and migrates) the database described by cfg.

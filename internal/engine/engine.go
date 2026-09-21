@@ -233,9 +233,14 @@ type Engine struct {
 	cmplDone    chan struct{}
 	cmplStarted atomic.Bool
 
-	wg      sync.WaitGroup // in-flight step executions
-	loopWG  sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
-	wake    chan struct{}
+	wg     sync.WaitGroup // in-flight step executions
+	loopWG sync.WaitGroup // ctx-driven loops (scheduler, cron, metrics, retention)
+	wake   chan struct{}
+	// urgent marks a wake that must be honored even while the scheduler is
+	// pacing claims at the poll interval: new runnable work (an enqueue, an
+	// unblocked dependent, a resume, a retry). A plain slot-free wake is
+	// ignored while busy so completions cannot open a claim transaction each.
+	urgent  atomic.Bool
 	closing atomic.Bool
 
 	// logSinks are the fanned-out destinations for task log lines. They are
@@ -271,8 +276,9 @@ type Options struct {
 	Store *store.Store
 	Bus   *bus.Bus
 	Log   *slog.Logger
-	// PollInterval is how often the scheduler re-checks for due work.
-	// Enqueues and retries wake the scheduler immediately regardless.
+	// PollInterval is how often the scheduler re-checks for due work while runs
+	// are in flight. An idle engine instead sleeps until the next due time and
+	// wakes early on an enqueue, retry, resume, or completion.
 	PollInterval time.Duration
 	// Now overrides the clock (tests).
 	Now func() time.Time
@@ -1121,7 +1127,13 @@ func (e *Engine) Snooze(ctx context.Context, runID string, until time.Time) erro
 	if ctx == nil {
 		ctx = e.ctx
 	}
-	return e.st.Snooze(ctx, runID, until.UnixNano())
+	if err := e.st.Snooze(ctx, runID, until.UnixNano()); err != nil {
+		return err
+	}
+	// A snooze can bring a run forward; wake so the scheduler re-evaluates its
+	// next-due sleep rather than waiting for the old due time.
+	e.wakeScheduler()
+	return nil
 }
 
 // interruptLocal cancels the contexts of a run's running steps, releases its
@@ -1154,28 +1166,102 @@ func (e *Engine) interruptLocal(runID, prevStatus string, running []string, now 
 // ---------------------------------------------------------------------------
 // Scheduler.
 
+// wakeScheduler wakes the scheduler for new runnable work — an enqueue, an
+// unblocked dependent, a resume, or a retry. It is honored even while the
+// scheduler is busy, so latency-sensitive work (a workflow's next step, a
+// freshly enqueued run) is claimed immediately.
 func (e *Engine) wakeScheduler() {
+	e.urgent.Store(true)
 	select {
 	case e.wake <- struct{}{}:
 	default:
 	}
 }
 
-func (e *Engine) schedulerLoop() {
-	ticker := time.NewTicker(e.poll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-e.ctx.Done():
-			return
-		case <-ticker.C:
-		case <-e.wake:
-		}
-		e.tick()
+// wakeSlot wakes the scheduler because a slot or key freed. It is only
+// consumed when the scheduler is idle; while busy the poll interval paces
+// claims, so a completion storm cannot open a claim transaction each.
+func (e *Engine) wakeSlot() {
+	select {
+	case e.wake <- struct{}{}:
+	default:
 	}
 }
 
-func (e *Engine) tick() {
+// Idle sleep caps. The scheduler sleeps when nothing is scheduled, waking on
+// the next due time or any wake signal. SQLite can sleep long: every way work
+// enters it goes through the engine, which wakes the scheduler. Postgres/MySQL
+// additionally accept EnqueueTx, which inserts on a caller-owned transaction
+// the engine cannot observe at commit, so those backends re-scan periodically
+// to pick such runs up.
+const (
+	idleCapDefault    = time.Minute
+	idleCapExternalTx = time.Second
+)
+
+// idleCap is how long the scheduler may sleep when nothing is scheduled.
+func (e *Engine) idleCap() time.Duration {
+	if e.st.SupportsExternalTx() {
+		return idleCapExternalTx
+	}
+	return idleCapDefault
+}
+
+func (e *Engine) schedulerLoop() {
+	timer := time.NewTimer(e.poll)
+	defer timer.Stop()
+	busy := false
+	for {
+		if busy {
+			// While work is in flight, pace claims at the poll interval and
+			// ignore slot-free wakes; honor only urgent ones (new runnable
+			// work). Waking per completion would otherwise open a claim
+			// transaction each and contend with the single writer.
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-timer.C:
+			case <-e.wake:
+				if !e.urgent.Swap(false) {
+					continue
+				}
+			}
+		} else {
+			// Idle: any wake ends the (possibly long) sleep early.
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-timer.C:
+			case <-e.wake:
+				e.urgent.Store(false)
+			}
+		}
+		wait, b := e.tick()
+		busy = b
+		resetTimer(timer, wait)
+	}
+}
+
+// resetTimer re-arms t for d, draining a pending fire so a stale tick cannot
+// cause an extra wake-up.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// tick runs one scheduler pass and returns how long to wait before the next
+// one, plus whether the engine is "busy" (work in flight or a queue at
+// capacity). While busy the loop paces ticks at the poll interval; when idle
+// it sleeps until the next due time and lets a wake interrupt it.
+func (e *Engine) tick() (time.Duration, bool) {
 	e.mu.Lock()
 	snapshot := make(map[string]*queueState, len(e.queues))
 	for q, qs := range e.queues {
@@ -1192,10 +1278,12 @@ func (e *Engine) tick() {
 	// single write transaction (one tx per tick instead of one per queue).
 	var reqs []store.QueueClaim
 	budget := make(map[string]*queueState, len(snapshot))
+	nonPaused := 0
 	for q, qs := range snapshot {
 		if _, ok := paused[q]; ok {
 			continue // paused locally; the claim SQL also blocks it cluster-wide
 		}
+		nonPaused++
 		slots := int(qs.concurrency.Load()) - int(qs.inFlight.Load())
 		if slots <= 0 {
 			continue
@@ -1207,8 +1295,18 @@ func (e *Engine) tick() {
 		budget[q] = qs
 	}
 	if len(reqs) == 0 {
-		return
+		if nonPaused == 0 {
+			// No runnable queue exists yet: nothing can be due until an
+			// enqueue or resume wakes us.
+			return e.idleWait(now), false
+		}
+		// Every runnable queue is at capacity; a completion frees a slot. Keep
+		// ticking at the poll interval so freed slots are refilled promptly.
+		return e.poll, true
 	}
+	// A rate-limited queue frees purely by time (no wake); its due work keeps
+	// the loop ticking at the poll interval (below), so no extra bound is
+	// needed here.
 	workerID, leaseUntil := "", int64(0)
 	if e.leaseMode {
 		workerID, leaseUntil = e.workerID, now+int64(e.leaseTTL)
@@ -1218,7 +1316,13 @@ func (e *Engine) tick() {
 		if e.ctx.Err() == nil {
 			e.log.Error("quacker: claim failed", "err", err)
 		}
-		return
+		return e.poll, true
+	}
+	if len(claims) == 0 {
+		// Capacity exists but nothing was claimable: sleep only if nothing is
+		// due at all, otherwise re-check at the poll interval (due-but-gated
+		// work, or a run inserted by an external transaction).
+		return e.idleWait(now), false
 	}
 	runStarted := map[string]bool{} // one run-level QUEUED→RUNNING per run per tick
 	for _, c := range claims {
@@ -1244,11 +1348,46 @@ func (e *Engine) tick() {
 		}
 		go e.execute(c, qs)
 	}
+	// One tick claims every free slot; pace the next claim to the poll interval
+	// (or sooner if a completion wake arrives once we are idle).
+	return e.poll, true
+}
+
+// idleWait returns how long to sleep after a tick that claimed nothing. If
+// nothing is scheduled it sleeps up to idleCap (until a wake). If work is
+// already due it re-checks at the poll interval — the work may be gated (keys,
+// sequence, labels, a pause) or have been inserted by an external transaction
+// after the claim. Only genuinely future work lets it sleep longer. A store
+// error falls back to the poll interval so a transient failure cannot stall it.
+func (e *Engine) idleWait(now int64) time.Duration {
+	next, err := e.st.NextDue(e.ctx)
+	if err != nil {
+		if e.ctx.Err() == nil {
+			e.log.Error("quacker: next-due lookup failed", "err", err)
+		}
+		return e.poll
+	}
+	if next == 0 {
+		return e.idleCap() // nothing scheduled: sleep until a wake
+	}
+	if next <= now {
+		return e.poll // due but unclaimed: re-check at the poll interval
+	}
+	d := time.Duration(next - now)
+	if d > e.idleCap() {
+		d = e.idleCap()
+	}
+	return d
 }
 
 // execute runs one claimed step and records the outcome.
 func (e *Engine) execute(c *store.Claim, qs *queueState) {
 	defer e.wg.Done()
+	// Wake after the slot is freed (defers run LIFO). Every finished execution
+	// funnels through here — success, failure, cancel, suspend, or park — and
+	// some of those (suspend, park) record no completion, so this is the only
+	// signal that a slot opened up. The scheduler paces these wakes.
+	defer e.wakeSlot()
 	defer qs.inFlight.Add(-1)
 
 	st := c.Step
@@ -1265,6 +1404,9 @@ func (e *Engine) execute(c *store.Claim, qs *queueState) {
 		// park is not a real attempt — give the claimed attempt back.
 		e.warnUnknownTask(taskName)
 		_ = e.st.ParkStep(context.Background(), st.ID, "task not registered in this process", e.now().Add(5*time.Second).UnixNano(), e.now().UnixNano())
+		// No completion is recorded on this path, so wake explicitly: the
+		// scheduler sleeps when idle and must re-check other queues.
+		e.wakeSlot()
 		return
 	}
 
@@ -1452,6 +1594,9 @@ func (e *Engine) recordFinalFailure(st *store.Step, errStr string, now time.Time
 	if res.RunTerminal {
 		e.finishRun(st.RunID, res.RunStatus, nil, res.RunError, now.UnixNano())
 	}
+	// The failure cancelled siblings and freed slots/keys; a slot-free wake
+	// is enough (the scheduler paces these while busy).
+	e.wakeSlot()
 }
 
 // cancelStepContexts cancels the live contexts of the given steps, leaving

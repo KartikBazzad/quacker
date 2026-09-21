@@ -46,6 +46,8 @@ func (pgBackend) Rebind(q string) string {
 	return out
 }
 
+func (pgBackend) InsertBatchRows() int { return 200 }
+
 // rebindCache memoizes rebindings; the query set is small and fixed, so the
 // cache stays bounded.
 var rebindCache sync.Map
@@ -65,6 +67,7 @@ func (pgBackend) Migrations() []driver.Migration {
 		{Version: 11, SQL: pgMigration11},
 		{Version: 12, SQL: pgMigration12},
 		{Version: 13, SQL: pgMigration13},
+		{Version: 14, SQL: pgMigration14},
 	}
 }
 

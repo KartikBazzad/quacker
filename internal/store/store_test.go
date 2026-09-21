@@ -561,3 +561,49 @@ func TestPurgeSkipsRunWithRunningStep(t *testing.T) {
 		t.Fatalf("purge after settle = %+v, want 1 run 1 step", res)
 	}
 }
+
+// TestNextDue: the scheduler's idle-sleep hint reports the earliest scheduled
+// QUEUED run_at or SUSPENDED resume_at, and 0 when nothing is scheduled. A
+// value at or before now means work is already due.
+func TestNextDue(t *testing.T) {
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+	if got, err := s.NextDue(ctx); err != nil || got != 0 {
+		t.Fatalf("empty NextDue = %d, %v (want 0, nil)", got, err)
+	}
+
+	future := now + int64(time.Hour)
+	run := &Run{ID: "r1", Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: future, CreatedAt: now, MaxAttempts: 1}
+	if err := s.CreateRun(ctx, run, []*Step{{ID: "r1/s", RunID: "r1", Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: future, CreatedAt: now, MaxAttempts: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NextDue(ctx); got != future {
+		t.Fatalf("queued NextDue = %d, want %d", got, future)
+	}
+
+	sooner := now + int64(time.Minute)
+	run2 := &Run{ID: "r2", Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	if err := s.CreateRun(ctx, run2, []*Step{{ID: "r2/s", RunID: "r2", Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.write.ExecContext(ctx, `UPDATE steps SET status=?, resume_at=? WHERE id=?`, StatusSuspended, sooner, "r2/s"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NextDue(ctx); got != sooner {
+		t.Fatalf("min NextDue = %d, want %d", got, sooner)
+	}
+	// A past-due step reports its (past) time, so the scheduler knows work is
+	// due now rather than sleeping.
+	run3 := &Run{ID: "r3", Workflow: "w", Kind: KindTask, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	if err := s.CreateRun(ctx, run3, []*Step{{ID: "r3/s", RunID: "r3", Name: "s", Task: "t", Ord: 0, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NextDue(ctx); got > now {
+		t.Fatalf("past-due NextDue = %d, want <= %d", got, now)
+	}
+}

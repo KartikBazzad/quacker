@@ -82,6 +82,7 @@ func (e *Engine) flushCompletions() {
 	comps := make([]store.Completion, len(batch))
 	for i, c := range batch {
 		comps[i] = c.comp
+		comps[i].Name = c.name
 	}
 	results, err := e.st.CompleteSteps(ctx, comps)
 	if err != nil {
@@ -99,7 +100,7 @@ func (e *Engine) flushCompletions() {
 
 // completeDirect records one completion outside the batcher.
 func (e *Engine) completeDirect(c completionReq) {
-	res, err := e.st.CompleteStep(context.Background(), c.comp.StepID, c.comp.RunID, c.comp.Output, c.comp.Now)
+	res, err := e.st.CompleteStep(context.Background(), c.comp.StepID, c.comp.RunID, c.name, c.comp.Output, c.comp.Now)
 	if err != nil {
 		e.log.Error("quacker: record success", "run", c.comp.RunID, "step", c.name, "err", err)
 		return
@@ -113,6 +114,7 @@ func (e *Engine) afterComplete(c completionReq, res store.CompleteResult) {
 	if !res.StepDone {
 		// Another path already made the step terminal; publish that instead.
 		e.publish(c.comp.RunID, c.name, store.StatusRunning, store.StatusCancelled, "", c.comp.Now)
+		e.wakeSlot()
 		return
 	}
 	e.publish(c.comp.RunID, c.name, store.StatusRunning, store.StatusSucceeded, "", c.comp.Now)
@@ -121,7 +123,13 @@ func (e *Engine) afterComplete(c completionReq, res store.CompleteResult) {
 	}
 	if res.RunTerminal {
 		e.finishRun(c.comp.RunID, res.RunStatus, res.RunOutput, res.RunError, c.comp.Now)
-	} else {
+	}
+	// Wake after the completion is persisted. Unblocked dependents are urgent
+	// (a workflow's next step must be claimed now); a plain freed slot is not
+	// (the scheduler paces those while busy).
+	if len(res.ReadySteps) > 0 {
 		e.wakeScheduler()
+	} else {
+		e.wakeSlot()
 	}
 }

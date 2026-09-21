@@ -204,3 +204,12 @@ ALTER TABLE runs ADD COLUMN parent_step VARCHAR(255) NOT NULL DEFAULT '';
 const myMigration10 = `
 ALTER TABLE runs ADD COLUMN groups_json LONGTEXT NULL;
 `
+
+// myMigration11 adds a queue-leading index matching the claim query's ORDER BY
+// (priority DESC, run_at, ord), so the claim scan stops at LIMIT instead of
+// collecting every due step and sorting it. MySQL 8 supports the DESC index
+// key part; on older versions it is parsed and ignored, so the plan may still
+// sort but nothing breaks.
+const myMigration11 = `
+CREATE INDEX idx_steps_queue_claim ON steps (queue, priority DESC, run_at, ord);
+`

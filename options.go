@@ -147,9 +147,11 @@ func WithRate(queue string, n int, per time.Duration) Option {
 	}
 }
 
-// WithPollInterval sets how often the scheduler scans for due work. Enqueues
-// and retries wake the scheduler immediately, so the interval only bounds
-// how late a delayed run can start after its run_at passes. Default 50ms.
+// WithPollInterval sets how often the scheduler scans for due work while runs
+// are in flight. When the engine is idle it does not poll at all: it sleeps
+// until the next step's due time, and a wake (an enqueue, retry, resume, or
+// completion) interrupts that sleep. So the interval bounds how often the
+// scheduler re-checks under load, not how late an idle run starts. Default 50ms.
 func WithPollInterval(d time.Duration) Option {
 	return func(c *config) { c.poll = d }
 }

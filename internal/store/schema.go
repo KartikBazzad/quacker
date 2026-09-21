@@ -302,6 +302,16 @@ const migration15 = `
 ALTER TABLE runs ADD COLUMN paused_at BIGINT NOT NULL DEFAULT 0;
 `
 
+// migration22 adds a queue-leading index whose column order matches the claim
+// query's ORDER BY (priority DESC, run_at ASC, ord ASC), so the claim scan can
+// walk the index in order and stop at LIMIT instead of collecting every due
+// step and sorting it in a temp B-tree. (queue, status, run_at) does not help:
+// the OR of the queued/suspended arms plus the priority sort still forces the
+// sort over the whole due set.
+const migration22 = `
+CREATE INDEX IF NOT EXISTS idx_steps_queue_claim ON steps (queue, priority DESC, run_at, ord);
+`
+
 var sqliteMigrations = []driver.Migration{
 	{Version: 1, SQL: schema},
 	{Version: 2, SQL: migration2},
@@ -324,6 +334,7 @@ var sqliteMigrations = []driver.Migration{
 	{Version: 19, SQL: migration19},
 	{Version: 20, SQL: migration20},
 	{Version: 21, SQL: migration21},
+	{Version: 22, SQL: migration22},
 }
 
 // init validates the built-in migration list's invariant before any Open can

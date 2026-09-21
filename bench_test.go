@@ -195,4 +195,5 @@ func BenchmarkSaturatedThroughput(b *testing.B) {
 		}
 	}
 	b.ReportMetric(float64(saturatedN)*1e9/float64(b.Elapsed().Nanoseconds()/int64(b.N)), "runs/s")
+	b.ReportMetric(float64(q.st.ClaimTransactions())/float64(b.N), "claimtx/op")
 }

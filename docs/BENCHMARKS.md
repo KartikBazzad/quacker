@@ -12,8 +12,12 @@ Machine: **Apple M4, 10 cores** (darwin/arm64), Go 1.26.5, `modernc.org/sqlite`
 ```
 BenchmarkEnqueueRun-10        426,655 ns/op  ~2,300 enqueues/s (contended)
 BenchmarkThroughput-10        458,678 ns/op  ~2,180 runs/s (enqueue→execute→Result)
-BenchmarkSaturatedThroughput  ~1,970,000,000 ns/op for n=5000  ~2,540 runs/s
+BenchmarkSaturatedThroughput  ~1,300,000,000 ns/op for n=5000  ~3,800 runs/s
 ```
+
+The saturated figure was ~2,500 runs/s before the claim index in "Claim
+candidates" below; that one index lifted it ~1.5× by removing the claim
+query's full due-set sort.
 
 - **`BenchmarkEnqueueRun`** is `Enqueue` in a loop while the scheduler and
   workers drain the same database, so it is a contended enqueue+execute figure,
@@ -22,12 +26,13 @@ BenchmarkSaturatedThroughput  ~1,970,000,000 ns/op for n=5000  ~2,540 runs/s
   per-job round-trip latency (~460 µs), *not* saturated throughput.
 - **`BenchmarkSaturatedThroughput`** (Ephemeral/WAL, n=5000) is the real
   ceiling: enqueue a batch, then wait for all runs. It is the number to compare
-  against a queue's "jobs/sec". It scales with queue concurrency — ~2,540
-  runs/s at 64 workers, ~3,230 at 128, ~3,790 at 256 (`QUACKER_SAT_WORKERS`) —
+  against a queue's "jobs/sec". It scales with queue concurrency — ~3,800
+  runs/s at 64 workers, ~4,050 at 128, ~4,400 at 256 (`QUACKER_SAT_WORKERS`) —
   because more in-flight work lets the batched completer form larger batches.
-  At n=1000 it is ~2,460 runs/s (less index depth); on `Memory()` (no WAL) it
-  collapses to ~440 runs/s — use `Ephemeral`/`File` for throughput benchmarks,
-  never `Memory`.
+  (Before the claim index these points were ~2,540 / ~3,230 / ~3,790.) At n=1000
+  it is ~2,460 runs/s (less index depth); on `Memory()` (no WAL) it collapses to
+  ~440 runs/s — use `Ephemeral`/`File` for throughput benchmarks, never
+  `Memory`.
 
 ## Producer throughput (insert-only)
 
@@ -43,17 +48,36 @@ n=100 3,893,511 ns/op    ~39 µs/run  ~25,700/s
 ```
 
 Postgres (`BenchmarkPostgresEnqueueBatch`, far-future runs so nothing executes
-— insert-only; each run is two statements, one `runs` and one `steps`):
+— insert-only). Runs and steps are written with multi-row INSERTs, chunked by
+the backend's `InsertBatchRows` (200 for Postgres/MySQL, 25 for modernc SQLite,
+which slows down on large VALUES lists). Measured locally against a Postgres 16
+container, old per-row vs new multi-row:
 
 ```
-n=1      765,653 ns/op   ~766 µs/run   ~1,300/s
-n=10   2,476,807 ns/op   ~248 µs/run   ~4,000/s
-n=100 24,137,270 ns/op   ~241 µs/run   ~4,100/s
-n=1000 254,776,831 ns/op ~255 µs/run   ~3,900/s
+        per-row (old)        multi-row (new)
+n=1      1,004,298 ns/op     1,152,660 ns/op   ~1.0 ms/run
+n=10     4,473,823 ns/op     1,174,792 ns/op   ~3.8x
+n=100   26,362,766 ns/op     4,545,892 ns/op   ~5.8x
+n=1000 280,775,772 ns/op    37,723,296 ns/op   ~7.4x
 ```
 
-Postgres is round-trip bound: two `database/sql` Execs per run (no multi-row
-INSERT or `COPY`). Concurrent producers use the pool and scale
+MySQL gains more (its per-statement cost is higher), measured with
+`BenchmarkMySQLEnqueueBatch`:
+
+```
+        per-row (old)        multi-row (new)
+n=1     33,145,236 ns/op     8,006,377 ns/op   ~4.1x
+n=10   211,223,842 ns/op    17,527,225 ns/op  ~12x
+n=100 1,255,097,403 ns/op   59,561,431 ns/op  ~21x
+n=1000 1,964,487,928 ns/op 446,601,799 ns/op  ~4.4x
+```
+
+Batch size is per-dialect because it is not monotonic on SQLite: a sweep of
+`BenchmarkZZBatchSize`-style runs showed 25 rows best for modernc SQLite (a
+200-row batch roughly halved saturated throughput), while networked backends
+want the round-trip reduction of a large batch.
+
+Concurrent producers use the pool and scale
 (`BenchmarkPostgresEnqueueParallel`, 100 runs/op):
 
 ```
@@ -76,18 +100,20 @@ transaction per completion, single writer):
 | Units | work/s (batch completion) | jobs/s (insert + work + persist) |
 | Storage | Postgres, many connections | SQLite (embedded) or Postgres |
 | Machine | M2 Air, 8 cores | M4, 10 cores |
-| Figure | ~46,000/s | ~2,500/s (Ephemeral, 64 workers; ~3,800 at 256) |
+| Figure | ~46,000/s | ~3,800/s (Ephemeral, 64 workers; ~4,400 at 256) |
 
-So River is roughly **18× higher** at completion throughput. The reasons are
+So River is roughly **12× higher** at completion throughput. The reasons are
 structural, not a constant factor:
 
 - **Batched completion, but still per-row queries.** quacker coalesces step
   successes into one transaction per flush (`CompleteSteps`, v1.10), which
   lifted saturated throughput ~1.4× and made it scale with worker count; River
   additionally collapses the row updates into one statement
-  (`UPDATE … WHERE id = ANY`), which quacker has not done.
-- **Batch insert via `COPY`.** River's `InsertManyFast` uses Postgres `COPY`;
-  quacker issues one Exec per run for `runs` and one for `steps`.
+  (`UPDATE … WHERE id = ANY`), which quacker has not done. quacker has since cut
+  the per-completion statement count (see "Completion" below).
+- **Batch insert.** quacker now issues multi-row INSERTs (see "Producer
+  throughput"); River's `InsertManyFast` uses Postgres `COPY`, which is still
+  cheaper for very large batches.
 - **Concurrency.** River fans work across pooled connections; SQLite permits a
   single writer (quacker's design trade for embedding).
 
@@ -131,6 +157,89 @@ n=800   after  ~0.24 s/run        (~10x)
 with completion cost now roughly flat per step instead of growing with the run
 size.
 
+## Completion statement count
+
+A completion used to issue eight statements per step (read the run, update the
+step, read its name, probe for BLOCKED dependents, check for remaining active
+steps, read a failed sibling's error, read the last step's output, update the
+run). Two changes cut that:
+
+- The step name now travels on the `Completion` (the executor already knows it),
+  and the run's outcome and last output are read in one query, so a DAG run
+  completion drops from eight statements to six.
+- A run whose **only** step just finished takes a fast path: it is terminal,
+  has no dependents to unblock, no failed sibling, and its own output is the
+  run output. `CompleteSteps` classifies the batch with one `GROUP BY` query, so
+  the common one-task-per-run shape needs only three statements.
+
+`BenchmarkPostgresComplete` completes single-step runs in batches of 100 (no
+engine, so it isolates the completion statements) against a local Postgres 16
+container:
+
+```
+before   112,977,966 ns/op   (~1.13 ms/completion, 8 statements)
+after     52,878,324 ns/op   (~0.53 ms/completion, 3 statements)   ~2.1x
+```
+
+The full collapse River does — one bulk `UPDATE … WHERE id = ANY` for the whole
+batch — remains the next step; it needs `RETURNING` (Postgres/SQLite) with a
+separate MySQL path.
+
+## Claim candidates (queue scan)
+
+The scheduler's candidate read (`claimCandidatesSQL`) was the largest single
+cost in a saturated run: CPU-profiling `BenchmarkSaturatedThroughput` put
+`ClaimDueMulti`/`claimQueueTx` at ~30% of samples, versus ~2% for completion and
+~3% for insert. `EXPLAIN QUERY PLAN` showed why: the query's two arms
+(QUEUED/`run_at`, SUSPENDED/`resume_at`) were indexed, but the
+`ORDER BY priority DESC, run_at, ord` forced a `USE TEMP B-TREE FOR ORDER BY`,
+so every tick gathered *all* due steps, ran the correlated concurrency/sequence/
+label gates on each, sorted them, and then took `LIMIT 64`.
+`BenchmarkClaimCandidates` isolates the read at n=5000:
+
+```
+no new index                 ~9,840,000 ns/op
+(queue, status, run_at)      ~9,950,000 ns/op   (no help: still must sort)
+(queue, priority DESC, run_at, ord)  ~390,000 ns/op   (~25x)
+```
+
+The index whose column order matches the `ORDER BY` lets the scan walk it in
+claim order and stop at `LIMIT`; the plan becomes a single
+`SEARCH steps USING INDEX idx_steps_queue_claim (queue=?)` with no temp B-tree.
+It is now flat in queue depth (~0.38 ms at n=500 and n=5000). Adding it lifts
+saturated throughput ~1.5× (see Results) at the cost of ~5% on the batch-insert
+path. Migration22 adds it for SQLite, Postgres, and MySQL.
+
+## Idle scheduler (empty claim transactions)
+
+The scheduler used to open a claim transaction every poll interval even when
+nothing was due — with the 50ms default that is 20 empty transactions/second
+per process, and far more in tests that poll at 1ms. It now sleeps instead:
+`Store.NextDue` returns the earliest scheduled QUEUED `run_at` or SUSPENDED
+`resume_at`, and the scheduler waits until then rather than polling. Any
+mutation that makes work claimable — enqueue, retry, resume, completion,
+suspend, park — wakes it. If work is already due but was not claimable (held by
+a concurrency/sequence/label gate, or inserted by `EnqueueTx` after the claim)
+it re-checks at the poll interval instead of sleeping; only genuinely future
+work sleeps longer. The sleep is capped (one minute for SQLite, one second for
+Postgres/MySQL, whose `EnqueueTx` inserts on a caller-owned transaction the
+engine cannot observe at commit).
+
+While runs are in flight the loop paces claims at the poll interval. Wakes are
+split: an *urgent* wake (an enqueue, an unblocked dependent, a resume, a retry)
+is honored immediately, so a workflow's next step is claimed without waiting a
+poll; a plain *slot-free* wake is ignored while busy, since waking per
+completion would open a claim transaction each and contend with the single
+writer. That is why `BenchmarkSaturatedThroughput` now also reports
+`claimtx/op` — for n=5000 it is ~100, i.e. the whole run is claimed in ~100
+transactions rather than one per completion. A rate-limited queue's steps stay
+due, so the scheduler re-checks it at the poll interval rather than sleeping.
+
+Covered by `TestNextDue` (store), `TestScheduledRunFiresAtDueTime` (a run
+scheduled 60ms out fires even with a one-hour poll interval), and
+`TestIdleSchedulerStopsClaiming` (at a 1ms poll an idle engine opens at most a
+handful of claim transactions in 200ms, versus ~200 before).
+
 ## Reproduce
 
 ```sh
@@ -139,10 +248,15 @@ go test -run XXX -bench 'BenchmarkSaturatedThroughput' -benchtime 1x .
 go test -run XXX -bench 'BenchmarkEnqueueParallel' -benchtime 2000x -cpu 1,4,10 .
 go test -run XXX -bench 'BenchmarkCreateRunsBatch' -benchtime 300x ./internal/store/
 go test -run XXX -bench 'BenchmarkWideDAGComplete' -benchtime 200x ./internal/store/
+go test -run XXX -bench 'BenchmarkClaimCandidates' -benchtime 200x ./internal/store/
 
 # Postgres producer throughput (needs a server):
 QUACKER_TEST_POSTGRES_DSN=... \
   go test -run XXX -bench 'BenchmarkPostgresEnqueue' -benchtime 50x -cpu 1,4,10 ./postgres/
+QUACKER_TEST_POSTGRES_DSN=... \
+  go test -run XXX -bench 'BenchmarkPostgresComplete' -benchtime 50x ./postgres/
+QUACKER_TEST_MYSQL_DSN=... \
+  go test -run XXX -bench 'BenchmarkMySQLEnqueueBatch' -benchtime 50x ./mysql/
 ```
 
 Drop `-benchtime` for quicker runs; raise it for stable numbers. Run with

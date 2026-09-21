@@ -964,3 +964,63 @@ func BenchmarkPostgresEnqueueParallel(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkPostgresComplete measures step-completion throughput: it completes
+// single-step runs in batches of 100 through the batched completer, the shape
+// a one-step workflow produces. No engine runs, so the numbers isolate the
+// completion statements. Run with:
+//
+//	QUACKER_TEST_POSTGRES_DSN=... go test -run XXX -bench BenchmarkPostgresComplete ./postgres/
+func BenchmarkPostgresComplete(b *testing.B) {
+	dsn := os.Getenv("QUACKER_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		b.Skip("set QUACKER_TEST_POSTGRES_DSN to run the Postgres benchmarks")
+	}
+	resetDB(b, dsn)
+	s, err := store.Open(driver.Config{Driver: "postgres", DSN: dsn})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := time.Now().UnixNano()
+	const batch = 100
+
+	b.StopTimer()
+	total := b.N * batch
+	ids := make([]string, total)
+	runIDs := make([]string, total)
+	for start := 0; start < total; start += 1000 {
+		end := start + 1000
+		if end > total {
+			end = total
+		}
+		runs := make([]*store.Run, 0, end-start)
+		steps := make([][]*store.Step, 0, end-start)
+		for i := start; i < end; i++ {
+			id := fmt.Sprintf("r-%d", i)
+			ids[i], runIDs[i] = id+"/s", id
+			runs = append(runs, &store.Run{ID: id, Workflow: "w", Kind: store.KindTask, Status: store.StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1})
+			steps = append(steps, []*store.Step{{ID: id + "/s", RunID: id, Name: "s", Task: "t", Ord: 0, Status: store.StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}})
+		}
+		if err := s.CreateRuns(ctx, runs, steps); err != nil {
+			b.Fatal(err)
+		}
+	}
+	out := []byte(`{"ok":true}`)
+	comps := make([]store.Completion, batch)
+	for j := range comps {
+		comps[j].Name, comps[j].Output, comps[j].Now = "s", out, now
+	}
+	b.StartTimer()
+	idx := 0
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < batch; j++ {
+			comps[j].StepID, comps[j].RunID = ids[idx], runIDs[idx]
+			idx++
+		}
+		if _, err := s.CompleteSteps(ctx, comps); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

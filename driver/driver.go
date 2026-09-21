@@ -141,6 +141,19 @@ type Backend interface {
 	UpsertSQL(table string, insertCols, conflictCols, updateCols []string) string
 }
 
+// InsertBatcher is an optional Backend extension: the number of rows per
+// multi-row INSERT on the enqueue path. Networked backends want a large batch
+// (fewer round trips); modernc SQLite's parameter handling slows down on large
+// VALUES lists, so it wants a small one. A backend that does not implement it
+// gets DefaultInsertBatchRows.
+type InsertBatcher interface {
+	InsertBatchRows() int
+}
+
+// DefaultInsertBatchRows is the enqueue batch size for backends that do not
+// implement InsertBatcher.
+const DefaultInsertBatchRows = 200
+
 var backends = map[string]Backend{}
 
 // RegisterBackend installs a driver under its Name(). Driver packages call it

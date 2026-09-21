@@ -35,6 +35,8 @@ func (myBackend) Name() string { return "mysql" }
 // Rebind is identity: MySQL uses '?' placeholders like SQLite.
 func (myBackend) Rebind(q string) string { return q }
 
+func (myBackend) InsertBatchRows() int { return 200 }
+
 func (myBackend) Migrations() []driver.Migration {
 	return []driver.Migration{
 		{Version: 1, SQL: mySchema},
@@ -47,6 +49,7 @@ func (myBackend) Migrations() []driver.Migration {
 		{Version: 8, SQL: myMigration8},
 		{Version: 9, SQL: myMigration9},
 		{Version: 10, SQL: myMigration10},
+		{Version: 11, SQL: myMigration11},
 	}
 }
 
