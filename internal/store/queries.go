@@ -460,6 +460,21 @@ func stepInsertArgs(st *Step) []any {
 	}
 }
 
+// insertMaxParams bounds the bound parameters in a single INSERT statement so
+// a large workflow cannot exceed a backend's placeholder limit. SQLite's
+// default SQLITE_MAX_VARIABLE_NUMBER is 32,766; Postgres and MySQL allow
+// 65,535. 30,000 leaves margin under all three.
+const insertMaxParams = 30000
+
+// Bound parameters per inserted row, derived from the arg builders so the
+// count cannot drift from the column lists. step_keys has no builder, so its
+// four columns are counted directly.
+var (
+	runInsertArgc  = len(runInsertArgs(&Run{}))
+	stepInsertArgc = len(stepInsertArgs(&Step{}))
+	keyInsertArgc  = 4
+)
+
 // insertRunsTx inserts runs and their steps into an existing transaction using
 // multi-row INSERTs, chunked by the backend's InsertBatchRows (large for
 // networked databases, small for modernc SQLite). Shared by CreateRuns and
@@ -472,6 +487,11 @@ func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) er
 	}
 	if batch < 1 {
 		batch = 1
+	}
+	// A backend could return a large batch; the runs statement is one INSERT,
+	// so cap it by the parameter budget too.
+	if maxRuns := insertMaxParams / runInsertArgc; batch > maxRuns {
+		batch = maxRuns
 	}
 	for start := 0; start < len(runs); start += batch {
 		end := start + batch
@@ -486,12 +506,14 @@ func insertRunsTx(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) er
 }
 
 // insertRunsChunk writes one chunk of runs, all of their steps, and all of
-// their step keys. unique_key is NULL when the run is not unique so the unique
-// index ignores it.
+// their step keys. The runs are one statement (the chunk is already bounded),
+// but steps and keys are split across as many statements as the parameter
+// budget requires — a single run can carry thousands of steps. unique_key is
+// NULL when the run is not unique so the unique index ignores it.
 func insertRunsChunk(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step) error {
 	var rb strings.Builder
 	rb.WriteString(`INSERT INTO runs (` + runInsertCols + `) VALUES `)
-	rargs := make([]any, 0, len(runs)*19)
+	rargs := make([]any, 0, len(runs)*runInsertArgc)
 	for i, run := range runs {
 		if i > 0 {
 			rb.WriteByte(',')
@@ -507,12 +529,32 @@ func insertRunsChunk(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step)
 		return fmt.Errorf("quacker: insert run: %d rows affected for %d runs", n, len(runs))
 	}
 
+	stepPrefix := `INSERT INTO steps (` + stepInsertCols + `) VALUES `
+	maxStepRows := insertMaxParams / stepInsertArgc
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO steps (` + stepInsertCols + `) VALUES `)
-	sargs := make([]any, 0, len(runs)*19)
+	sargs := make([]any, 0, maxStepRows*stepInsertArgc)
 	rows := 0
+	flushSteps := func() error {
+		if rows == 0 {
+			return nil
+		}
+		if _, err := tx.exec(ctx, sb.String(), sargs...); err != nil {
+			return fmt.Errorf("quacker: insert steps: %w", err)
+		}
+		sb.Reset()
+		sb.WriteString(stepPrefix)
+		sargs = sargs[:0]
+		rows = 0
+		return nil
+	}
+	sb.WriteString(stepPrefix)
 	for _, sts := range steps {
 		for _, st := range sts {
+			if rows == maxStepRows {
+				if err := flushSteps(); err != nil {
+					return err
+				}
+			}
 			if rows > 0 {
 				sb.WriteByte(',')
 			}
@@ -527,12 +569,33 @@ func insertRunsChunk(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step)
 		}
 	}
 
+	const keyPrefix = `INSERT INTO step_keys (step_id, name, value, key_limit) VALUES `
+	maxKeyRows := insertMaxParams / keyInsertArgc
 	var kb strings.Builder
-	kargs := []any{}
+	kargs := make([]any, 0, maxKeyRows*keyInsertArgc)
 	krows := 0
+	flushKeys := func() error {
+		if krows == 0 {
+			return nil
+		}
+		if _, err := tx.exec(ctx, kb.String(), kargs...); err != nil {
+			return fmt.Errorf("quacker: insert step keys: %w", err)
+		}
+		kb.Reset()
+		kb.WriteString(keyPrefix)
+		kargs = kargs[:0]
+		krows = 0
+		return nil
+	}
+	kb.WriteString(keyPrefix)
 	for _, sts := range steps {
 		for _, st := range sts {
 			for _, k := range st.Keys {
+				if krows == maxKeyRows {
+					if err := flushKeys(); err != nil {
+						return err
+					}
+				}
 				if krows > 0 {
 					kb.WriteByte(',')
 				}
@@ -543,7 +606,7 @@ func insertRunsChunk(ctx context.Context, tx *txn, runs []*Run, steps [][]*Step)
 		}
 	}
 	if krows > 0 {
-		if _, err := tx.exec(ctx, `INSERT INTO step_keys (step_id, name, value, key_limit) VALUES `+kb.String(), kargs...); err != nil {
+		if _, err := tx.exec(ctx, kb.String(), kargs...); err != nil {
 			return fmt.Errorf("quacker: insert step keys: %w", err)
 		}
 	}

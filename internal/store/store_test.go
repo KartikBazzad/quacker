@@ -607,3 +607,52 @@ func TestNextDue(t *testing.T) {
 		t.Fatalf("past-due NextDue = %d, want <= %d", got, now)
 	}
 }
+
+// TestCreateRunManyStepsBoundedParams: a single run with more steps than one
+// INSERT's parameter budget must still insert. At 19 bound params per step,
+// 2000 steps is 38,000 params — over SQLite's 32,766 placeholder limit — so
+// the step (and step-key) statements must be split across several INSERTs.
+func TestCreateRunManyStepsBoundedParams(t *testing.T) {
+	s, err := Open(driver.Config{Mode: driver.ModeEphemeral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	now := nowUnix()
+
+	const n = 2000
+	run := &Run{ID: "big", Workflow: "w", Kind: KindWorkflow, Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1}
+	steps := make([]*Step, n)
+	for i := range steps {
+		name := fmt.Sprintf("s%d", i)
+		steps[i] = &Step{
+			ID: "big/" + name, RunID: "big", Name: name, Task: "t", Ord: int64(i),
+			Status: StatusQueued, Queue: "q", RunAt: now, CreatedAt: now, MaxAttempts: 1,
+			// Four keys per step (8000 total) pushes the step_keys statement
+			// over its own budget too.
+			Keys: []StepKey{
+				{Name: "k1", Value: name, Limit: 1},
+				{Name: "k2", Value: name, Limit: 1},
+				{Name: "k3", Value: name, Limit: 1},
+				{Name: "k4", Value: name, Limit: 1},
+			},
+		}
+	}
+	if err := s.CreateRun(ctx, run, steps); err != nil {
+		t.Fatal(err)
+	}
+	var gotSteps, gotKeys int
+	if err := s.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE run_id='big'`).Scan(&gotSteps); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM step_keys`).Scan(&gotKeys); err != nil {
+		t.Fatal(err)
+	}
+	if gotSteps != n {
+		t.Fatalf("steps = %d, want %d", gotSteps, n)
+	}
+	if want := n * 4; gotKeys != want {
+		t.Fatalf("step keys = %d, want %d", gotKeys, want)
+	}
+}
