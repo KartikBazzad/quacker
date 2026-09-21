@@ -412,9 +412,15 @@ choices are deliberate:
 `depends_on`, status, attempts), so they show the *current state* and work for
 recovered or purged-adjacent runs, not just freshly registered workflows.
 Rendering SVG in-process (dependency-level longest-path layout, one box per
-step, bezier edges) avoids a Graphviz/cgo dependency and keeps the library's
+step, orthogonal edges) avoids a Graphviz/cgo dependency and keeps the library's
 "one `go get`, embeddable" promise; labels are XML-escaped and long names
-truncated, and the layout is deterministic for a given graph. The alternative
+truncated, and the layout is deterministic for a given graph. Edges are routed
+around node boxes rather than drawn straight: a visibility grid is built from
+the obstacle edges, then Dijkstra with a bend penalty picks a right-angle path
+that keeps `routeClearance` pixels off every node it is not attached to. A
+skip-level edge that would otherwise cross an intermediate node therefore
+detours around it. If no forward route exists the renderer falls back to the
+old bezier. The alternative
 — shelling out to `dot` — would have broken the no-external-binary property
 for a fairly small amount of drawing code.
 

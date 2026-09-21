@@ -289,6 +289,32 @@ func absolutize(c *dagCluster, dx, dy float64, pos map[string][2]float64, boxes 
 	}
 }
 
+// dagNodeRects maps every node to its rectangle from the layout.
+func dagNodeRects(d *DAG, pos map[string][2]float64, nodeW float64) map[string]svgRect {
+	rects := make(map[string]svgRect, len(d.Nodes))
+	for _, n := range d.Nodes {
+		p := pos[n.Name]
+		rects[n.Name] = svgRect{x: p[0], y: p[1], w: nodeW, h: dagNodeH}
+	}
+	return rects
+}
+
+// dagEdgeObstacles is the obstacle set for one edge: every node except the
+// edge's own endpoints, which are passed exactly so the route can leave and
+// enter their ports. Other nodes are inflated by the routing clearance.
+func dagEdgeObstacles(d *DAG, rects map[string]svgRect, from, to string) []svgRect {
+	obstacles := make([]svgRect, 0, len(d.Nodes))
+	for _, n := range d.Nodes {
+		r := rects[n.Name]
+		if n.Name == from || n.Name == to {
+			obstacles = append(obstacles, r)
+		} else {
+			obstacles = append(obstacles, inflateRect(r, routeClearance))
+		}
+	}
+	return obstacles
+}
+
 // renderDAGSVG lays nodes out in dependency levels and draws edges
 // left-to-right. It is dependency-free and deterministic for a given DAG.
 func renderDAGSVG(d *DAG) []byte {
@@ -351,10 +377,17 @@ func renderDAGSVG(d *DAG) []byte {
 		}
 		return 0, 0, false
 	}
+	rects := dagNodeRects(d, pos, nodeW)
 	for _, e := range d.Edges {
 		x1, y1, ok1 := anchor(e.From, true)
 		x2, y2, ok2 := anchor(e.To, false)
 		if !ok1 || !ok2 {
+			continue
+		}
+		// Route around other nodes; fall back to a bezier when no clean
+		// right-angle path exists (e.g. a backward edge).
+		if pts := routeEdge(x1, y1, x2, y2, dagEdgeObstacles(d, rects, e.From, e.To)); len(pts) >= 2 {
+			fmt.Fprintf(&b, `<path d="%s" fill="none" stroke="#9aa0a6" stroke-width="1.6" marker-end="url(#qarrow)"/>`, routePathD(pts))
 			continue
 		}
 		dx := (x2 - x1) / 2
