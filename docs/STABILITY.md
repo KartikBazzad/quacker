@@ -31,6 +31,11 @@ any time.
   unchanged. `Execution.Groups`, `DAGNode.Group`, and `DAGGroup`'s
   `Parent`/`Deps`/`Steps` are new fields on existing structs (JSON-optional),
   so existing readers and decoders keep working.
+- `driver.InsertBatcher` (v1.3.0) is an **optional** extension interface, not a
+  change to `driver.Backend`: a backend that implements `InsertBatchRows` gets
+  multi-row inserts on the enqueue path, and one that does not is unaffected
+  (it uses `driver.DefaultInsertBatchRows`). v1.3.0 changes no exported
+  signature.
 - Removing or changing the signature of an exported identifier is breaking.
 - When something is superseded it is first deprecated in a doc comment before
   removal in the next major.
