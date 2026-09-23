@@ -15,9 +15,9 @@ package quacker
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"log/slog"
 	"time"
 

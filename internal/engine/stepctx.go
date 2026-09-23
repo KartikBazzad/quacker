@@ -2,8 +2,8 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"log/slog"
 	"runtime/debug"
 	"strconv"

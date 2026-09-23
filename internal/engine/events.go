@@ -2,8 +2,8 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	json "github.com/goccy/go-json"
 
 	"go.opentelemetry.io/otel/attribute"
 

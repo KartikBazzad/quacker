@@ -14,10 +14,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"log"
 	"os"
 	"strconv"

@@ -2,7 +2,7 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
+	json "github.com/goccy/go-json"
 )
 
 // Codec (de)serializes user payloads: task inputs and outputs, dependency
@@ -15,7 +15,7 @@ type Codec interface {
 	Unmarshal(data []byte, v any) error
 }
 
-// JSONCodec is the default codec; it wraps encoding/json.
+// JSONCodec is the default codec; it wraps github.com/goccy/go-json.
 type JSONCodec struct{}
 
 func (JSONCodec) Name() string                       { return "json" }

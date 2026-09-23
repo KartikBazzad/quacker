@@ -1,8 +1,8 @@
 package store
 
 import (
-	"encoding/json"
 	"errors"
+	json "github.com/goccy/go-json"
 	"strings"
 	"time"
 )

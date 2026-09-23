@@ -9,9 +9,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"log"
 	"os"
 	"strings"

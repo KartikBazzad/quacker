@@ -3,8 +3,8 @@ package quacker
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	json "github.com/goccy/go-json"
 	"sync"
 	"testing"
 	"time"

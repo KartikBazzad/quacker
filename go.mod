@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
+	github.com/goccy/go-json v0.10.6
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/robfig/cron/v3 v3.0.1
 	go.opentelemetry.io/otel v1.46.0

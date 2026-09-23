@@ -4,8 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
+	json "github.com/goccy/go-json"
 
 	"github.com/kartikbazzad/quacker/internal/engine"
 )
@@ -20,7 +20,7 @@ import (
 // encoded them.
 type Codec = engine.Codec
 
-// JSONCodec is the default codec (encoding/json).
+// JSONCodec is the default codec (goccy/go-json).
 type JSONCodec = engine.JSONCodec
 
 // WithCodec sets the payload codec (default JSONCodec). It applies engine-wide

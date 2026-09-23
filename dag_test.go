@@ -2,9 +2,9 @@ package quacker
 
 import (
 	"context"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
+	json "github.com/goccy/go-json"
 	"strings"
 	"testing"
 	"time"

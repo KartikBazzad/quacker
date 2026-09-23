@@ -2,7 +2,7 @@ package quacker
 
 import (
 	"context"
-	"encoding/json"
+	json "github.com/goccy/go-json"
 )
 
 // DAGNode is one step of a run's DAG with its current state.

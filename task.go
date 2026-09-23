@@ -2,8 +2,8 @@ package quacker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	json "github.com/goccy/go-json"
 	"time"
 
 	"github.com/kartikbazzad/quacker/internal/engine"
